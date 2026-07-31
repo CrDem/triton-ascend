@@ -50,6 +50,11 @@
 #include "TritonToUnstructure/OffsetAnalysis.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include <fstream>
+#include <string>
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Operation.h"
+
 using namespace mlir;
 static constexpr const char *DEBUG_TYPE = "ReorderOpsByBlockIdPass";
 #define LOG_DEBUG(...)                                                         \
@@ -70,6 +75,63 @@ struct BlockOpGraph {
   BlockOpGraph(ArrayRef<Operation *> allOps, Block *block,
                const MemoryDependenceGraph &memGraph);
 };
+
+void dumpBlockOpGraphToDot(const BlockOpGraph &graph, const std::string &filename) {
+    std::ofstream os(filename);
+    if (!os.is_open()) {
+        llvm::errs() << "Failed to open file for DOT dump: " << filename << "\n";
+        return;
+    }
+
+    os << "digraph BlockOpGraph {\n";
+    os << "  rankdir=TB;\n"; // Top-to-bottom layout
+    os << "  node [shape=box, fontname=\"Courier\", style=\"filled\", fillcolor=\"#f0f4f8\"];\n";
+    os << "  edge [color=\"#333333\", arrowhead=\"normal\"];\n\n";
+
+    // 1. Emit all nodes with formatted MLIR op representations
+    for (size_t i = 0; i < graph.ops.size(); ++i) {
+        mlir::Operation *op = graph.ops[i];
+
+        // Print operation to a string
+        std::string opStr;
+        llvm::raw_string_ostream ss(opStr);
+        op->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
+
+        // Escape special characters for DOT syntax
+        std::string safeLabel;
+        for (char c : ss.str()) {
+            if (c == '"') safeLabel += "\\\"";
+            else if (c == '\\') safeLabel += "\\\\";
+            else if (c == '\n') safeLabel += "\\l"; // Left-align line breaks in Graphviz
+            else safeLabel += c;
+        }
+
+        os << "  Node_" << i << " [label=\"[" << i << "] " 
+           << op->getName().getStringRef().str() << "\\l" 
+           << safeLabel << "\"];\n";
+    }
+
+    os << "\n  // Edges (Successors)\n";
+
+    // 2. Emit directed edges from 'succs' map
+    for (const auto &[op, successors] : graph.succs) {
+        auto srcIt = graph.opIndex.find(op);
+        if (srcIt == graph.opIndex.end()) continue;
+        unsigned srcIdx = srcIt->second;
+
+        for (mlir::Operation *succOp : successors) {
+            auto dstIt = graph.opIndex.find(succOp);
+            if (dstIt != graph.opIndex.end()) {
+                unsigned dstIdx = dstIt->second;
+                os << "  Node_" << srcIdx << " -> Node_" << dstIdx << ";\n";
+            }
+        }
+    }
+
+    os << "}\n";
+    os.close();
+    llvm::errs() << "Successfully dumped BlockOpGraph to " << filename << "\n";
+}
 
 // Helper class to manage edges in OpGraph, mainly to reduce congitive
 // complexity of the build function
@@ -214,6 +276,46 @@ struct GroupAdjacencyGraph {
                       const DenseMap<Operation *, int> &opBlockId);
   llvm::FailureOr<SmallVector<int>> computeTopologicalOrder();
 };
+
+void dumpGroupAdjacencyGraphToDot(const GroupAdjacencyGraph &graph, const std::string &filename) {
+    std::ofstream os(filename);
+    if (!os.is_open()) {
+        llvm::errs() << "Failed to open file for DOT dump: " << filename << "\n";
+        return;
+    }
+
+    os << "digraph GroupAdjacencyGraph {\n";
+    os << "  rankdir=TB;\n"; // Top-to-bottom layout
+    
+    // Aesthetic styling for group nodes
+    os << "  node [shape=Mrecord, fontname=\"Helvetica\", style=\"filled\", fillcolor=\"#e2f0d9\", color=\"#548235\"];\n";
+    os << "  edge [color=\"#385723\", penwidth=1.5];\n\n";
+
+    // 1. Emit nodes (Group IDs)
+    // The graph structure implies indices 0...groupIds.size()-1 map to the actual group IDs
+    for (size_t i = 0; i < graph.groupIds.size(); ++i) {
+        int actualGroupId = graph.groupIds[i];
+        unsigned inDegree = (i < graph.inDeg.size()) ? graph.inDeg[i] : 0;
+        
+        // Node format: Index | Group ID | In-Degree
+        os << "  Node_" << i << " [label=\"{Idx: " << i 
+           << " | Group ID: " << actualGroupId 
+           << " | In-Deg: " << inDegree << "}\"];\n";
+    }
+
+    os << "\n  // Edges (Group Successors)\n";
+
+    // 2. Emit edges
+    for (size_t i = 0; i < graph.succs.size(); ++i) {
+        for (unsigned targetIdx : graph.succs[i]) {
+            os << "  Node_" << i << " -> Node_" << targetIdx << ";\n";
+        }
+    }
+
+    os << "}\n";
+    os.close();
+    llvm::errs() << "Successfully dumped GroupAdjacencyGraph to " << filename << "\n";
+}
 
 } // namespace
 
@@ -390,6 +492,75 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   applyReorder(block, reorderedRes.value());
 
   return llvm::success();
+}
+
+void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
+                                    ArrayRef<Operation *> ops, 
+                                    const std::string &filename) {
+    std::ofstream os(filename);
+    if (!os.is_open()) {
+        llvm::errs() << "Failed to open file for DOT dump: " << filename << "\n";
+        return;
+    }
+
+    os << "digraph MemoryDependenceGraph {\n";
+    os << "  rankdir=TB;\n"; // Top-to-bottom layout
+    os << "  node [shape=box, fontname=\"Courier\", style=\"filled\", fillcolor=\"#f9f9f9\"];\n";
+    os << "  // Solid Blue = Memory Data Dep | Dashed Red = Execution Order Dep\n\n";
+
+    // 1. Map operations to zero-based indices for clean node IDs
+    DenseMap<Operation *, unsigned> opIndex;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        opIndex[ops[i]] = i;
+
+        // Extract printed MLIR string representation
+        std::string opStr;
+        llvm::raw_string_ostream ss(opStr);
+        ops[i]->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
+
+        // Escape string for Graphviz DOT syntax
+        std::string safeLabel;
+        for (char c : ss.str()) {
+            if (c == '"') safeLabel += "\\\"";
+            else if (c == '\\') safeLabel += "\\\\";
+            else if (c == '\n') safeLabel += "\\l"; // Left-align line breaks
+            else safeLabel += c;
+        }
+
+        os << "  Node_" << i << " [label=\"[" << i << "] " 
+           << ops[i]->getName().getStringRef().str() << "\\l" 
+           << safeLabel << "\"];\n";
+    }
+
+    os << "\n  // 1. Memory Dependencies (Solid Blue)\n";
+    for (size_t i = 0; i < ops.size(); ++i) {
+        Operation *srcOp = ops[i];
+        ArrayRef<Operation *> users = graph.getMemUsers(srcOp);
+        for (Operation *dstOp : users) {
+            auto it = opIndex.find(dstOp);
+            if (it != opIndex.end()) {
+                os << "  Node_" << i << " -> Node_" << it->second 
+                   << " [color=\"#1f77b4\", label=\"mem\", fontcolor=\"#1f77b4\"];\n";
+            }
+        }
+    }
+
+    os << "\n  // 2. Execution Order Dependencies (Dashed Red)\n";
+    for (size_t i = 0; i < ops.size(); ++i) {
+        Operation *srcOp = ops[i];
+        ArrayRef<Operation *> afterOps = graph.getExecAfter(srcOp);
+        for (Operation *dstOp : afterOps) {
+            auto it = opIndex.find(dstOp);
+            if (it != opIndex.end()) {
+                os << "  Node_" << i << " -> Node_" << it->second 
+                   << " [color=\"#d62728\", style=\"dashed\", label=\"exec\", fontcolor=\"#d62728\"];\n";
+            }
+        }
+    }
+
+    os << "}\n";
+    os.close();
+    llvm::errs() << "Successfully dumped MemoryDependenceGraph to " << filename << "\n";
 }
 
 void ReorderOpsByBlockIdPass::runOnOperation() {
