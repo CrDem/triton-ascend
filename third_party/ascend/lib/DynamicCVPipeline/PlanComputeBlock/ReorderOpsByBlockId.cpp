@@ -95,7 +95,7 @@ void dumpBlockOpGraphToDot(const BlockOpGraph &graph, const std::string &filenam
         // Print operation to a string
         std::string opStr;
         llvm::raw_string_ostream ss(opStr);
-        op->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
+        op->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
 
         // Escape special characters for DOT syntax
         std::string safeLabel;
@@ -516,7 +516,7 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
         // Extract printed MLIR string representation
         std::string opStr;
         llvm::raw_string_ostream ss(opStr);
-        ops[i]->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
+        ops[i]->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
 
         // Escape string for Graphviz DOT syntax
         std::string safeLabel;
