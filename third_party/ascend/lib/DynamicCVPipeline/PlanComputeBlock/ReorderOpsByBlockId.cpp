@@ -437,6 +437,8 @@ buildReorderedOps(const BlockOpGraph &graph,
                   const DenseMap<Operation *, int> &opBlockId) {
   SmallVector<Operation *> reordered;
   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId};
+  
+  dumpGroupAdjacencyGraphToDot(adjacencyGraph, std::string("./adjacency_graph_block_") + std::to_string(opBlockId.second) + "_before.dot");
   auto groupOrderResult = adjacencyGraph.computeTopologicalOrder();
   if (llvm::failed(groupOrderResult)) {
     return llvm::failure();
@@ -449,6 +451,8 @@ buildReorderedOps(const BlockOpGraph &graph,
       }
     }
   }
+
+  dumpGroupAdjacencyGraphToDot(adjacencyGraph, std::string("./adjacency_graph_block_") + std::to_string(opBlockId.second) + "_after.dot");
   return reordered;
 }
 
@@ -578,6 +582,12 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
 
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
+
+  const auto allOps1 =
+      llvm::to_vector(llvm::make_pointer_range(moduleOp.without_terminator()));
+
+  dumpMemoryDependenceGraphToDot(memGraph, allOps1, "./mem_dep_graph_before.dot");
+
   auto bm = ComputeBlockIdManager(moduleOp);
   auto result = moduleOp.walk([&](Block *block) {
     auto *parentOp = block->getParentOp();
@@ -592,6 +602,11 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
     }
     return WalkResult::advance();
   });
+
+  const auto allOps2 =
+      llvm::to_vector(llvm::make_pointer_range(moduleOp.without_terminator()));
+
+  dumpMemoryDependenceGraphToDot(memGraph, allOps2, "./mem_dep_graph_after.dot");
 
   if (result.wasInterrupted()) {
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);
