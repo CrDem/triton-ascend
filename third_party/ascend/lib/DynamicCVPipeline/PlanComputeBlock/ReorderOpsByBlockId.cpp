@@ -583,9 +583,13 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
 
-  const auto allOps1 =
-      llvm::to_vector(llvm::make_pointer_range(moduleOp.without_terminator()));
+  // 1. Create a vector to hold the pointers
+  llvm::SmallVector<mlir::Operation *> allOps1;
 
+  // 2. Walk the entire module and collect every operation
+  moduleOp.walk([&](mlir::Operation *op) {
+      allOps1.push_back(op);
+  });
   dumpMemoryDependenceGraphToDot(memGraph, allOps1, "./mem_dep_graph_before.dot");
 
   auto bm = ComputeBlockIdManager(moduleOp);
@@ -603,8 +607,13 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
     return WalkResult::advance();
   });
 
-  const auto allOps2 =
-      llvm::to_vector(llvm::make_pointer_range(moduleOp.without_terminator()));
+  // 1. Create a vector to hold the pointers
+  llvm::SmallVector<mlir::Operation *> allOps2;
+
+  // 2. Walk the entire module and collect every operation
+  moduleOp.walk([&](mlir::Operation *op) {
+      allOps2.push_back(op);
+  });
 
   dumpMemoryDependenceGraphToDot(memGraph, allOps2, "./mem_dep_graph_after.dot");
 
