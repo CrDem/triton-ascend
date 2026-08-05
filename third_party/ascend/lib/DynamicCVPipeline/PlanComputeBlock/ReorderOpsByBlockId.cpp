@@ -505,6 +505,7 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
 #include <tuple>
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
 void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
@@ -574,6 +575,8 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
         unsigned i = opIndex[op];
         std::string opStr;
         llvm::raw_string_ostream ss(opStr);
+        
+        // Print generic form as discardableAttributes() is unavailable
         op->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
 
         // Escape string characters for DOT formatting
@@ -618,9 +621,27 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
         emitNode(op, "  ");
     }
 
-    // 4. Deduplicate and emit Execution Order Dependencies (getExecBefore & getExecAfter)
-    std::set<std::pair<unsigned, unsigned>> execEdges;
+    // 4. Collect and Emit MLIR SSA Data Flow Dependencies (Producers -> Consumers)
+    std::set<std::pair<unsigned, unsigned>> dataEdges;
+    for (Operation *consumerOp : ops) {
+        unsigned consumerIdx = opIndex[consumerOp];
+        for (mlir::Value operand : consumerOp->getOperands()) {
+            if (Operation *producerOp = operand.getDefiningOp()) {
+                if (opIndex.count(producerOp)) {
+                    dataEdges.insert({opIndex[producerOp], consumerIdx});
+                }
+            }
+        }
+    }
 
+    os << "\n  // SSA Data Flow Dependencies (Solid Black)\n";
+    for (const auto &edge : dataEdges) {
+        os << "  Node_" << edge.first << " -> Node_" << edge.second 
+           << " [color=\"#000000\", penwidth=1.5];\n";
+    }
+
+    // 5. Collect and Emit Execution Order (Memory) Dependencies
+    std::set<std::pair<unsigned, unsigned>> execEdges;
     for (Operation *srcOp : ops) {
         unsigned srcIdx = opIndex[srcOp];
         for (Operation *dstOp : graph.getExecAfter(srcOp)) {
@@ -629,7 +650,6 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
             }
         }
     }
-
     for (Operation *dstOp : ops) {
         unsigned dstIdx = opIndex[dstOp];
         for (Operation *srcOp : graph.getExecBefore(dstOp)) {
@@ -639,15 +659,15 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
         }
     }
 
-    os << "\n  // Execution Dependencies\n";
+    os << "\n  // Memory Execution Dependencies (Dashed Red)\n";
     for (const auto &edge : execEdges) {
         os << "  Node_" << edge.first << " -> Node_" << edge.second 
-           << " [color=\"#d62728\", penwidth=1.5];\n";
+           << " [color=\"#d62728\", style=\"dashed\", penwidth=1.5];\n";
     }
 
     os << "}\n";
     os.close();
-    llvm::errs() << "Successfully dumped color-coded MemoryDependenceGraph to " << filename << "\n";
+    llvm::errs() << "Successfully dumped clustered MemoryDependenceGraph to " << filename << "\n";
 }
 
 void ReorderOpsByBlockIdPass::runOnOperation() {
