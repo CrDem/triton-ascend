@@ -588,7 +588,7 @@ void MemoryDependenceGraph::recordEdges(Operation *op,
   }
 }
 
-void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
+void mlir::CVPipeline::dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
                                     ArrayRef<Operation *> ops, 
                                     const std::string &filename) {
     std::ofstream os(filename);
