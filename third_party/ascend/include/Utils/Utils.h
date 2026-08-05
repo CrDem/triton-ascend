@@ -31,6 +31,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeRange.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -218,14 +219,31 @@ inline constexpr unsigned kDotAccIntWidth = 32;
 
 class OpBuilder;
 
+enum class IntegerExtensionKind {
+  Signed,
+  Unsigned,
+};
+
+/// Returns true when both ranges have identical ordered type signatures.
+bool haveSameTypes(TypeRange lhs, TypeRange rhs);
+
+FailureOr<Value>
+castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
+                IntegerExtensionKind extension = IntegerExtensionKind::Signed);
+
+/// Without an explicit result type, preserve equal types and widen signless
+/// integers. Mixed index/integer operands require an explicit result type.
 OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b);
+                             const Location &loc, OpBuilder &b,
+                             Type resultType = {});
 
 OpFoldResult subOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b);
 
+/// Uses the same result-type rules as addOpFoldResult.
 OpFoldResult mulOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b);
+                             const Location &loc, OpBuilder &b,
+                             Type resultType = {});
 
 OpFoldResult divOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b);
@@ -272,8 +290,6 @@ Value materializeValue(OpBuilder &builder, Location loc, OpFoldResult ofr);
 bool isZero(const OpFoldResult ofr);
 
 bool isOne(const OpFoldResult ofr);
-
-Value convertToIndexIfNeeded(Value intValue, const Location &loc, OpBuilder &b);
 
 RankedTensorType getExtractSlicedType(ArrayRef<OpFoldResult> shape,
                                       const llvm::SmallBitVector &droppedDims,

@@ -66,6 +66,7 @@ inline constexpr llvm::StringLiteral kInsertionOptimization =
     "ssbuffer.insertionOptimization";
 static constexpr llvm::StringLiteral kInlinableQuantScaleAttr =
     "enable_fast_tf32_mul";
+inline constexpr llvm::StringLiteral kGMLoadMultiBufferHintAttr = "gm_load";
 inline constexpr llvm::StringLiteral kHIVMMatmulLimitedInCubeAttr =
     "hivm.matmul_limited_in_cube";
 inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =

@@ -69,7 +69,7 @@ from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
 )
-from triton.runtime.cache import _base32, get_dump_manager
+from triton.runtime.cache import get_dump_manager
 
 
 # TODO: materialize the concrete min shape
@@ -123,15 +123,8 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
 
 
 def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, str]:
-    """
-    If TRITON_DUMP_DIR is set, return paths under that directory.
-    Otherwise, return the original src_path and dst_path.
-    """
-    dump_dir_env = os.getenv("TRITON_DUMP_DIR")
-    if dump_dir_env:
-        dump_dir = os.path.join(dump_dir_env, _base32(hash_key))
-        return (os.path.join(dump_dir, os.path.basename(src_path)), os.path.join(dump_dir, os.path.basename(dst_path)))
-    return (src_path, dst_path)
+    dump_manager = get_dump_manager(hash_key)
+    return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
 
 
 def make_ttir(mod, metadata, opt):
@@ -732,7 +725,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             cmd_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-            print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
+            print_cmd_list = cmd_list.copy()
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -949,12 +944,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
-        if opt.debug:
+
+        if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
             print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
-        elif os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-            print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
