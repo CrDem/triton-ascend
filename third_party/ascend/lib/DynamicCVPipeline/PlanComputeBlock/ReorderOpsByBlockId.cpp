@@ -438,7 +438,6 @@ buildReorderedOps(const BlockOpGraph &graph,
   SmallVector<Operation *> reordered;
   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId};
   
-  dumpGroupAdjacencyGraphToDot(adjacencyGraph, std::string("./adjacency_graph_block_") + std::to_string(opBlockId.second) + "_before.dot");
   auto groupOrderResult = adjacencyGraph.computeTopologicalOrder();
   if (llvm::failed(groupOrderResult)) {
     return llvm::failure();
@@ -452,7 +451,6 @@ buildReorderedOps(const BlockOpGraph &graph,
     }
   }
 
-  dumpGroupAdjacencyGraphToDot(adjacencyGraph, std::string("./adjacency_graph_block_") + std::to_string(opBlockId.second) + "_after.dot");
   return reordered;
 }
 
