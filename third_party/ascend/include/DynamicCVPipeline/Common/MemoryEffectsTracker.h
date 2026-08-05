@@ -30,6 +30,16 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <fstream>
+#include <string>
+#include <map>
+#include <set>
+#include <tuple>
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Value.h"
+#include "mlir/IR/BuiltinAttributes.h"
+
 namespace mlir {
 namespace CVPipeline {
 constexpr int INIT_SIZE = 4;
@@ -101,6 +111,10 @@ private:
   SmallVector<std::unique_ptr<MemSlot>> slots;
   DenseMap<Value, MemSlot *> valueToSlot;
 };
+
+void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
+                                    ArrayRef<Operation *> ops, 
+                                    const std::string &filename);
 
 } // namespace CVPipeline
 } // namespace mlir

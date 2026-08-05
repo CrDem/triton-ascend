@@ -498,177 +498,7 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   return llvm::success();
 }
 
-#include <fstream>
-#include <string>
-#include <map>
-#include <set>
-#include <tuple>
-#include "llvm/Support/raw_ostream.h"
-#include "mlir/IR/Operation.h"
-#include "mlir/IR/Value.h"
-#include "mlir/IR/BuiltinAttributes.h"
-
-void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
-                                    ArrayRef<Operation *> ops, 
-                                    const std::string &filename) {
-    std::ofstream os(filename);
-    if (!os.is_open()) {
-        llvm::errs() << "Failed to open file for DOT dump: " << filename << "\n";
-        return;
-    }
-
-    os << "digraph MemoryDependenceGraph {\n";
-    os << "  rankdir=TB;\n";     // Force vertical layout
-    os << "  compound=true;\n";  // Allow cluster subgraphs
-    os << "  node [shape=box, fontname=\"Courier\", style=\"filled\"];\n\n";
-
-    // Helper lambda to determine node background and border color based on core_type
-    auto getNodeColors = [](Operation *op) -> std::pair<std::string, std::string> {
-        std::string coreType = "";
-        if (auto attr = op->getAttrOfType<mlir::StringAttr>("ssbuffer.core_type")) {
-            coreType = attr.getValue().str();
-        } else if (auto attrOld = op->getAttrOfType<mlir::StringAttr>("ssbuf.core_type")) {
-            coreType = attrOld.getValue().str();
-        }
-
-        if (coreType.find("CUBE_AND_VECTOR") != std::string::npos) {
-            return {"#e1d5e7", "#9673a6"}; // Purple fill / Dark purple border
-        } else if (coreType.find("CUBE") != std::string::npos) {
-            return {"#ffe6cc", "#d79b00"}; // Orange fill / Amber border
-        } else if (coreType.find("VECTOR") != std::string::npos) {
-            return {"#d5e8d4", "#82b366"}; // Green fill / Green border
-        }
-        return {"#ffffff", "#cccccc"};     // Default White fill / Gray border
-    };
-
-    // 1. Group operations by {block_id, transfer_id}
-    std::map<std::pair<int, int>, std::vector<Operation*>> clusters;
-    std::vector<Operation*> unassigned;
-    DenseMap<Operation *, unsigned> opIndex;
-
-    for (size_t i = 0; i < ops.size(); ++i) {
-        opIndex[ops[i]] = i;
-        int blockId = -1;
-        int transferId = -1;
-
-        if (auto bAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuffer.block_id")) {
-            blockId = bAttr.getInt();
-        } else if (auto bAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuf.block_id")) {
-            blockId = bAttr.getInt();
-        }
-
-        if (auto tAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuffer.transfer_id")) {
-            transferId = tAttr.getInt();
-        } else if (auto tAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuf.transfer_id")) {
-            transferId = tAttr.getInt();
-        }
-
-        if (blockId != -1 || transferId != -1) {
-            clusters[{blockId, transferId}].push_back(ops[i]);
-        } else {
-            unassigned.push_back(ops[i]);
-        }
-    }
-
-    // Helper lambda to format and emit a node in Graphviz format
-    auto emitNode = [&](Operation *op, const std::string &indent) {
-        unsigned i = opIndex[op];
-        std::string opStr;
-        llvm::raw_string_ostream ss(opStr);
-        
-        // Print generic form as discardableAttributes() is unavailable
-        op->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
-
-        // Escape string characters for DOT formatting
-        std::string safeLabel;
-        for (char c : ss.str()) {
-            if (c == '"') safeLabel += "\\\"";
-            else if (c == '\\') safeLabel += "\\\\";
-            else if (c == '\n') safeLabel += "\\l";
-            else safeLabel += c;
-        }
-
-        auto [fillColor, borderColor] = getNodeColors(op);
-
-        std::string coreTag = "";
-        if (auto attr = op->getAttrOfType<mlir::StringAttr>("ssbuffer.core_type")) {
-            coreTag = " [" + attr.getValue().str() + "]";
-        }
-
-        os << indent << "Node_" << i << " [label=\"[" << i << "]" << coreTag << " "
-           << op->getName().getStringRef().str() << "\\l" << safeLabel 
-           << "\", fillcolor=\"" << fillColor << "\", color=\"" << borderColor << "\", penwidth=1.5];\n";
-    };
-
-    // 2. Emit Bounding Boxes (Clusters) for grouped block_ids
-    int clusterIdx = 0;
-    for (const auto &[key, clusterOps] : clusters) {
-        os << "  subgraph cluster_" << clusterIdx++ << " {\n";
-        os << "    label=\"block_id: " << key.first << " | transfer_id: " << key.second << "\";\n";
-        os << "    style=\"rounded,filled\";\n";
-        os << "    fillcolor=\"#f8f9fa\";\n";
-        os << "    color=\"#495057\";\n";
-        os << "    penwidth=2;\n\n";
-
-        for (Operation *op : clusterOps) {
-            emitNode(op, "    ");
-        }
-        os << "  }\n\n";
-    }
-
-    // 3. Emit unassigned operations (operations without block_id or transfer_id)
-    for (Operation *op : unassigned) {
-        emitNode(op, "  ");
-    }
-
-    // 4. Collect and Emit MLIR SSA Data Flow Dependencies (Producers -> Consumers)
-    std::set<std::pair<unsigned, unsigned>> dataEdges;
-    for (Operation *consumerOp : ops) {
-        unsigned consumerIdx = opIndex[consumerOp];
-        for (mlir::Value operand : consumerOp->getOperands()) {
-            if (Operation *producerOp = operand.getDefiningOp()) {
-                if (opIndex.count(producerOp)) {
-                    dataEdges.insert({opIndex[producerOp], consumerIdx});
-                }
-            }
-        }
-    }
-
-    os << "\n  // SSA Data Flow Dependencies (Solid Black)\n";
-    for (const auto &edge : dataEdges) {
-        os << "  Node_" << edge.first << " -> Node_" << edge.second 
-           << " [color=\"#000000\", penwidth=1.5];\n";
-    }
-
-    // 5. Collect and Emit Execution Order (Memory) Dependencies
-    std::set<std::pair<unsigned, unsigned>> execEdges;
-    for (Operation *srcOp : ops) {
-        unsigned srcIdx = opIndex[srcOp];
-        for (Operation *dstOp : graph.getExecAfter(srcOp)) {
-            if (opIndex.count(dstOp)) {
-                execEdges.insert({srcIdx, opIndex[dstOp]});
-            }
-        }
-    }
-    for (Operation *dstOp : ops) {
-        unsigned dstIdx = opIndex[dstOp];
-        for (Operation *srcOp : graph.getExecBefore(dstOp)) {
-            if (opIndex.count(srcOp)) {
-                execEdges.insert({opIndex[srcOp], dstIdx});
-            }
-        }
-    }
-
-    os << "\n  // Memory Execution Dependencies (Dashed Red)\n";
-    for (const auto &edge : execEdges) {
-        os << "  Node_" << edge.first << " -> Node_" << edge.second 
-           << " [color=\"#d62728\", style=\"dashed\", penwidth=1.5];\n";
-    }
-
-    os << "}\n";
-    os.close();
-    llvm::errs() << "Successfully dumped clustered MemoryDependenceGraph to " << filename << "\n";
-}
+static int call_count = 0;
 
 void ReorderOpsByBlockIdPass::runOnOperation() {
   LOG_DEBUG("\n=== Pass: TuningOpSeq ===\n");
@@ -685,15 +515,6 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
 
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
-
-  // 1. Create a vector to hold the pointers
-  llvm::SmallVector<mlir::Operation *> allOps1;
-
-  // 2. Walk the entire module and collect every operation
-  moduleOp.walk([&](mlir::Operation *op) {
-      allOps1.push_back(op);
-  });
-  dumpMemoryDependenceGraphToDot(memGraph, allOps1, "./mem_dep_graph_before.dot");
 
   auto bm = ComputeBlockIdManager(moduleOp);
   auto result = moduleOp.walk([&](Block *block) {
@@ -718,7 +539,8 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
       allOps2.push_back(op);
   });
 
-  dumpMemoryDependenceGraphToDot(memGraph, allOps2, "./mem_dep_graph_after.dot");
+  dumpMemoryDependenceGraphToDot(memGraph, allOps2, std::string("./mem_dep_graph_") + std::to_string(call_count) + std::string("_after_reorderopsbiblockid.dot"));
+  call_count++;
 
   if (result.wasInterrupted()) {
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);
