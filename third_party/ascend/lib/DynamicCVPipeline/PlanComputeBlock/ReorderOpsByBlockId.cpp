@@ -498,6 +498,15 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   return llvm::success();
 }
 
+#include <fstream>
+#include <string>
+#include <map>
+#include <set>
+#include <tuple>
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/BuiltinAttributes.h"
+
 void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph, 
                                     ArrayRef<Operation *> ops, 
                                     const std::string &filename) {
@@ -508,63 +517,137 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
     }
 
     os << "digraph MemoryDependenceGraph {\n";
-    os << "  rankdir=TB;\n"; // Top-to-bottom layout
-    os << "  node [shape=box, fontname=\"Courier\", style=\"filled\", fillcolor=\"#f9f9f9\"];\n";
-    os << "  // Solid Blue = Memory Data Dep | Dashed Red = Execution Order Dep\n\n";
+    os << "  rankdir=TB;\n";     // Force vertical layout
+    os << "  compound=true;\n";  // Allow cluster subgraphs
+    os << "  node [shape=box, fontname=\"Courier\", style=\"filled\"];\n\n";
 
-    // 1. Map operations to zero-based indices for clean node IDs
+    // Helper lambda to determine node background and border color based on core_type
+    auto getNodeColors = [](Operation *op) -> std::pair<std::string, std::string> {
+        std::string coreType = "";
+        if (auto attr = op->getAttrOfType<mlir::StringAttr>("ssbuffer.core_type")) {
+            coreType = attr.getValue().str();
+        } else if (auto attrOld = op->getAttrOfType<mlir::StringAttr>("ssbuf.core_type")) {
+            coreType = attrOld.getValue().str();
+        }
+
+        if (coreType.find("CUBE_AND_VECTOR") != std::string::npos) {
+            return {"#e1d5e7", "#9673a6"}; // Purple fill / Dark purple border
+        } else if (coreType.find("CUBE") != std::string::npos) {
+            return {"#ffe6cc", "#d79b00"}; // Orange fill / Amber border
+        } else if (coreType.find("VECTOR") != std::string::npos) {
+            return {"#d5e8d4", "#82b366"}; // Green fill / Green border
+        }
+        return {"#ffffff", "#cccccc"};     // Default White fill / Gray border
+    };
+
+    // 1. Group operations by {block_id, transfer_id}
+    std::map<std::pair<int, int>, std::vector<Operation*>> clusters;
+    std::vector<Operation*> unassigned;
     DenseMap<Operation *, unsigned> opIndex;
+
     for (size_t i = 0; i < ops.size(); ++i) {
         opIndex[ops[i]] = i;
+        int blockId = -1;
+        int transferId = -1;
 
-        // Extract printed MLIR string representation
+        if (auto bAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuffer.block_id")) {
+            blockId = bAttr.getInt();
+        } else if (auto bAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuf.block_id")) {
+            blockId = bAttr.getInt();
+        }
+
+        if (auto tAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuffer.transfer_id")) {
+            transferId = tAttr.getInt();
+        } else if (auto tAttr = ops[i]->getAttrOfType<mlir::IntegerAttr>("ssbuf.transfer_id")) {
+            transferId = tAttr.getInt();
+        }
+
+        if (blockId != -1 || transferId != -1) {
+            clusters[{blockId, transferId}].push_back(ops[i]);
+        } else {
+            unassigned.push_back(ops[i]);
+        }
+    }
+
+    // Helper lambda to format and emit a node in Graphviz format
+    auto emitNode = [&](Operation *op, const std::string &indent) {
+        unsigned i = opIndex[op];
         std::string opStr;
         llvm::raw_string_ostream ss(opStr);
-        ops[i]->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
+        op->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
 
-        // Escape string for Graphviz DOT syntax
+        // Escape string characters for DOT formatting
         std::string safeLabel;
         for (char c : ss.str()) {
             if (c == '"') safeLabel += "\\\"";
             else if (c == '\\') safeLabel += "\\\\";
-            else if (c == '\n') safeLabel += "\\l"; // Left-align line breaks
+            else if (c == '\n') safeLabel += "\\l";
             else safeLabel += c;
         }
 
-        os << "  Node_" << i << " [label=\"[" << i << "] " 
-           << ops[i]->getName().getStringRef().str() << "\\l" 
-           << safeLabel << "\"];\n";
+        auto [fillColor, borderColor] = getNodeColors(op);
+
+        std::string coreTag = "";
+        if (auto attr = op->getAttrOfType<mlir::StringAttr>("ssbuffer.core_type")) {
+            coreTag = " [" + attr.getValue().str() + "]";
+        }
+
+        os << indent << "Node_" << i << " [label=\"[" << i << "]" << coreTag << " "
+           << op->getName().getStringRef().str() << "\\l" << safeLabel 
+           << "\", fillcolor=\"" << fillColor << "\", color=\"" << borderColor << "\", penwidth=1.5];\n";
+    };
+
+    // 2. Emit Bounding Boxes (Clusters) for grouped block_ids
+    int clusterIdx = 0;
+    for (const auto &[key, clusterOps] : clusters) {
+        os << "  subgraph cluster_" << clusterIdx++ << " {\n";
+        os << "    label=\"block_id: " << key.first << " | transfer_id: " << key.second << "\";\n";
+        os << "    style=\"rounded,filled\";\n";
+        os << "    fillcolor=\"#f8f9fa\";\n";
+        os << "    color=\"#495057\";\n";
+        os << "    penwidth=2;\n\n";
+
+        for (Operation *op : clusterOps) {
+            emitNode(op, "    ");
+        }
+        os << "  }\n\n";
     }
 
-    os << "\n  // 1. Memory Dependencies (Solid Blue)\n";
-    for (size_t i = 0; i < ops.size(); ++i) {
-        Operation *srcOp = ops[i];
-        ArrayRef<Operation *> users = graph.getMemUsers(srcOp);
-        for (Operation *dstOp : users) {
-            auto it = opIndex.find(dstOp);
-            if (it != opIndex.end()) {
-                os << "  Node_" << i << " -> Node_" << it->second 
-                   << " [color=\"#1f77b4\", label=\"mem\", fontcolor=\"#1f77b4\"];\n";
+    // 3. Emit unassigned operations (operations without block_id or transfer_id)
+    for (Operation *op : unassigned) {
+        emitNode(op, "  ");
+    }
+
+    // 4. Deduplicate and emit Execution Order Dependencies (getExecBefore & getExecAfter)
+    std::set<std::pair<unsigned, unsigned>> execEdges;
+
+    for (Operation *srcOp : ops) {
+        unsigned srcIdx = opIndex[srcOp];
+        for (Operation *dstOp : graph.getExecAfter(srcOp)) {
+            if (opIndex.count(dstOp)) {
+                execEdges.insert({srcIdx, opIndex[dstOp]});
             }
         }
     }
 
-    os << "\n  // 2. Execution Order Dependencies (Dashed Red)\n";
-    for (size_t i = 0; i < ops.size(); ++i) {
-        Operation *srcOp = ops[i];
-        ArrayRef<Operation *> afterOps = graph.getExecAfter(srcOp);
-        for (Operation *dstOp : afterOps) {
-            auto it = opIndex.find(dstOp);
-            if (it != opIndex.end()) {
-                os << "  Node_" << i << " -> Node_" << it->second 
-                   << " [color=\"#d62728\", style=\"dashed\", label=\"exec\", fontcolor=\"#d62728\"];\n";
+    for (Operation *dstOp : ops) {
+        unsigned dstIdx = opIndex[dstOp];
+        for (Operation *srcOp : graph.getExecBefore(dstOp)) {
+            if (opIndex.count(srcOp)) {
+                execEdges.insert({opIndex[srcOp], dstIdx});
             }
         }
+    }
+
+    os << "\n  // Execution Dependencies\n";
+    for (const auto &edge : execEdges) {
+        os << "  Node_" << edge.first << " -> Node_" << edge.second 
+           << " [color=\"#d62728\", penwidth=1.5];\n";
     }
 
     os << "}\n";
     os.close();
-    llvm::errs() << "Successfully dumped MemoryDependenceGraph to " << filename << "\n";
+    llvm::errs() << "Successfully dumped color-coded MemoryDependenceGraph to " << filename << "\n";
 }
 
 void ReorderOpsByBlockIdPass::runOnOperation() {
