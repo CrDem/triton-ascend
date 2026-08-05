@@ -574,7 +574,7 @@ void dumpMemoryDependenceGraphToDot(const MemoryDependenceGraph &graph,
         unsigned i = opIndex[op];
         std::string opStr;
         llvm::raw_string_ostream ss(opStr);
-        op->print(ss, mlir::OpPrintingFlags().skipRegions().discardableAttributes());
+        op->print(ss, mlir::OpPrintingFlags().skipRegions().printGenericOpForm());
 
         // Escape string characters for DOT formatting
         std::string safeLabel;
