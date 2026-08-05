@@ -27,11 +27,10 @@ set_property(DIRECTORY PROPERTY RULE_LAUNCH_LINK ${_saved_launch_link})
 include_directories(${ASCENDNPU_IR_SRC_DIR}/bishengir/include)
 include_directories(${ASCENDNPU_IR_BINARY_DIR}/bishengir/include) # Tablegen'd files
 
-add_subdirectory(bin)
-add_subdirectory(include)
-add_subdirectory(lib)
-
-
+# NOTE: the costmodel must be configured BEFORE add_subdirectory(lib): the
+# include_directories() calls and the AscendModelAnalysis target below are
+# consumed by lib/DynamicCVPipeline (cost estimation inside the CV pipeline),
+# and both only reach subdirectories added after this point.
 option(TRITON_ASCEND_ENABLE_COSTMODEL_INPROC "Enable in-process costmodel C++ bridge" ON)
 if(TRITON_ASCEND_ENABLE_COSTMODEL_INPROC)
   set(TRITON_ASCEND_COSTMODEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/costmodel" CACHE PATH "Path to vendored vTriton source root")
@@ -71,6 +70,10 @@ if(TRITON_ASCEND_ENABLE_COSTMODEL_INPROC)
 else()
   set(TRITON_ASCEND_HAS_INPROC_COSTMODEL 0)
 endif()
+
+add_subdirectory(bin)
+add_subdirectory(include)
+add_subdirectory(lib)
 
 add_triton_plugin(TritonAscend
   ${CMAKE_CURRENT_SOURCE_DIR}/triton_ascend.cc

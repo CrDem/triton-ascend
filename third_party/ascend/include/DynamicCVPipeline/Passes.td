@@ -73,6 +73,21 @@ def ComputeBlockOptPass : Pass<"compute-block-id-opt", "mlir::ModuleOp"> {
   let constructor = "triton::createComputeBlockOptPass()";
 }
 
+def EstimateCVPipelineCostPass : Pass<"estimate-cv-pipeline-cost", "mlir::ModuleOp"> {
+  let summary = "Estimate the execution cost of the dynamic CV pipeline IR";
+  let description = [{
+    Annotates the module with an estimated cycle count for the CV-pipelined IR.
+    Must run before remove-ssbuf-attr, since the estimate is driven by the
+    ssbuffer.* attributes (core_type in particular) that pass strips.
+
+    The estimate is advisory: it never mutates compute IR and never fails the
+    pipeline. It exists so that alternative CV-pipeline IR variants can be
+    ranked against each other.
+  }];
+  let constructor = "triton::createEstimateCVPipelineCostPass()";
+  let dependentDialects = ["scope::ScopeDialect", "hivm::HIVMDialect"];
+}
+
 def RemoveSsbufAttrPass : Pass<"remove-ssbuf-attr", "mlir::ModuleOp"> {
   let summary = "Remove ssbuf attributes";
   let constructor = "triton::createRemoveSsbufAttrPass()";
