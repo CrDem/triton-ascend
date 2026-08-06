@@ -271,6 +271,18 @@ public:
   // Performance estimation
   int64_t estimateCubeCycles(int64_t M, int64_t N, int64_t K) const;
   int64_t estimateVectorCycles(int64_t numElements) const;
+
+  /// Cycles for one vector instruction over ``numElements`` elements, using
+  /// the migrated per-(intrinsic, dtype) cycle table:
+  ///   repeats = ceil(numElements * elemBytes / 256B)
+  ///   cycles  = compute(intrinsic, dtype) * repeats + vector startup
+  /// ``intrinsic`` is a tilesim mnemonic such as "VADD" or "VEXP"; an unknown
+  /// or empty mnemonic falls back to one cycle per repeat.
+  ///
+  /// Prefer this over ``estimateVectorCycles``, which charges every vector
+  /// operation the same regardless of which instruction it lowers to.
+  int64_t estimateVectorCyclesFromTable(int64_t numElements, int elementBits,
+                                        llvm::StringRef intrinsic) const;
   int64_t estimateMemoryCycles(llvm::StringRef moverName, int64_t bytes) const;
   int64_t estimateMemoryCyclesWithLatency(llvm::StringRef space,
                                           int64_t bytes) const;

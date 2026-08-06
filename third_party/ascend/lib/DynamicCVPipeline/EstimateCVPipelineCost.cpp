@@ -61,6 +61,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -78,6 +79,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
@@ -235,6 +237,14 @@ bool isZeroCostOp(Operation *op) {
   if (CVPipeline::isViewLike(op)) {
     return true; // subview/reshape: descriptor math, no data movement
   }
+  // Shape metadata: reshape/expand/collapse/cast rewrite how a buffer is
+  // indexed, they never move an element. Charging them as vector work is a
+  // pure over-estimate. (The memref equivalents are ViewLikeOpInterface and
+  // are already covered above.)
+  if (isa<tensor::ReshapeOp, tensor::ExpandShapeOp, tensor::CollapseShapeOp,
+          tensor::CastOp>(op)) {
+    return true;
+  }
   if (isa<arith::ConstantOp>(op)) {
     return true;
   }
@@ -245,6 +255,17 @@ bool isZeroCostOp(Operation *op) {
   }
   return false;
 }
+
+/// Cross-core synchronisation. These occupy real time -- a core waiting on a
+/// flag is idle -- but modelling that needs the flag graph the CV pipeline
+/// builds, which this pass does not read yet. Recognised explicitly so they
+/// are reported as un-modelled rather than silently mistaken for compute.
+bool isSyncOp(Operation *op) {
+  return isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp, hivm::SyncBlockOp,
+             hivm::SyncBlockLockOp, hivm::SyncBlockUnlockOp,
+             hivm::CreateSyncBlockLockOp>(op);
+}
+
 
 /// Whether a value's backing buffer is a local (on-chip) allocation, as opposed
 /// to a kernel argument living in global memory. Mirrors the dest-tracing rule
@@ -322,6 +343,12 @@ enum class CostConfidence {
   /// No dedicated model for this operation kind: it was charged generically
   /// from its element count. The number is an order of magnitude, not a model.
   Generic,
+  /// Recognised as something that does occupy hardware, but deliberately
+  /// charged zero because no model exists yet. Cross-core synchronisation is
+  /// the important case: it is real time that this pass cannot yet account
+  /// for. Distinct from Generic (which does produce a number) and from the
+  /// zero-cost ops (which really are free).
+  NotModelled,
   /// A required input is not statically known -- a dynamic shape -- so no cost
   /// could be computed at all and the operation contributes nothing.
   UnknownSize,
@@ -333,6 +360,8 @@ llvm::StringRef stringifyConfidence(CostConfidence confidence) {
     return "modelled";
   case CostConfidence::Generic:
     return "generic";
+  case CostConfidence::NotModelled:
+    return "not-modelled";
   case CostConfidence::UnknownSize:
     return "unknown-size";
   }
@@ -400,7 +429,80 @@ OpCost estimateTransfer(Type shapedType, bool isCube, bool isLoad,
   return cost;
 }
 
-/// Cost of an elementwise / reduction style compute op on the Vector core.
+/// Map an operation to the vector instruction whose measured cost it is closest
+/// to. The names are tilesim mnemonics; the migrated cycle table distinguishes
+/// cheap ALU ops from transcendentals, so this mapping is what makes an exp or
+/// a divide cost more than an add. Returning an empty name means "no mapping",
+/// which the caller reports as a gap rather than hiding.
+llvm::StringRef getVectorIntrinsic(Operation *op) {
+  using Ret = llvm::StringRef;
+  return llvm::TypeSwitch<Operation *, Ret>(op)
+      // Arithmetic.
+      .Case<arith::AddFOp, arith::AddIOp>(
+          [](Operation *) { return Ret("VADD"); })
+      .Case<arith::SubFOp, arith::SubIOp>(
+          [](Operation *) { return Ret("VSUB"); })
+      .Case<arith::MulFOp, arith::MulIOp>(
+          [](Operation *) { return Ret("VMUL"); })
+      .Case<arith::DivFOp, arith::DivSIOp, arith::DivUIOp>(
+          [](Operation *) { return Ret("VDIV"); })
+      .Case<arith::MaxNumFOp, arith::MaximumFOp, arith::MaxSIOp,
+            arith::MaxUIOp>([](Operation *) { return Ret("VMAX"); })
+      .Case<arith::MinNumFOp, arith::MinimumFOp, arith::MinSIOp,
+            arith::MinUIOp>([](Operation *) { return Ret("VMIN"); })
+      .Case<arith::NegFOp>([](Operation *) { return Ret("VSUB"); })
+      .Case<arith::SelectOp>([](Operation *) { return Ret("VSEL"); })
+      .Case<arith::CmpFOp, arith::CmpIOp>(
+          [](Operation *) { return Ret("VCMPV_GE"); })
+      // Conversions all cost about one pass over the data.
+      .Case<arith::TruncFOp, arith::ExtFOp, arith::TruncIOp, arith::ExtSIOp,
+            arith::ExtUIOp, arith::SIToFPOp, arith::UIToFPOp, arith::FPToSIOp,
+            arith::FPToUIOp, arith::BitcastOp>(
+          [](Operation *) { return Ret("VCOPY"); })
+      // Transcendentals.
+      .Case<math::ExpOp, math::Exp2Op>([](Operation *) { return Ret("VEXP"); })
+      .Case<math::LogOp, math::Log2Op>([](Operation *) { return Ret("LOG"); })
+      .Case<math::SqrtOp, math::RsqrtOp>(
+          [](Operation *) { return Ret("VSQRT"); })
+      .Case<math::AbsFOp, math::AbsIOp>([](Operation *) { return Ret("VABS"); })
+      // Structured ops that are really one pass over the data.
+      .Case<linalg::FillOp, linalg::TransposeOp, linalg::CopyOp>(
+          [](Operation *) { return Ret("VCOPY"); })
+      .Case<linalg::BroadcastOp>([](Operation *) { return Ret("VBRCB"); })
+      .Default([](Operation *) { return Ret(); });
+}
+
+/// Cost of a reduction. A reduction is not one pass over the data: after the
+/// elementwise pass it costs a logarithmic tree inside each vector register and
+/// another one across registers. Mirrors the costmodel's own reduce model.
+OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
+                      const HardwareConfig &config) {
+  OpCost cost;
+  cost.unit = HWUnit::Vector;
+
+  int elementBits = getShapedElementBits(shapedType);
+  int64_t vectorWidth = elementBits > 0 ? 2048 / elementBits : 64;
+  if (vectorWidth <= 0) {
+    vectorWidth = 1;
+  }
+  int64_t numVectors = (elements + vectorWidth - 1) / vectorWidth;
+
+  auto log2Steps = [](int64_t value) {
+    int steps = 0;
+    while (value > 1) {
+      value /= 2;
+      ++steps;
+    }
+    return steps;
+  };
+
+  cost.cycles = numVectors + log2Steps(vectorWidth) + log2Steps(numVectors) +
+                config.getVectorStartupLatency();
+  cost.flops = elements;
+  return cost;
+}
+
+/// Cost of an elementwise compute op on the Vector core.
 OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
   OpCost cost;
   cost.unit = HWUnit::Vector;
@@ -416,14 +518,19 @@ OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
     return cost;
   }
 
-  // Charged purely by element count: this path has no knowledge of which
-  // vector instruction the operation lowers to, so every op of a given size
-  // costs the same. Flagged as Generic precisely so the operations that end up
-  // here show up in the breakdown as candidates for a dedicated model.
-  cost.cycles =
-      config.estimateVectorCycles(*elements) + config.getVectorStartupLatency();
+  if (isa<linalg::ReduceOp>(op)) {
+    return estimateReduce(op, shapedType, *elements, config);
+  }
+
+  llvm::StringRef intrinsic = getVectorIntrinsic(op);
+  cost.cycles = config.estimateVectorCyclesFromTable(
+      *elements, getShapedElementBits(shapedType), intrinsic);
   cost.flops = *elements;
-  cost.confidence = CostConfidence::Generic;
+  // With a known instruction the cost comes from the measured table; without
+  // one it falls back to a flat cycle per pass, which is a guess worth
+  // surfacing rather than a model.
+  cost.confidence = intrinsic.empty() ? CostConfidence::Generic
+                                      : CostConfidence::Modelled;
   return cost;
 }
 
@@ -435,10 +542,44 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     return std::nullopt;
   }
 
+  // Cross-core synchronisation: real time, no model yet.
+  if (isSyncOp(op)) {
+    OpCost cost;
+    cost.unit = HWUnit::Scalar;
+    cost.confidence = CostConfidence::NotModelled;
+    return cost;
+  }
+
+  // Pointer arithmetic and scalar loads/stores emitted by the LLVM lowering.
+  // They run on the scalar unit, outside the Cube/Vector roofline, so they are
+  // charged zero -- but recognised, so they do not masquerade as compute of
+  // unknown size.
+  if (isa<LLVM::LLVMDialect>(op->getDialect())) {
+    OpCost cost;
+    cost.unit = HWUnit::Scalar;
+    cost.confidence = CostConfidence::NotModelled;
+    return cost;
+  }
+
   const bool isCube = runsOnCubeCore(op);
 
   if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
     return estimateMatmul(matmulOp, config);
+  }
+
+  // hivm.hir.fixpipe is the Cube write-back engine: it drains the accumulator
+  // through the FixPipe unit. Costing it as generic compute both used the
+  // wrong formula and loaded the wrong unit.
+  if (isa<hivm::FixpipeOp>(op)) {
+    Type shapedType = getRepresentativeShapedType(op);
+    if (!shapedType) {
+      OpCost cost;
+      cost.unit = HWUnit::FixPipe;
+      cost.confidence = CostConfidence::UnknownSize;
+      return cost;
+    }
+    return estimateTransfer(shapedType, /*isCube=*/true, /*isLoad=*/false,
+                            config);
   }
 
   if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
@@ -451,6 +592,19 @@ std::optional<OpCost> estimateOpCost(Operation *op,
                             config);
   }
 
+  // hivm.hir.copy moves a buffer, it does not compute over it: it belongs to a
+  // data mover, not to the vector ALU.
+  if (isa<hivm::CopyOp>(op)) {
+    Type shapedType = getRepresentativeShapedType(op);
+    if (!shapedType) {
+      OpCost cost;
+      cost.unit = getTransferUnit(isCube, /*isLoad=*/true);
+      cost.confidence = CostConfidence::UnknownSize;
+      return cost;
+    }
+    return estimateTransfer(shapedType, isCube, /*isLoad=*/true, config);
+  }
+
   if (CVPipeline::isStoreLike(op)) {
     Type shapedType = getRepresentativeShapedType(op);
     if (!shapedType) {
@@ -460,6 +614,16 @@ std::optional<OpCost> estimateOpCost(Operation *op,
       return cost;
     }
     return estimateTransfer(shapedType, isCube, /*isLoad=*/false, config);
+  }
+
+  // Anything left that touches no shaped value is scalar bookkeeping: index
+  // queries, block ids, predicates. Checked after the specific kinds above so
+  // it can never swallow one of them.
+  if (!getRepresentativeShapedType(op)) {
+    OpCost cost;
+    cost.unit = HWUnit::Scalar;
+    cost.confidence = CostConfidence::NotModelled;
+    return cost;
   }
 
   // Remaining shaped compute. Cube-side non-matmul work (e.g. a fill or
@@ -557,8 +721,10 @@ int confidenceRank(CostConfidence confidence) {
     return 0;
   case CostConfidence::Generic:
     return 1;
-  case CostConfidence::UnknownSize:
+  case CostConfidence::NotModelled:
     return 2;
+  case CostConfidence::UnknownSize:
+    return 3;
   }
   return 0;
 }
@@ -586,7 +752,9 @@ struct CostBreakdown {
     if (cost.confidence == CostConfidence::UnknownSize) {
       unknownSizeOps.push_back(op);
     }
-    if (!weight.isKnown) {
+    // Only worth reporting when the operation actually costs something: a
+    // zero-cycle op in a dynamic loop does not move the estimate either way.
+    if (!weight.isKnown && cost.cycles > 0) {
       dynamicTripCountOps.push_back(op);
     }
   }
@@ -644,20 +812,28 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
   }
 
   // The actionable lists.
-  llvm::SmallVector<llvm::StringRef> genericKinds;
-  for (const auto &[name, stats] : rows) {
-    if (stats.confidence == CostConfidence::Generic) {
-      genericKinds.push_back(name);
+  auto listKinds = [&](CostConfidence confidence, llvm::StringRef what) {
+    llvm::SmallVector<llvm::StringRef> kinds;
+    for (const auto &[name, stats] : rows) {
+      if (stats.confidence == confidence) {
+        kinds.push_back(name);
+      }
     }
-  }
-  if (!genericKinds.empty()) {
-    os << "[" << DEBUG_TYPE << "] " << genericKinds.size()
-       << " operation kind(s) charged by element count only, i.e. with no"
-          " dedicated cost model:\n";
-    for (llvm::StringRef name : genericKinds) {
+    if (kinds.empty()) {
+      return;
+    }
+    os << "[" << DEBUG_TYPE << "] " << kinds.size() << " operation kind(s) "
+       << what << ":\n";
+    for (llvm::StringRef name : kinds) {
       os << "[" << DEBUG_TYPE << "]     " << name << "\n";
     }
-  }
+  };
+
+  listKinds(CostConfidence::Generic,
+            "charged by element count only, i.e. with no dedicated cost model");
+  listKinds(CostConfidence::NotModelled,
+            "recognised but charged zero: they occupy hardware time this pass "
+            "does not account for yet (synchronisation, scalar work)");
 
   printOpList(os, "operation(s) with a non-static shape, contributing 0 cycles",
               breakdown.unknownSizeOps);
@@ -707,7 +883,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     }
 
     LoopWeight weight = getLoopWeight(op);
-    if (cost->confidence == CostConfidence::UnknownSize || !weight.isKnown) {
+    // "Unknown" means the estimate is understated because of this operation.
+    // A zero-cycle operation in a dynamic loop does not qualify.
+    if (cost->confidence == CostConfidence::UnknownSize ||
+        (!weight.isKnown && cost->cycles > 0)) {
       ++unknownOps;
     }
     breakdown.record(op, *cost, weight);
