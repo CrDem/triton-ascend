@@ -39,6 +39,15 @@
 // modelled. The number is intended for *ranking* CV pipeline variants against
 // each other, not for absolute latency prediction.
 //
+// Because a single number hides how much of it was actually modelled, every
+// operation is classified (see CostConfidence) and a per-operation-kind
+// breakdown can be printed. Operations charged generically are the ones worth
+// teaching the model about next; operations of unknown size contribute nothing
+// at all and would otherwise be invisible.
+//
+//   TRITON_ASCEND_CV_COST_VERBOSE=1   one-line summary
+//   TRITON_ASCEND_CV_COST_VERBOSE=2   summary + per-operation breakdown
+//
 //===----------------------------------------------------------------------===//
 
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
@@ -63,7 +72,11 @@
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/PassRegistry.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
@@ -299,12 +312,39 @@ int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
 // Cost estimation
 //===----------------------------------------------------------------------===//
 
+/// How much the model actually knows about an operation, as opposed to how
+/// confident the resulting number looks. Reported per operation kind so that
+/// the list of things worth teaching the model is visible rather than guessed.
+enum class CostConfidence {
+  /// The operation kind has a dedicated cost model and every input that model
+  /// needs (shape, dtype, sizes) is statically known.
+  Modelled,
+  /// No dedicated model for this operation kind: it was charged generically
+  /// from its element count. The number is an order of magnitude, not a model.
+  Generic,
+  /// A required input is not statically known -- a dynamic shape -- so no cost
+  /// could be computed at all and the operation contributes nothing.
+  UnknownSize,
+};
+
+llvm::StringRef stringifyConfidence(CostConfidence confidence) {
+  switch (confidence) {
+  case CostConfidence::Modelled:
+    return "modelled";
+  case CostConfidence::Generic:
+    return "generic";
+  case CostConfidence::UnknownSize:
+    return "unknown-size";
+  }
+  return "?";
+}
+
 struct OpCost {
   HWUnit unit = HWUnit::Scalar;
   int64_t cycles = 0;
   int64_t bytes = 0;
   int64_t flops = 0;
-  bool isKnown = true;
+  CostConfidence confidence = CostConfidence::Modelled;
 };
 
 /// Cost of a linalg.matmul on the Cube core.
@@ -315,7 +355,7 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
 
   auto inputs = matmulOp.getInputs();
   if (inputs.size() < 2) {
-    cost.isKnown = false;
+    cost.confidence = CostConfidence::UnknownSize;
     return cost;
   }
   auto lhsType = dyn_cast<ShapedType>(inputs[0].getType());
@@ -323,7 +363,7 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
   if (!lhsType || !rhsType || lhsType.getRank() != 2 ||
       rhsType.getRank() != 2 || !lhsType.hasStaticShape() ||
       !rhsType.hasStaticShape()) {
-    cost.isKnown = false;
+    cost.confidence = CostConfidence::UnknownSize;
     return cost;
   }
 
@@ -348,7 +388,7 @@ OpCost estimateTransfer(Type shapedType, bool isCube, bool isLoad,
 
   auto bytes = getShapedByteSize(shapedType);
   if (!bytes) {
-    cost.isKnown = false;
+    cost.confidence = CostConfidence::UnknownSize;
     return cost;
   }
   cost.bytes = *bytes;
@@ -367,18 +407,23 @@ OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
 
   Type shapedType = getRepresentativeShapedType(op);
   if (!shapedType) {
-    cost.isKnown = false;
+    cost.confidence = CostConfidence::UnknownSize;
     return cost;
   }
   auto elements = getShapedElementCount(shapedType);
   if (!elements) {
-    cost.isKnown = false;
+    cost.confidence = CostConfidence::UnknownSize;
     return cost;
   }
 
+  // Charged purely by element count: this path has no knowledge of which
+  // vector instruction the operation lowers to, so every op of a given size
+  // costs the same. Flagged as Generic precisely so the operations that end up
+  // here show up in the breakdown as candidates for a dedicated model.
   cost.cycles =
       config.estimateVectorCycles(*elements) + config.getVectorStartupLatency();
   cost.flops = *elements;
+  cost.confidence = CostConfidence::Generic;
   return cost;
 }
 
@@ -411,7 +456,7 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     if (!shapedType) {
       OpCost cost;
       cost.unit = getTransferUnit(isCube, /*isLoad=*/false);
-      cost.isKnown = false;
+      cost.confidence = CostConfidence::UnknownSize;
       return cost;
     }
     return estimateTransfer(shapedType, isCube, /*isLoad=*/false, config);
@@ -490,8 +535,155 @@ int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
 }
 
 //===----------------------------------------------------------------------===//
+// Diagnostics
+//===----------------------------------------------------------------------===//
+// The breakdown exists to answer one question: which operations does the model
+// actually understand? Everything charged generically is a candidate for a
+// dedicated cost model, and everything with an unknown size silently
+// contributes nothing. Both are invisible in the single summary number.
+
+struct OpKindStats {
+  int64_t count = 0;
+  int64_t weightedCycles = 0;
+  HWUnit unit = HWUnit::Scalar;
+  CostConfidence confidence = CostConfidence::Modelled;
+};
+
+/// Ordering used when several operations of one kind disagree: report the
+/// least-known outcome, since that is the one worth acting on.
+int confidenceRank(CostConfidence confidence) {
+  switch (confidence) {
+  case CostConfidence::Modelled:
+    return 0;
+  case CostConfidence::Generic:
+    return 1;
+  case CostConfidence::UnknownSize:
+    return 2;
+  }
+  return 0;
+}
+
+struct CostBreakdown {
+  llvm::MapVector<llvm::StringRef, OpKindStats> byOpKind;
+  llvm::SmallVector<Operation *> unknownSizeOps;
+  llvm::SmallVector<Operation *> dynamicTripCountOps;
+  int64_t genericOps = 0;
+  int64_t totalWeightedCycles = 0;
+
+  void record(Operation *op, const OpCost &cost, const LoopWeight &weight) {
+    OpKindStats &stats = byOpKind[op->getName().getStringRef()];
+    stats.count += 1;
+    stats.weightedCycles += cost.cycles * weight.multiplier;
+    stats.unit = cost.unit;
+    if (confidenceRank(cost.confidence) > confidenceRank(stats.confidence)) {
+      stats.confidence = cost.confidence;
+    }
+
+    totalWeightedCycles += cost.cycles * weight.multiplier;
+    if (cost.confidence == CostConfidence::Generic) {
+      ++genericOps;
+    }
+    if (cost.confidence == CostConfidence::UnknownSize) {
+      unknownSizeOps.push_back(op);
+    }
+    if (!weight.isKnown) {
+      dynamicTripCountOps.push_back(op);
+    }
+  }
+};
+
+/// Cap on how many individual operations are listed per category, so a large
+/// kernel produces a readable report rather than a wall of text.
+constexpr size_t kMaxListedOps = 20;
+
+void printOpList(llvm::raw_ostream &os, llvm::StringRef title,
+                 llvm::ArrayRef<Operation *> ops) {
+  if (ops.empty()) {
+    return;
+  }
+  os << "[" << DEBUG_TYPE << "] " << ops.size() << " " << title << ":\n";
+  for (size_t i = 0; i < ops.size() && i < kMaxListedOps; ++i) {
+    os << "[" << DEBUG_TYPE << "]     "
+       << ops[i]->getName().getStringRef() << "  at " << ops[i]->getLoc()
+       << "\n";
+  }
+  if (ops.size() > kMaxListedOps) {
+    os << "[" << DEBUG_TYPE << "]     ... and " << (ops.size() - kMaxListedOps)
+       << " more\n";
+  }
+}
+
+void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
+  // Heaviest first: that is the order in which teaching the model new
+  // operations pays off.
+  llvm::SmallVector<std::pair<llvm::StringRef, OpKindStats>> rows;
+  for (const auto &entry : breakdown.byOpKind) {
+    rows.push_back({entry.first, entry.second});
+  }
+  llvm::sort(rows, [](const auto &lhs, const auto &rhs) {
+    return lhs.second.weightedCycles > rhs.second.weightedCycles;
+  });
+
+  const double total =
+      breakdown.totalWeightedCycles > 0
+          ? static_cast<double>(breakdown.totalWeightedCycles)
+          : 1.0;
+
+  os << "[" << DEBUG_TYPE << "] cost breakdown by operation kind"
+     << " (share is of total work, not of the estimate):\n";
+  os << "[" << DEBUG_TYPE << "]     count       cycles   share  confidence  "
+     << "  unit        operation\n";
+  for (const auto &[name, stats] : rows) {
+    os << "[" << DEBUG_TYPE << "] "
+       << llvm::format("%9lld", static_cast<long long>(stats.count))
+       << llvm::format("%13lld", static_cast<long long>(stats.weightedCycles))
+       << llvm::format("%7.1f%%", 100.0 * stats.weightedCycles / total) << "  "
+       << llvm::left_justify(stringifyConfidence(stats.confidence), 12)
+       << llvm::left_justify(mlir::ascend::stringifyHWUnit(stats.unit), 12)
+       << name << "\n";
+  }
+
+  // The actionable lists.
+  llvm::SmallVector<llvm::StringRef> genericKinds;
+  for (const auto &[name, stats] : rows) {
+    if (stats.confidence == CostConfidence::Generic) {
+      genericKinds.push_back(name);
+    }
+  }
+  if (!genericKinds.empty()) {
+    os << "[" << DEBUG_TYPE << "] " << genericKinds.size()
+       << " operation kind(s) charged by element count only, i.e. with no"
+          " dedicated cost model:\n";
+    for (llvm::StringRef name : genericKinds) {
+      os << "[" << DEBUG_TYPE << "]     " << name << "\n";
+    }
+  }
+
+  printOpList(os, "operation(s) with a non-static shape, contributing 0 cycles",
+              breakdown.unknownSizeOps);
+  printOpList(os,
+              "operation(s) in a loop with a dynamic trip count, counted once",
+              breakdown.dynamicTripCountOps);
+}
+
+//===----------------------------------------------------------------------===//
 // Driver
 //===----------------------------------------------------------------------===//
+
+/// Verbosity requested through the environment: 0 = silent, 1 = one-line
+/// summary, >=2 = summary plus the per-operation breakdown.
+int getVerbosity() {
+  const char *raw = std::getenv(kVerboseEnvVar);
+  if (!raw) {
+    return 0;
+  }
+  int level = std::atoi(raw);
+  // Any non-numeric but present value means "on"; only an explicit 0 is off.
+  if (level == 0 && raw[0] != '0') {
+    return 1;
+  }
+  return level;
+}
 
 void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   std::string configError;
@@ -504,6 +696,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
   mlir::ascend::PipelineScheduler scheduler(config.get());
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
+  CostBreakdown breakdown;
   int64_t nextOpId = 0;
   int64_t unknownOps = 0;
 
@@ -514,9 +707,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     }
 
     LoopWeight weight = getLoopWeight(op);
-    if (!cost->isKnown || !weight.isKnown) {
+    if (cost->confidence == CostConfidence::UnknownSize || !weight.isKnown) {
       ++unknownOps;
     }
+    breakdown.record(op, *cost, weight);
 
     // NOTE: dependencies are intentionally not registered yet, so the
     // scheduler's own critical path is not meaningful here; the reported
@@ -557,17 +751,25 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,
                   builder.getI64IntegerAttr(unknownOps));
+  module->setAttr(kCVPipelineCostGenericOps,
+                  builder.getI64IntegerAttr(breakdown.genericOps));
 
   auto reportTo = [&](llvm::raw_ostream &os) {
     os << "[" << DEBUG_TYPE << "] " << config->getName() << ": " << totalCycles
        << " cycles roofline ("
        << llvm::format("%.3f", config->cyclesToMicroseconds(totalCycles))
        << " us), " << scheduledCycles << " cycles critical path, " << nextOpId
-       << " ops costed, " << unknownOps << " of unknown cost\n";
+       << " ops costed, " << unknownOps << " of unknown cost, "
+       << breakdown.genericOps << " without a dedicated model\n";
   };
-  LLVM_DEBUG(reportTo(llvm::dbgs()));
-  if (std::getenv(kVerboseEnvVar)) {
+
+  const int verbosity = getVerbosity();
+  LLVM_DEBUG(reportTo(llvm::dbgs()); printBreakdown(llvm::dbgs(), breakdown));
+  if (verbosity >= 1) {
     reportTo(llvm::errs());
+  }
+  if (verbosity >= 2) {
+    printBreakdown(llvm::errs(), breakdown);
   }
 }
 

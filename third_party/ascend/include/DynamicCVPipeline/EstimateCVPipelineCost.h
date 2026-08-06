@@ -51,6 +51,14 @@ inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
 inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
     "ascend.cv_pipeline_cost_unknown_ops";
 
+/// Number of operations charged by element count alone, because their kind has
+/// no dedicated cost model (i64). Unlike the unknown count these do contribute
+/// cycles, but the number is an order of magnitude rather than a model, so a
+/// high value means the estimate is coarse. Set TRITON_ASCEND_CV_COST_VERBOSE=2
+/// to see which operation kinds they are.
+inline constexpr llvm::StringLiteral kCVPipelineCostGenericOps =
+    "ascend.cv_pipeline_cost_generic_ops";
+
 /// Estimates the execution cost of the dynamic CV pipeline IR and records it as
 /// module attributes. Purely advisory: it never mutates compute IR and never
 /// fails the pipeline, so a costmodel problem can not break compilation.
