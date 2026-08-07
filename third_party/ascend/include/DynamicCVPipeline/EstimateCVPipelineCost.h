@@ -51,6 +51,19 @@ inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
 inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
     "ascend.cv_pipeline_cost_unknown_ops";
 
+/// Per-compute-block results, as an array of dictionaries -- one per
+/// ssbuffer.block_id, plus one with id -1 for operations the pipeline left
+/// unassigned. Each entry carries:
+///   id, core ("CUBE"/"VECTOR"/"MIXED"), cycles (the block's own roofline),
+///   work_cycles (the plain sum), ops, bottleneck (busiest unit),
+///   depends_on (blocks whose values it reads).
+///
+/// The block is the unit the CV pipeline schedules and synchronises, so this is
+/// the view that maps onto its decisions. Block cycles deliberately do not sum
+/// to the module estimate: blocks on different cores overlap.
+inline constexpr llvm::StringLiteral kCVPipelineBlocks =
+    "ascend.cv_pipeline_blocks";
+
 /// Number of loops whose trip count is only known at run time (i64), such as a
 /// loop bounded by a sequence length passed to the kernel. Their bodies are
 /// counted once, so each of them understates the estimate by however many

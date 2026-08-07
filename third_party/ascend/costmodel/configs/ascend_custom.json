@@ -1,6 +1,6 @@
 {
   "$schema": "./hardware_schema.json",
-  "name": "Ascend 910_95 (PLACEHOLDER: values inherited from 910B)",
+  "name": "Ascend custom (PLACEHOLDER: values inherited from 910B)",
   "vendor": "Huawei",
   "version": "0.1-draft",
   "clock": {
@@ -176,7 +176,7 @@
       "alignment_bytes": 32
     },
     "fixpipe_ub": {
-      "description": "910_95 Cube output: L0C to UB, staying on chip instead of going out to HBM and back. PLACEHOLDER bandwidth.",
+      "description": "Cube output: L0C to UB, staying on chip instead of going out to HBM and back. PLACEHOLDER bandwidth.",
       "src_space": "l0c",
       "dst_space": "ub",
       "bandwidth_gbps": 200,
@@ -186,7 +186,7 @@
       "supports_cast": true
     },
     "ub_to_l1": {
-      "description": "910_95 on-chip Vector-to-Cube staging: UB to L1, avoiding the HBM round trip. PLACEHOLDER bandwidth.",
+      "description": "On-chip Vector-to-Cube staging: UB to L1, avoiding the HBM round trip. PLACEHOLDER bandwidth.",
       "src_space": "ub",
       "dst_space": "l1",
       "bandwidth_gbps": 200,
@@ -194,7 +194,7 @@
       "alignment_bytes": 32
     },
     "l1_to_ub": {
-      "description": "910_95 on-chip Cube-to-Vector staging: L1 to UB. PLACEHOLDER bandwidth.",
+      "description": "On-chip Cube-to-Vector staging: L1 to UB. PLACEHOLDER bandwidth.",
       "src_space": "l1",
       "dst_space": "ub",
       "bandwidth_gbps": 200,
@@ -211,7 +211,7 @@
         "fixpipe",
         "fixpipe_ub"
       ],
-      "description": "Matrix multiplication data flow; on 910_95 the result may drain to UB instead of HBM",
+      "description": "Matrix multiplication data flow; on this target the result may drain to UB instead of HBM",
       "fully_pipelined": true
     },
     "vector_path": {
@@ -345,7 +345,7 @@
       ]
     },
     "mutex_groups": {
-      "description": "Hardware units that share a physical pipeline and cannot execute in parallel (tilesim MutexComponents / pipe_exclusive_config). Each clique is an array of costmodel unit names (cube/cube_mte2/fixpipe/vector/vec_mte2/mte3/scalar). 910B: AIV MTE2 (vec load) and MTE3 (vec store) share one pipeline -> they serialize, so the vector-path roofline uses max(vector, vec_mte2 + mte3) instead of max(vector, vec_mte2, mte3). UNVERIFIED for 910_95: the vec_mte2/mte3 clique is inherited from 910B, and whether fixpipe and fixpipe_ub share one physical pipe is not known. If they do, add [\"fixpipe\", \"fixpipe_ub\"] as a clique here -- that serialises them with no code change.",
+      "description": "Hardware units that share a physical pipeline and cannot execute in parallel (tilesim MutexComponents / pipe_exclusive_config). Each clique is an array of costmodel unit names (cube/cube_mte2/fixpipe/vector/vec_mte2/mte3/scalar). 910B: AIV MTE2 (vec load) and MTE3 (vec store) share one pipeline -> they serialize, so the vector-path roofline uses max(vector, vec_mte2 + mte3) instead of max(vector, vec_mte2, mte3). UNVERIFIED for this target: the vec_mte2/mte3 clique is inherited from 910B, and whether fixpipe and fixpipe_ub share one physical pipe is not known. If they do, add [\"fixpipe\", \"fixpipe_ub\"] as a clique here -- that serialises them with no code change.",
       "cliques": [
         [
           "vec_mte2",
@@ -370,7 +370,7 @@
     "l0_tile_limit_kb": 32
   },
   "bandwidth_tables": {
-    "description": "Per-(src:dst[,corenum,pkt]) bandwidth in GB/s, migrated from tilesim bandwidth_910B1.csv (GM->hbm, SHM->l2). Costmodel space names: hbm/l2/l1/l0a/l0b/l0c/ub. Core-dependent movers carry per_core_gbps (1..48); others use bandwidth_gbps. 910_95 adds l0c:ub, ub:l1 and l1:ub. Their values here are PLACEHOLDERS copied from comparable 910B paths (l0c:l1 and l2:ub) and must be replaced with measurements.",
+    "description": "Per-(src:dst[,corenum,pkt]) bandwidth in GB/s, migrated from tilesim bandwidth_910B1.csv (GM->hbm, SHM->l2). Costmodel space names: hbm/l2/l1/l0a/l0b/l0c/ub. Core-dependent movers carry per_core_gbps (1..48); others use bandwidth_gbps. This target adds l0c:ub, ub:l1 and l1:ub. Their values here are PLACEHOLDERS copied from comparable 910B paths (l0c:l1 and l2:ub) and must be replaced with measurements.",
     "hbm:ub": {
       "per_core_gbps": {
         "1": 100.9,
@@ -790,5 +790,5 @@
       }
     }
   },
-  "status": "DRAFT. The topology below is 910_95 -- the Cube accumulator can drain straight into UB, and UB and L1 talk to each other on chip -- but every bandwidth, latency and cycle figure is still the measured 910B value. Replace them with 910_95 measurements before trusting any absolute number from this profile. Until then it is useful for checking that the new data paths are picked up, not for predicting time."
+  "status": "DRAFT. The topology below is the newer one -- the Cube accumulator can drain straight into UB, and UB and L1 talk to each other on chip -- but every bandwidth, latency and cycle figure is still the measured 910B value. Replace them with measurements before trusting any absolute number from this profile. Until then it is useful for checking that the new data paths are picked up, not for predicting time."
 }

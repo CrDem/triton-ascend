@@ -46,7 +46,7 @@ def HWUnit_Vector    : I32EnumAttrCase<"Vector", 3, "vector">;
 def HWUnit_VecMTE2   : I32EnumAttrCase<"VecMTE2", 4, "vec_mte2">;
 def HWUnit_MTE3      : I32EnumAttrCase<"MTE3", 5, "mte3">;
 def HWUnit_Scalar    : I32EnumAttrCase<"Scalar", 6, "scalar">;
-// 910_95 drains the Cube accumulator straight into UB instead of going out to
+// This target drains the Cube accumulator straight into UB instead of going out to
 // HBM and back. It is a separate engine from the HBM write-back, so it gets
 // its own unit; on a part where the two share one pipe, declaring them a mutex
 // clique in the hardware profile serialises them without a code change.

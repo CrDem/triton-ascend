@@ -58,13 +58,13 @@
 //   TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT=32
 //
 // The hardware profile defaults to a 910B. Selecting another one matters on
-// 910_95, whose data paths differ: the Cube accumulator can drain straight
+// targets whose data paths differ: the Cube accumulator can drain straight
 // into UB, and UB and L1 exchange data on chip instead of through HBM. Which
 // engine a transfer occupies is derived from the address spaces the compiler
 // put on the memrefs, so those paths are costed as soon as the profile
 // describes them:
 //
-//   TRITON_ASCEND_CV_COST_HARDWARE_CONFIG=/path/to/ascend_910_95.json
+//   TRITON_ASCEND_CV_COST_HARDWARE_CONFIG=/path/to/ascend_custom.json
 //
 //===----------------------------------------------------------------------===//
 
@@ -95,6 +95,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -325,8 +326,8 @@ bool isBackedByLocalAlloc(Value value) {
 /// tensor that has not been bufferized yet, typically.
 ///
 /// Reading this rather than inferring it from the operation's role is what
-/// makes 910_95 expressible at all: there, the same memref.copy may target HBM
-/// or UB or L1, and only the type says which.
+/// makes the newer topology expressible at all: there, the same memref.copy
+/// may target HBM or UB or L1, and only the type says which.
 llvm::StringRef getMemorySpaceName(Type type) {
   auto memrefType = dyn_cast<MemRefType>(type);
   if (!memrefType) {
@@ -358,20 +359,20 @@ llvm::StringRef getMemorySpaceName(Type type) {
 /// Which data mover executes a transfer between two memory spaces.
 ///
 /// The engine follows from where the data comes from and goes to, not from
-/// which core issued it. On 910_95 that distinction matters: draining the Cube
-/// accumulator to UB (FixPipeUB) and draining it to HBM (FixPipe) are different
-/// engines, and UB<->L1 traffic never leaves the chip at all.
+/// which core issued it. On the newer topology that distinction matters:
+/// draining the accumulator to UB (FixPipeUB) and to HBM (FixPipe) are
+/// different engines, and UB<->L1 traffic never leaves the chip at all.
 HWUnit getTransferUnit(llvm::StringRef src, llvm::StringRef dst) {
   if (src == "l0c") {
     return dst == "ub" ? HWUnit::FixPipeUB : HWUnit::FixPipe;
   }
   if (dst == "l1" || dst == "l0a" || dst == "l0b") {
-    // Feeding the Cube: from HBM/L2 this is its MTE2; from UB (910_95) it is
+    // Feeding the Cube: from HBM/L2 this is its MTE2; from UB it is
     // the vector store engine writing on-chip instead of out to HBM.
     return src == "ub" ? HWUnit::MTE3 : HWUnit::CubeMTE2;
   }
   if (dst == "ub") {
-    return HWUnit::VecMTE2; // from HBM/L2, or from L1 on 910_95
+    return HWUnit::VecMTE2; // from HBM/L2, or from L1 on the newer topology
   }
   if (src == "ub") {
     return HWUnit::MTE3;
@@ -707,12 +708,12 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     return estimateMatmul(matmulOp, config);
   }
 
-  // hivm.hir.fixpipe drains the Cube accumulator. On 910_95 it may land in UB
+  // hivm.hir.fixpipe drains the Cube accumulator. It may land in UB
   // instead of HBM, which is a different engine entirely, so the destination
   // is read from the operands rather than assumed.
   if (isa<hivm::FixpipeOp>(op)) {
     // The source is the accumulator by definition; only the destination is in
-    // question, and on 910_95 it decides whether this is a FixPipe to HBM or
+    // question, and it decides whether this is a FixPipe to HBM or
     // the on-chip drain into UB.
     auto [srcSpace, dstSpace] =
         resolveHivmTransferSpaces(op, /*fallbackSrc=*/"l0c",
@@ -743,8 +744,8 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   // hivm.hir.copy moves a buffer, it does not compute over it: it belongs to a
   // data mover, not to the vector ALU.
   if (isa<hivm::CopyOp>(op)) {
-    // The CV pipeline emits these to stage data between the cores; on 910_95
-    // the destination is often L1, keeping the traffic on chip.
+    // The CV pipeline emits these to stage data between the cores; on the newer
+    // topology the destination is often L1, keeping the traffic on chip.
     auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
     auto [srcSpace, dstSpace] =
         resolveHivmTransferSpaces(op, guessed.first, guessed.second);
@@ -1181,14 +1182,140 @@ struct DynamicLoopStats {
   int64_t assumedTripCount = 1;
 };
 
+/// One compute block, as planned by PlanComputeBlock and identified by
+/// ssbuffer.block_id. The block is the unit the CV pipeline actually schedules
+/// and synchronises, so it is the natural granularity to report cost at:
+/// operations inside one block run on one core, back to back.
+struct BlockStats {
+  bool isCube = false;
+  bool mixedCore = false; ///< set if the block's ops disagree, which is a bug
+  int64_t costedOps = 0;
+  int64_t workCycles = 0; ///< sum over operations
+  llvm::DenseMap<HWUnit, int64_t> unitCycles;
+  llvm::MapVector<llvm::StringRef, int64_t> opCounts;
+};
+
+/// Synchronisation edges between blocks, read from what the pipeline stamped
+/// rather than re-derived.
+///
+/// InterCoreTransferAndSync and AllocMultiCache tag both ends of every transfer
+/// with [groupId, role] -- role 1 produces, 0 consumes, matching
+/// InitDependentMap::collectDepsByGroup. Those pairs are the flag waits the
+/// hardware will actually perform. SSA cannot show them: after bufferization
+/// the two ends are joined through a buffer, not through a value, so a
+/// value-based walk sees nothing at all where the real barrier is.
+void collectSyncDeps(ModuleOp module,
+                     llvm::MapVector<int64_t, llvm::SetVector<int64_t>> &deps) {
+  for (llvm::StringLiteral attrName :
+       {CVPipeline::kCrossCoreDeps, CVPipeline::kIntraDeps}) {
+    // group -> (producing blocks, consuming blocks)
+    using BlockSet = llvm::SetVector<int64_t>;
+    llvm::MapVector<int64_t, std::pair<BlockSet, BlockSet>> byGroup;
+
+    module.walk([&](Operation *op) {
+      auto attr = op->getAttrOfType<ArrayAttr>(attrName);
+      if (!attr || attr.size() < 2) {
+        return;
+      }
+      auto groupAttr = dyn_cast<IntegerAttr>(attr[0]);
+      auto roleAttr = dyn_cast<IntegerAttr>(attr[1]);
+      auto blockId = CVPipeline::getOpBlockId(op);
+      if (!groupAttr || !roleAttr || !blockId) {
+        return;
+      }
+      auto &ends = byGroup[groupAttr.getInt()];
+      if (roleAttr.getInt() == CVPipeline::crossCoreProducerId) {
+        ends.first.insert(*blockId);
+      } else {
+        ends.second.insert(*blockId);
+      }
+    });
+
+    for (const auto &[group, ends] : byGroup) {
+      for (int64_t consumer : ends.second) {
+        for (int64_t producer : ends.first) {
+          if (producer != consumer) {
+            deps[consumer].insert(producer);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Block a value was produced in, walking back through operations that carry
+/// no block id of their own (views, casts) so the chain is not broken by them.
+std::optional<int64_t> getProducingBlock(Value value, int depth = 0) {
+  if (depth > 8) {
+    return std::nullopt;
+  }
+  Operation *def = value.getDefiningOp();
+  if (!def) {
+    return std::nullopt;
+  }
+  if (auto blockId = CVPipeline::getOpBlockId(def)) {
+    return static_cast<int64_t>(*blockId);
+  }
+  for (Value operand : def->getOperands()) {
+    if (auto found = getProducingBlock(operand, depth + 1)) {
+      return found;
+    }
+  }
+  return std::nullopt;
+}
+
+/// Sentinel for operations the pipeline left without a block id.
+constexpr int64_t kNoBlockId = -1;
+
+/// consumer block -> blocks it depends on.
+using BlockDepMap = llvm::MapVector<int64_t, llvm::SetVector<int64_t>>;
+
 struct CostBreakdown {
   llvm::MapVector<llvm::StringRef, OpKindStats> byOpKind;
   llvm::SmallVector<Operation *> unknownSizeOps;
   llvm::MapVector<Operation *, DynamicLoopStats> dynamicLoops;
+  llvm::MapVector<int64_t, BlockStats> blocks;
+  /// Block -> blocks whose values it reads, from SSA. Ordering within a
+  /// core that no transfer group covers.
+  llvm::MapVector<int64_t, llvm::SetVector<int64_t>> dataDeps;
+  /// Block -> blocks it waits on through a synchronisation flag. These are
+  /// hard barriers: the consumer cannot start until the producer signals.
+  llvm::MapVector<int64_t, llvm::SetVector<int64_t>> syncDeps;
   int64_t genericOps = 0;
   int64_t totalWeightedCycles = 0;
 
-  void record(Operation *op, const OpCost &cost, const LoopWeight &weight) {
+  void recordBlock(Operation *op, const OpCost &cost, const LoopWeight &weight,
+                   bool isCube) {
+    auto blockId = CVPipeline::getOpBlockId(op);
+    int64_t id = blockId ? static_cast<int64_t>(*blockId) : kNoBlockId;
+
+    BlockStats &stats = blocks[id];
+    if (stats.costedOps == 0) {
+      stats.isCube = isCube;
+    } else if (stats.isCube != isCube) {
+      stats.mixedCore = true;
+    }
+    stats.costedOps += 1;
+    stats.workCycles += cost.cycles * weight.multiplier;
+    stats.unitCycles[cost.unit] += cost.cycles * weight.multiplier;
+    stats.opCounts[op->getName().getStringRef()] += 1;
+
+    // Edges to the blocks this operation reads from. Self-edges say nothing.
+    if (id == kNoBlockId) {
+      return;
+    }
+    for (Value operand : op->getOperands()) {
+      auto producer = getProducingBlock(operand);
+      if (producer && *producer != id) {
+        dataDeps[id].insert(*producer);
+      }
+    }
+  }
+
+  void record(Operation *op, const OpCost &cost, const LoopWeight &weight,
+              bool isCube) {
+    recordBlock(op, cost, weight, isCube);
+
     OpKindStats &stats = byOpKind[op->getName().getStringRef()];
     stats.count += 1;
     stats.weightedCycles += cost.cycles * weight.multiplier;
@@ -1234,6 +1361,113 @@ void printOpList(llvm::raw_ostream &os, llvm::StringRef title,
     os << "[" << DEBUG_TYPE << "]     ... and " << (ops.size() - kMaxListedOps)
        << " more\n";
   }
+}
+
+/// Busiest unit in a block, which is what its own estimate is bounded by.
+HWUnit getBlockBottleneck(const BlockStats &stats) {
+  HWUnit worst = HWUnit::Scalar;
+  int64_t worstCycles = -1;
+  for (const auto &[unit, cycles] : stats.unitCycles) {
+    if (cycles > worstCycles) {
+      worstCycles = cycles;
+      worst = unit;
+    }
+  }
+  return worst;
+}
+
+/// Short, readable summary of what a block contains: the heaviest few kinds,
+/// then a count of the rest, so a large block stays one line.
+std::string describeBlockContents(const BlockStats &stats) {
+  llvm::SmallVector<std::pair<llvm::StringRef, int64_t>> kinds(
+      stats.opCounts.begin(), stats.opCounts.end());
+  llvm::sort(kinds, [](const auto &lhs, const auto &rhs) {
+    return lhs.second > rhs.second;
+  });
+
+  constexpr size_t kMaxShown = 3;
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  for (size_t i = 0; i < kinds.size() && i < kMaxShown; ++i) {
+    if (i != 0) {
+      stream << ", ";
+    }
+    stream << kinds[i].first;
+    if (kinds[i].second > 1) {
+      stream << " x" << kinds[i].second;
+    }
+  }
+  if (kinds.size() > kMaxShown) {
+    stream << ", +" << (kinds.size() - kMaxShown) << " more kind(s)";
+  }
+  return stream.str();
+}
+
+/// Per-block report. The block is what the pipeline schedules and synchronises,
+/// so this is the view that maps onto what it decided; the per-operation table
+/// above says what it costs, this says where.
+void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
+                 const HardwareConfig &config) {
+  if (breakdown.blocks.empty()) {
+    return;
+  }
+
+  struct Row {
+    int64_t id;
+    const BlockStats *stats;
+    int64_t cycles; ///< the block's own roofline
+  };
+  llvm::SmallVector<Row> rows;
+  for (const auto &[id, stats] : breakdown.blocks) {
+    rows.push_back({id, &stats, combineRoofline(stats.unitCycles, config)});
+  }
+  llvm::sort(rows, [](const Row &lhs, const Row &rhs) {
+    return lhs.cycles > rhs.cycles;
+  });
+
+  os << "[" << DEBUG_TYPE
+     << "] per-block cost (ssbuffer.block_id, as planned by"
+        " PlanComputeBlock). Each block's cycles are its own roofline. They do"
+        " not add up to the module total because the model *assumes* Cube and"
+        " Vector overlap fully; the sync edges below say where that assumption"
+        " is wrong, but they do not constrain the estimate yet:\n";
+  os << "[" << DEBUG_TYPE
+     << "]    block  core        cycles  ops  bottleneck   contents\n";
+  for (const Row &row : rows) {
+    std::string blockName =
+        row.id == kNoBlockId ? std::string("  --") : std::to_string(row.id);
+    llvm::StringRef core = row.stats->mixedCore ? "MIXED"
+                           : row.stats->isCube  ? "CUBE"
+                                                : "VECTOR";
+    os << "[" << DEBUG_TYPE << "] " << llvm::right_justify(blockName, 8) << "  "
+       << llvm::left_justify(core, 7)
+       << llvm::format("%12lld", static_cast<long long>(row.cycles))
+       << llvm::format("%5lld", static_cast<long long>(row.stats->costedOps))
+       << "  "
+       << llvm::left_justify(mlir::ascend::stringifyHWUnit(
+                                 getBlockBottleneck(*row.stats)),
+                             13)
+       << describeBlockContents(*row.stats) << "\n";
+  }
+
+  auto printDeps =
+      [&](const llvm::MapVector<int64_t, llvm::SetVector<int64_t>> &deps,
+          llvm::StringRef tag, llvm::StringRef what) {
+        if (deps.empty()) {
+          return;
+        }
+        os << "[" << DEBUG_TYPE << "] block " << tag << " (" << what << "):\n";
+        for (const auto &[id, producers] : deps) {
+          os << "[" << DEBUG_TYPE << "]     block " << id << " <- ";
+          llvm::interleaveComma(producers, os);
+          os << "\n";
+        }
+      };
+  // Sync edges first: those are the ones that actually stall a core.
+  printDeps(breakdown.syncDeps, "sync",
+            "waits on a flag the other block sets");
+  printDeps(breakdown.dataDeps, "dataflow",
+            "reads a value the other block produced");
 }
 
 void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
@@ -1332,7 +1566,7 @@ int getVerbosity() {
 
 void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // An explicitly constructed path wins; otherwise the environment selects the
-  // profile, so that a 910_95 run does not silently get 910B numbers.
+  // profile, so a run on another target does not silently get 910B numbers.
   std::string configPath = hardwareConfigPath.str();
   if (configPath.empty()) {
     if (const char *fromEnv = std::getenv(kHardwareConfigEnvVar)) {
@@ -1370,7 +1604,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     if (cost->confidence == CostConfidence::UnknownSize) {
       ++unknownOps;
     }
-    breakdown.record(op, *cost, weight);
+    breakdown.record(op, *cost, weight, runsOnCubeCore(op));
 
     // NOTE: dependencies are intentionally not registered yet, so the
     // scheduler's own critical path is not meaningful here; the reported
@@ -1389,6 +1623,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
     unitCycles[cost->unit] += cost->cycles * weight.multiplier;
   });
+
+  // Synchronisation edges come from the pipeline's own transfer groups, so
+  // they are read once over the whole module rather than per operation.
+  collectSyncDeps(module, breakdown.syncDeps);
 
   if (nextOpId == 0) {
     LOG_DEBUG("no costed operations found; skipping estimate");
@@ -1418,6 +1656,51 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
       builder.getI64IntegerAttr(
           static_cast<int64_t>(breakdown.dynamicLoops.size())));
 
+  // Per-block results, machine-readable. Kept on the module rather than on the
+  // operations themselves: a block is a set of operations sharing an id, not an
+  // IR entity, and stamping every operation would bury the IR in annotations.
+  if (!breakdown.blocks.empty()) {
+    llvm::SmallVector<Attribute> blockAttrs;
+    for (const auto &[id, stats] : breakdown.blocks) {
+      auto collect = [&](const BlockDepMap &deps) {
+        llvm::SmallVector<Attribute> result;
+        auto it = deps.find(id);
+        if (it != deps.end()) {
+          for (int64_t producer : it->second) {
+            result.push_back(builder.getI64IntegerAttr(producer));
+          }
+        }
+        return result;
+      };
+      llvm::SmallVector<Attribute> dependsOn = collect(breakdown.dataDeps);
+      llvm::SmallVector<Attribute> syncsWith = collect(breakdown.syncDeps);
+      blockAttrs.push_back(builder.getDictionaryAttr({
+          builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
+          builder.getNamedAttr(
+              "core", builder.getStringAttr(stats.mixedCore ? "MIXED"
+                                            : stats.isCube  ? "CUBE"
+                                                            : "VECTOR")),
+          builder.getNamedAttr(
+              "cycles",
+              builder.getI64IntegerAttr(
+                  combineRoofline(stats.unitCycles, *config))),
+          builder.getNamedAttr("work_cycles",
+                               builder.getI64IntegerAttr(stats.workCycles)),
+          builder.getNamedAttr("ops",
+                               builder.getI64IntegerAttr(stats.costedOps)),
+          builder.getNamedAttr(
+              "bottleneck",
+              builder.getStringAttr(
+                  mlir::ascend::stringifyHWUnit(getBlockBottleneck(stats)))),
+          builder.getNamedAttr("depends_on",
+                               builder.getArrayAttr(dependsOn)),
+          builder.getNamedAttr("sync_depends_on",
+                               builder.getArrayAttr(syncsWith)),
+      }));
+    }
+    module->setAttr(kCVPipelineBlocks, builder.getArrayAttr(blockAttrs));
+  }
+
   auto reportTo = [&](llvm::raw_ostream &os) {
     os << "[" << DEBUG_TYPE << "] " << config->getName() << ": " << totalCycles
        << " cycles roofline ("
@@ -1429,11 +1712,14 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   };
 
   const int verbosity = getVerbosity();
-  LLVM_DEBUG(reportTo(llvm::dbgs()); printBreakdown(llvm::dbgs(), breakdown));
+  LLVM_DEBUG(reportTo(llvm::dbgs());
+             printBlocks(llvm::dbgs(), breakdown, *config);
+             printBreakdown(llvm::dbgs(), breakdown));
   if (verbosity >= 1) {
     reportTo(llvm::errs());
   }
   if (verbosity >= 2) {
+    printBlocks(llvm::errs(), breakdown, *config);
     printBreakdown(llvm::errs(), breakdown);
   }
 }

@@ -153,7 +153,7 @@ void PipelineScheduler::initPipelines() {
   pipelines.emplace(HWUnit::VecMTE2, HWUnitPipeline(HWUnit::VecMTE2));
   pipelines.emplace(HWUnit::MTE3, HWUnitPipeline(HWUnit::MTE3));
   pipelines.emplace(HWUnit::Scalar, HWUnitPipeline(HWUnit::Scalar));
-  // 910_95 Cube-to-UB write-back. A unit without a pipeline here is silently
+  // Cube-to-UB write-back. A unit without a pipeline here is silently
   // dropped by schedule(), so every HWUnit must appear.
   pipelines.emplace(HWUnit::FixPipeUB, HWUnitPipeline(HWUnit::FixPipeUB));
 }
