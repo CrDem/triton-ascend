@@ -45,11 +45,18 @@ inline constexpr llvm::StringLiteral kCVPipelineEstimatedCycles =
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
     "ascend.cv_pipeline_cost_hardware";
 
-/// Number of operations whose cost could not be determined (i64), e.g. dynamic
-/// shapes or loops with a non-constant trip count. A high count relative to the
-/// module size means the estimate should not be trusted.
+/// Number of operations whose own cost could not be computed (i64), because a
+/// shape is not statically known. They contribute nothing, so a high count
+/// relative to the module size means the estimate should not be trusted.
 inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
     "ascend.cv_pipeline_cost_unknown_ops";
+
+/// Number of loops whose trip count is only known at run time (i64), such as a
+/// loop bounded by a sequence length passed to the kernel. Their bodies are
+/// counted once, so each of them understates the estimate by however many
+/// iterations actually execute -- usually the largest single source of error.
+inline constexpr llvm::StringLiteral kCVPipelineCostDynamicLoops =
+    "ascend.cv_pipeline_cost_dynamic_loops";
 
 /// Number of operations charged by element count alone, because their kind has
 /// no dedicated cost model (i64). Unlike the unknown count these do contribute

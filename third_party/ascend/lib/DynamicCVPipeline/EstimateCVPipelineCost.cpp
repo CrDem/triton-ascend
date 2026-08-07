@@ -48,6 +48,13 @@
 //   TRITON_ASCEND_CV_COST_VERBOSE=1   one-line summary
 //   TRITON_ASCEND_CV_COST_VERBOSE=2   summary + per-operation breakdown
 //
+// A loop bounded by a kernel argument has no trip count at compile time, and
+// its body is usually where the kernel spends its time. Either bind the
+// arguments, or say how many iterations to assume:
+//
+//   TRITON_ASCEND_CV_COST_ARG_BINDINGS=arg3=98432,arg5=128
+//   TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT=32
+//
 //===----------------------------------------------------------------------===//
 
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
@@ -110,6 +117,15 @@ namespace {
 /// which is impractical when driving compilation from Python; this env var
 /// gives the same one-line summary from a release build.
 constexpr const char *kVerboseEnvVar = "TRITON_ASCEND_CV_COST_VERBOSE";
+
+/// Values for entry-function arguments, so that loops bounded by a kernel
+/// argument can be resolved: "arg3=98432,arg5=128".
+constexpr const char *kArgBindingsEnvVar = "TRITON_ASCEND_CV_COST_ARG_BINDINGS";
+
+/// Iterations assumed for loops that no binding resolves. Defaults to 1, which
+/// counts such a body exactly once.
+constexpr const char *kDefaultTripCountEnvVar =
+    "TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT";
 
 using mlir::ascend::HardwareConfig;
 using mlir::ascend::HWUnit;
@@ -640,30 +656,215 @@ std::optional<OpCost> estimateOpCost(Operation *op,
 // Loop weighting
 //===----------------------------------------------------------------------===//
 
+/// What the caller can supply that the IR itself does not say.
+///
+/// A loop bounded by a kernel argument -- a sequence length, say -- has no
+/// trip count at compile time, yet its body is usually where the kernel spends
+/// its time. Counting such a body once understates the estimate by however many
+/// iterations run, so there are two ways to fill the gap: bind the arguments to
+/// the sizes the kernel will actually be called with, or, failing that, assume
+/// a fixed iteration count.
+struct TripCountOptions {
+  /// Values for entry-function arguments, by argument index.
+  llvm::DenseMap<unsigned, int64_t> argBindings;
+  /// Iteration count assumed for loops that remain unresolved. One reproduces
+  /// the behaviour of not assuming anything.
+  int64_t defaultTripCount = 1;
+};
+
+/// Resolve an integer value given bindings for the entry function's arguments.
+///
+/// Only entry-block arguments of a func.func are bound. This matters: a loop
+/// induction variable and a loop-carried value are BlockArguments too, and
+/// binding those by index would silently yield a plausible but wrong number.
+std::optional<int64_t>
+evaluateWithBindings(Value value,
+                     const llvm::DenseMap<unsigned, int64_t> &argBindings,
+                     int depth = 0) {
+  // Guards against a pathological or cyclic expression.
+  if (depth > 16) {
+    return std::nullopt;
+  }
+
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    auto funcOp =
+        dyn_cast_or_null<func::FuncOp>(blockArg.getOwner()->getParentOp());
+    if (!funcOp || blockArg.getOwner() != &funcOp.getBody().front()) {
+      return std::nullopt; // induction variable / iter_arg, not a kernel arg
+    }
+    auto it = argBindings.find(blockArg.getArgNumber());
+    if (it == argBindings.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  Operation *def = value.getDefiningOp();
+  if (!def) {
+    return std::nullopt;
+  }
+
+  if (auto constOp = dyn_cast<arith::ConstantOp>(def)) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
+      return intAttr.getInt();
+    }
+    return std::nullopt;
+  }
+
+  auto operand = [&](unsigned index) {
+    return evaluateWithBindings(def->getOperand(index), argBindings, depth + 1);
+  };
+
+  // Pass-through casts.
+  if (isa<arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+          arith::IndexCastOp>(def)) {
+    return operand(0);
+  }
+
+  if (def->getNumOperands() < 2) {
+    return std::nullopt;
+  }
+  auto lhs = operand(0);
+  auto rhs = operand(1);
+  if (!lhs || !rhs) {
+    return std::nullopt;
+  }
+
+  if (isa<arith::AddIOp>(def)) {
+    return *lhs + *rhs;
+  }
+  if (isa<arith::SubIOp>(def)) {
+    return *lhs - *rhs;
+  }
+  if (isa<arith::MulIOp>(def)) {
+    return *lhs * *rhs;
+  }
+  if (isa<arith::DivSIOp, arith::DivUIOp>(def)) {
+    if (*rhs == 0) {
+      return std::nullopt;
+    }
+    return *lhs / *rhs;
+  }
+  if (isa<arith::RemSIOp, arith::RemUIOp>(def)) {
+    if (*rhs == 0) {
+      return std::nullopt;
+    }
+    return *lhs % *rhs;
+  }
+  if (isa<arith::MinSIOp, arith::MinUIOp>(def)) {
+    return std::min(*lhs, *rhs);
+  }
+  if (isa<arith::MaxSIOp, arith::MaxUIOp>(def)) {
+    return std::max(*lhs, *rhs);
+  }
+  return std::nullopt;
+}
+
+/// Trip count of a loop once the supplied bindings are taken into account.
+std::optional<int64_t>
+resolveTripCount(scf::ForOp forOp,
+                 const llvm::DenseMap<unsigned, int64_t> &argBindings) {
+  if (argBindings.empty()) {
+    return std::nullopt;
+  }
+  auto lower = evaluateWithBindings(forOp.getLowerBound(), argBindings);
+  auto upper = evaluateWithBindings(forOp.getUpperBound(), argBindings);
+  auto step = evaluateWithBindings(forOp.getStep(), argBindings);
+  if (!lower || !upper || !step || *step == 0) {
+    return std::nullopt;
+  }
+  if (*upper <= *lower) {
+    return 0;
+  }
+  return (*upper - *lower + *step - 1) / *step;
+}
+
 struct LoopWeight {
   int64_t multiplier = 1;
-  bool isKnown = true;
+  /// Innermost enclosing loop whose trip count could not be determined, even
+  /// with bindings. Null means `multiplier` is trustworthy. The whole body of
+  /// such a loop is assumed together, so the loop -- not each operation in it
+  /// -- is the thing worth reporting.
+  Operation *dynamicLoop = nullptr;
+  /// Iteration count assumed for `dynamicLoop`, so the report can say what
+  /// the estimate is actually based on.
+  int64_t assumedTripCount = 1;
 };
 
 /// How many times an operation executes, given the enclosing loop nest.
-LoopWeight getLoopWeight(Operation *op) {
+///
+/// Each loop is resolved in three steps, most trustworthy first: constant
+/// bounds in the IR, then the caller's argument bindings, then the assumed
+/// default. Only a loop that reaches the third step is reported, since only
+/// then is the number a guess.
+LoopWeight getLoopWeight(Operation *op, const TripCountOptions &options) {
   LoopWeight weight;
+  // Walking outwards, so the first unresolved loop met is the innermost one.
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp()) {
     auto forOp = dyn_cast<scf::ForOp>(parent);
     if (!forOp) {
       continue;
     }
+
     auto tripCount = mlir::ascend::utils::analyzeScfForTripCount(forOp);
     if (tripCount.isStatic) {
       weight.multiplier *= tripCount.staticTripCount;
-    } else {
-      // Dynamic bound: counting one iteration keeps the estimate finite, but
-      // the caller must know the number understates the real cost.
-      weight.isKnown = false;
+      continue;
+    }
+    if (auto bound = resolveTripCount(forOp, options.argBindings)) {
+      weight.multiplier *= *bound;
+      continue;
+    }
+
+    weight.multiplier *= options.defaultTripCount;
+    if (!weight.dynamicLoop) {
+      weight.dynamicLoop = forOp;
+      weight.assumedTripCount = options.defaultTripCount;
     }
   }
   return weight;
+}
+
+/// Read the trip-count options from the environment.
+///
+/// Bindings are "arg3=98432,arg5=128" (the "arg" prefix is optional), naming
+/// entry-function argument indices. The environment is process-wide, which is
+/// fine for inspecting one kernel but is the reason these are not the right
+/// channel for per-configuration autotuning; that will want the values passed
+/// in explicitly.
+TripCountOptions readTripCountOptions() {
+  TripCountOptions options;
+
+  if (const char *raw = std::getenv(kArgBindingsEnvVar)) {
+    llvm::SmallVector<llvm::StringRef> entries;
+    llvm::StringRef(raw).split(entries, ',', /*MaxSplit=*/-1,
+                               /*KeepEmpty=*/false);
+    for (llvm::StringRef entry : entries) {
+      auto [name, valueText] = entry.split('=');
+      name = name.trim();
+      name.consume_front("arg");
+      unsigned index = 0;
+      int64_t value = 0;
+      if (name.getAsInteger(10, index) ||
+          valueText.trim().getAsInteger(10, value)) {
+        LOG_DEBUG("ignoring malformed argument binding: " << entry);
+        continue;
+      }
+      options.argBindings[index] = value;
+    }
+  }
+
+  if (const char *raw = std::getenv(kDefaultTripCountEnvVar)) {
+    int64_t value = 0;
+    if (!llvm::StringRef(raw).trim().getAsInteger(10, value) && value > 0) {
+      options.defaultTripCount = value;
+    } else {
+      LOG_DEBUG("ignoring invalid default trip count: " << raw);
+    }
+  }
+
+  return options;
 }
 
 //===----------------------------------------------------------------------===//
@@ -729,10 +930,19 @@ int confidenceRank(CostConfidence confidence) {
   return 0;
 }
 
+/// A loop whose trip count is unknown, summarised by what it contains. One
+/// such loop understates the estimate once, not once per operation inside it,
+/// so this is the granularity the report uses.
+struct DynamicLoopStats {
+  int64_t costedOps = 0;
+  int64_t bodyCycles = 0;
+  int64_t assumedTripCount = 1;
+};
+
 struct CostBreakdown {
   llvm::MapVector<llvm::StringRef, OpKindStats> byOpKind;
   llvm::SmallVector<Operation *> unknownSizeOps;
-  llvm::SmallVector<Operation *> dynamicTripCountOps;
+  llvm::MapVector<Operation *, DynamicLoopStats> dynamicLoops;
   int64_t genericOps = 0;
   int64_t totalWeightedCycles = 0;
 
@@ -752,10 +962,13 @@ struct CostBreakdown {
     if (cost.confidence == CostConfidence::UnknownSize) {
       unknownSizeOps.push_back(op);
     }
-    // Only worth reporting when the operation actually costs something: a
-    // zero-cycle op in a dynamic loop does not move the estimate either way.
-    if (!weight.isKnown && cost.cycles > 0) {
-      dynamicTripCountOps.push_back(op);
+    // Attribute the operation to its loop rather than listing it separately.
+    // Zero-cycle operations are skipped: they cannot understate anything.
+    if (weight.dynamicLoop && cost.cycles > 0) {
+      DynamicLoopStats &loopStats = dynamicLoops[weight.dynamicLoop];
+      loopStats.costedOps += 1;
+      loopStats.bodyCycles += cost.cycles * weight.multiplier;
+      loopStats.assumedTripCount = weight.assumedTripCount;
     }
   }
 };
@@ -837,9 +1050,23 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
 
   printOpList(os, "operation(s) with a non-static shape, contributing 0 cycles",
               breakdown.unknownSizeOps);
-  printOpList(os,
-              "operation(s) in a loop with a dynamic trip count, counted once",
-              breakdown.dynamicTripCountOps);
+
+  // Loops, not their contents: one loop with an unknown trip count is one
+  // problem, however many operations it happens to contain.
+  if (!breakdown.dynamicLoops.empty()) {
+    os << "[" << DEBUG_TYPE << "] " << breakdown.dynamicLoops.size()
+       << " loop(s) whose trip count no binding resolved; the count below is"
+          " assumed, so the estimate is only as good as that assumption. Set "
+       << kArgBindingsEnvVar << " to bind the kernel arguments that bound them,"
+          " or "
+       << kDefaultTripCountEnvVar << " to change the assumption:\n";
+    for (const auto &[loop, stats] : breakdown.dynamicLoops) {
+      os << "[" << DEBUG_TYPE << "]     " << stats.costedOps
+         << " costed op(s), " << stats.bodyCycles << " cycles over an assumed "
+         << stats.assumedTripCount << " iteration(s)  at " << loop->getLoc()
+         << "\n";
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -870,6 +1097,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     return;
   }
 
+  const TripCountOptions tripCountOptions = readTripCountOptions();
+
   mlir::ascend::PipelineScheduler scheduler(config.get());
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
   CostBreakdown breakdown;
@@ -882,11 +1111,12 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
       return;
     }
 
-    LoopWeight weight = getLoopWeight(op);
-    // "Unknown" means the estimate is understated because of this operation.
-    // A zero-cycle operation in a dynamic loop does not qualify.
-    if (cost->confidence == CostConfidence::UnknownSize ||
-        (!weight.isKnown && cost->cycles > 0)) {
+    LoopWeight weight = getLoopWeight(op, tripCountOptions);
+    // Counts operations whose own cost could not be computed. An operation in
+    // a loop of unknown trip count is not one of those: its per-iteration cost
+    // is known, it is the iteration count that is not, which is accounted for
+    // per loop rather than per operation.
+    if (cost->confidence == CostConfidence::UnknownSize) {
       ++unknownOps;
     }
     breakdown.record(op, *cost, weight);
@@ -932,6 +1162,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(unknownOps));
   module->setAttr(kCVPipelineCostGenericOps,
                   builder.getI64IntegerAttr(breakdown.genericOps));
+  module->setAttr(
+      kCVPipelineCostDynamicLoops,
+      builder.getI64IntegerAttr(
+          static_cast<int64_t>(breakdown.dynamicLoops.size())));
 
   auto reportTo = [&](llvm::raw_ostream &os) {
     os << "[" << DEBUG_TYPE << "] " << config->getName() << ": " << totalCycles
@@ -939,7 +1173,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
        << llvm::format("%.3f", config->cyclesToMicroseconds(totalCycles))
        << " us), " << scheduledCycles << " cycles critical path, " << nextOpId
        << " ops costed, " << unknownOps << " of unknown cost, "
-       << breakdown.genericOps << " without a dedicated model\n";
+       << breakdown.genericOps << " without a dedicated model, "
+       << breakdown.dynamicLoops.size() << " loop(s) of unknown trip count\n";
   };
 
   const int verbosity = getVerbosity();
