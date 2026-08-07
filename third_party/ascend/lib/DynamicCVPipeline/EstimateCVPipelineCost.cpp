@@ -1662,9 +1662,12 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   if (!breakdown.blocks.empty()) {
     llvm::SmallVector<Attribute> blockAttrs;
     for (const auto &[id, stats] : breakdown.blocks) {
+      // A structured binding cannot be captured by a lambda before C++20, so
+      // the id is copied into an ordinary local first.
+      const int64_t blockId = id;
       auto collect = [&](const BlockDepMap &deps) {
         llvm::SmallVector<Attribute> result;
-        auto it = deps.find(id);
+        auto it = deps.find(blockId);
         if (it != deps.end()) {
           for (int64_t producer : it->second) {
             result.push_back(builder.getI64IntegerAttr(producer));
