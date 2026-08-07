@@ -48,11 +48,13 @@
 //   TRITON_ASCEND_CV_COST_VERBOSE=1   one-line summary
 //   TRITON_ASCEND_CV_COST_VERBOSE=2   summary + per-operation breakdown
 //
-// A loop bounded by a kernel argument has no trip count at compile time, and
-// its body is usually where the kernel spends its time. Either bind the
-// arguments, or say how many iterations to assume:
+// A loop whose bound is not a compile-time constant has no trip count, and its
+// body is usually where the kernel spends its time. Such a bound comes either
+// from a kernel argument or from the launch grid -- TritonToLinalg appends
+// program_id and num_programs to the entry function's arguments, so naming
+// them binds them. Failing that, say how many iterations to assume:
 //
-//   TRITON_ASCEND_CV_COST_ARG_BINDINGS=arg3=98432,arg5=128
+//   TRITON_ASCEND_CV_COST_ARG_BINDINGS=pid_x=0,num_programs_x=28,arg3=98432
 //   TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT=32
 //
 // The hardware profile defaults to a 910B. Selecting another one matters on
@@ -103,6 +105,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <optional>
+#include <string>
 #include <utility>
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
@@ -802,20 +805,50 @@ std::optional<OpCost> estimateOpCost(Operation *op,
 struct TripCountOptions {
   /// Values for entry-function arguments, by argument index.
   llvm::DenseMap<unsigned, int64_t> argBindings;
+  /// Values for the launch grid, keyed "pid_x" / "num_programs_x" and so on.
+  llvm::StringMap<int64_t> gridBindings;
   /// Iteration count assumed for loops that remain unresolved. One reproduces
   /// the behaviour of not assuming anything.
   int64_t defaultTripCount = 1;
 };
+
+/// TritonToLinalg does not lower tl.program_id to an operation: it appends the
+/// launch grid to the entry function's arguments and replaces the op with one
+/// of them. The last three are program_id x/y/z and the three before them are
+/// num_programs x/y/z -- see FunctionConverter.cpp, which does the append.
+///
+/// That makes the grid bindable through the ordinary argument mechanism, but
+/// only if the caller counts arguments by hand. Naming the slots instead is
+/// what makes `pid_x=0` work.
+constexpr unsigned kLaunchGridRank = 3;
+
+/// Grid slot a function argument corresponds to, or empty if it is an ordinary
+/// argument. `numArgs` is the entry function's argument count.
+std::string getGridBindingName(unsigned argIndex, unsigned numArgs) {
+  if (numArgs < 2 * kLaunchGridRank) {
+    return {}; // no launch grid was appended to this function
+  }
+  static constexpr llvm::StringLiteral kDims[] = {"x", "y", "z"};
+
+  unsigned programIdBase = numArgs - kLaunchGridRank;
+  if (argIndex >= programIdBase) {
+    return ("pid_" + kDims[argIndex - programIdBase]).str();
+  }
+  unsigned numProgramsBase = numArgs - 2 * kLaunchGridRank;
+  if (argIndex >= numProgramsBase) {
+    return ("num_programs_" + kDims[argIndex - numProgramsBase]).str();
+  }
+  return {};
+}
 
 /// Resolve an integer value given bindings for the entry function's arguments.
 ///
 /// Only entry-block arguments of a func.func are bound. This matters: a loop
 /// induction variable and a loop-carried value are BlockArguments too, and
 /// binding those by index would silently yield a plausible but wrong number.
-std::optional<int64_t>
-evaluateWithBindings(Value value,
-                     const llvm::DenseMap<unsigned, int64_t> &argBindings,
-                     int depth = 0) {
+std::optional<int64_t> evaluateWithBindings(Value value,
+                                            const TripCountOptions &options,
+                                            int depth = 0) {
   // Guards against a pathological or cyclic expression.
   if (depth > 16) {
     return std::nullopt;
@@ -827,11 +860,22 @@ evaluateWithBindings(Value value,
     if (!funcOp || blockArg.getOwner() != &funcOp.getBody().front()) {
       return std::nullopt; // induction variable / iter_arg, not a kernel arg
     }
-    auto it = argBindings.find(blockArg.getArgNumber());
-    if (it == argBindings.end()) {
-      return std::nullopt;
+    unsigned argIndex = blockArg.getArgNumber();
+    auto byIndex = options.argBindings.find(argIndex);
+    if (byIndex != options.argBindings.end()) {
+      return byIndex->second;
     }
-    return it->second;
+    // Only consult the grid slots when the caller named some, so a kernel
+    // whose real arguments happen to sit in those positions is unaffected.
+    if (!options.gridBindings.empty()) {
+      std::string gridName =
+          getGridBindingName(argIndex, funcOp.getNumArguments());
+      auto byName = options.gridBindings.find(gridName);
+      if (!gridName.empty() && byName != options.gridBindings.end()) {
+        return byName->second;
+      }
+    }
+    return std::nullopt;
   }
 
   Operation *def = value.getDefiningOp();
@@ -847,7 +891,7 @@ evaluateWithBindings(Value value,
   }
 
   auto operand = [&](unsigned index) {
-    return evaluateWithBindings(def->getOperand(index), argBindings, depth + 1);
+    return evaluateWithBindings(def->getOperand(index), options, depth + 1);
   };
 
   // Pass-through casts.
@@ -897,14 +941,13 @@ evaluateWithBindings(Value value,
 
 /// Trip count of a loop once the supplied bindings are taken into account.
 std::optional<int64_t>
-resolveTripCount(scf::ForOp forOp,
-                 const llvm::DenseMap<unsigned, int64_t> &argBindings) {
-  if (argBindings.empty()) {
+resolveTripCount(scf::ForOp forOp, const TripCountOptions &options) {
+  if (options.argBindings.empty() && options.gridBindings.empty()) {
     return std::nullopt;
   }
-  auto lower = evaluateWithBindings(forOp.getLowerBound(), argBindings);
-  auto upper = evaluateWithBindings(forOp.getUpperBound(), argBindings);
-  auto step = evaluateWithBindings(forOp.getStep(), argBindings);
+  auto lower = evaluateWithBindings(forOp.getLowerBound(), options);
+  auto upper = evaluateWithBindings(forOp.getUpperBound(), options);
+  auto step = evaluateWithBindings(forOp.getStep(), options);
   if (!lower || !upper || !step || *step == 0) {
     return std::nullopt;
   }
@@ -947,7 +990,7 @@ LoopWeight getLoopWeight(Operation *op, const TripCountOptions &options) {
       weight.multiplier *= tripCount.staticTripCount;
       continue;
     }
-    if (auto bound = resolveTripCount(forOp, options.argBindings)) {
+    if (auto bound = resolveTripCount(forOp, options)) {
       weight.multiplier *= *bound;
       continue;
     }
@@ -959,6 +1002,22 @@ LoopWeight getLoopWeight(Operation *op, const TripCountOptions &options) {
     }
   }
   return weight;
+}
+
+/// Canonical name for a launch-grid binding. Accepts the spellings the
+/// standalone costmodel uses, so the same string works in both. Empty when the
+/// name is not a grid slot and should be read as an argument index.
+std::string canonicalGridName(llvm::StringRef name) {
+  auto isDim = [](llvm::StringRef dim) {
+    return dim == "x" || dim == "y" || dim == "z";
+  };
+  if (name.consume_front("pid_") || name.consume_front("program_id_")) {
+    return isDim(name) ? ("pid_" + name).str() : std::string();
+  }
+  if (name.consume_front("num_programs_")) {
+    return isDim(name) ? ("num_programs_" + name).str() : std::string();
+  }
+  return {};
 }
 
 /// Read the trip-count options from the environment.
@@ -976,14 +1035,22 @@ TripCountOptions readTripCountOptions() {
     llvm::StringRef(raw).split(entries, ',', /*MaxSplit=*/-1,
                                /*KeepEmpty=*/false);
     for (llvm::StringRef entry : entries) {
-      auto [name, valueText] = entry.split('=');
-      name = name.trim();
-      name.consume_front("arg");
-      unsigned index = 0;
+      auto [rawName, rawValue] = entry.split('=');
+      llvm::StringRef name = rawName.trim();
       int64_t value = 0;
-      if (name.getAsInteger(10, index) ||
-          valueText.trim().getAsInteger(10, value)) {
-        LOG_DEBUG("ignoring malformed argument binding: " << entry);
+      if (rawValue.trim().getAsInteger(10, value)) {
+        LOG_DEBUG("ignoring malformed binding: " << entry);
+        continue;
+      }
+      if (std::string gridName = canonicalGridName(name); !gridName.empty()) {
+        options.gridBindings[gridName] = value;
+        continue;
+      }
+      llvm::StringRef indexText = name;
+      indexText.consume_front("arg");
+      unsigned index = 0;
+      if (indexText.getAsInteger(10, index)) {
+        LOG_DEBUG("ignoring malformed binding: " << entry);
         continue;
       }
       options.argBindings[index] = value;
