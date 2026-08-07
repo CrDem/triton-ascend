@@ -55,6 +55,15 @@
 //   TRITON_ASCEND_CV_COST_ARG_BINDINGS=arg3=98432,arg5=128
 //   TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT=32
 //
+// The hardware profile defaults to a 910B. Selecting another one matters on
+// 910_95, whose data paths differ: the Cube accumulator can drain straight
+// into UB, and UB and L1 exchange data on chip instead of through HBM. Which
+// engine a transfer occupies is derived from the address spaces the compiler
+// put on the memrefs, so those paths are costed as soon as the profile
+// describes them:
+//
+//   TRITON_ASCEND_CV_COST_HARDWARE_CONFIG=/path/to/ascend_910_95.json
+//
 //===----------------------------------------------------------------------===//
 
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
@@ -126,6 +135,11 @@ constexpr const char *kArgBindingsEnvVar = "TRITON_ASCEND_CV_COST_ARG_BINDINGS";
 /// counts such a body exactly once.
 constexpr const char *kDefaultTripCountEnvVar =
     "TRITON_ASCEND_CV_COST_DEFAULT_TRIP_COUNT";
+
+/// Path to the hardware profile JSON. Without this there is no way to select
+/// anything other than the built-in default, which is a 910B.
+constexpr const char *kHardwareConfigEnvVar =
+    "TRITON_ASCEND_CV_COST_HARDWARE_CONFIG";
 
 using mlir::ascend::HardwareConfig;
 using mlir::ascend::HWUnit;
@@ -303,32 +317,132 @@ bool isBackedByLocalAlloc(Value value) {
   return def && isa<memref::AllocOp, memref::AllocaOp>(def);
 }
 
-/// Hardware unit a data transfer occupies, given its direction and core.
-/// Ascend keeps separate movers per core: the Cube path loads through MTE2 into
-/// L1 and writes back through FixPipe, the Vector path loads through its own
-/// MTE2 into UB and writes back through MTE3.
-HWUnit getTransferUnit(bool isCube, bool isLoad) {
-  if (isCube) {
-    return isLoad ? HWUnit::CubeMTE2 : HWUnit::FixPipe;
+/// Costmodel name of the memory a buffer lives in, read from the address space
+/// the compiler attached to its memref. Empty when there is none to read -- a
+/// tensor that has not been bufferized yet, typically.
+///
+/// Reading this rather than inferring it from the operation's role is what
+/// makes 910_95 expressible at all: there, the same memref.copy may target HBM
+/// or UB or L1, and only the type says which.
+llvm::StringRef getMemorySpaceName(Type type) {
+  auto memrefType = dyn_cast<MemRefType>(type);
+  if (!memrefType) {
+    return {};
   }
-  return isLoad ? HWUnit::VecMTE2 : HWUnit::MTE3;
+  auto addressSpace =
+      dyn_cast_or_null<hivm::AddressSpaceAttr>(memrefType.getMemorySpace());
+  if (!addressSpace) {
+    return {};
+  }
+  switch (addressSpace.getAddressSpace()) {
+  case hivm::AddressSpace::GM:
+    return "hbm"; // the bandwidth tables call global memory "hbm"
+  case hivm::AddressSpace::L1:
+    return "l1";
+  case hivm::AddressSpace::L0A:
+    return "l0a";
+  case hivm::AddressSpace::L0B:
+    return "l0b";
+  case hivm::AddressSpace::L0C:
+    return "l0c";
+  case hivm::AddressSpace::UB:
+    return "ub";
+  default:
+    return {};
+  }
 }
 
-/// Memory spaces a transfer moves between, used to select the measured
-/// per-(src,dst) bandwidth table entry.
-std::pair<llvm::StringRef, llvm::StringRef> getTransferSpaces(HWUnit unit) {
-  switch (unit) {
-  case HWUnit::CubeMTE2:
-    return {"hbm", "l1"};
-  case HWUnit::FixPipe:
-    return {"l0c", "hbm"};
-  case HWUnit::VecMTE2:
-    return {"hbm", "ub"};
-  case HWUnit::MTE3:
-    return {"ub", "hbm"};
-  default:
-    return {"hbm", "ub"};
+/// Which data mover executes a transfer between two memory spaces.
+///
+/// The engine follows from where the data comes from and goes to, not from
+/// which core issued it. On 910_95 that distinction matters: draining the Cube
+/// accumulator to UB (FixPipeUB) and draining it to HBM (FixPipe) are different
+/// engines, and UB<->L1 traffic never leaves the chip at all.
+HWUnit getTransferUnit(llvm::StringRef src, llvm::StringRef dst) {
+  if (src == "l0c") {
+    return dst == "ub" ? HWUnit::FixPipeUB : HWUnit::FixPipe;
   }
+  if (dst == "l1" || dst == "l0a" || dst == "l0b") {
+    // Feeding the Cube: from HBM/L2 this is its MTE2; from UB (910_95) it is
+    // the vector store engine writing on-chip instead of out to HBM.
+    return src == "ub" ? HWUnit::MTE3 : HWUnit::CubeMTE2;
+  }
+  if (dst == "ub") {
+    return HWUnit::VecMTE2; // from HBM/L2, or from L1 on 910_95
+  }
+  if (src == "ub") {
+    return HWUnit::MTE3;
+  }
+  return HWUnit::VecMTE2;
+}
+
+/// Memory spaces to assume when the IR does not carry an address space, e.g.
+/// while values are still tensors. Reproduces the 910B-shaped guess the pass
+/// used before address spaces were read.
+std::pair<llvm::StringRef, llvm::StringRef> guessTransferSpaces(bool isCube,
+                                                                bool isLoad) {
+  using Spaces = std::pair<llvm::StringRef, llvm::StringRef>;
+  if (isCube) {
+    return isLoad ? Spaces{"hbm", "l1"} : Spaces{"l0c", "hbm"};
+  }
+  return isLoad ? Spaces{"hbm", "ub"} : Spaces{"ub", "hbm"};
+}
+
+/// Source and destination spaces of a transfer, preferring what the IR says
+/// and falling back to the guess above.
+std::pair<llvm::StringRef, llvm::StringRef>
+resolveTransferSpaces(Type srcType, Type dstType, bool isCube, bool isLoad) {
+  llvm::StringRef src = getMemorySpaceName(srcType);
+  llvm::StringRef dst = getMemorySpaceName(dstType);
+  if (src.empty() || dst.empty()) {
+    auto guessed = guessTransferSpaces(isCube, isLoad);
+    if (src.empty()) {
+      src = guessed.first;
+    }
+    if (dst.empty()) {
+      dst = guessed.second;
+    }
+  }
+  return {src, dst};
+}
+
+/// Spaces of a data-movement op that does not expose source and target
+/// directly. Destination-passing style puts the buffer written to last, so the
+/// first addressed operand is read from and the last is written to.
+std::pair<llvm::StringRef, llvm::StringRef>
+getDataMovementSpaces(Operation *op, bool isCube, bool isLoad) {
+  llvm::StringRef first;
+  llvm::StringRef last;
+  for (Value operand : op->getOperands()) {
+    llvm::StringRef space = getMemorySpaceName(operand.getType());
+    if (space.empty()) {
+      continue;
+    }
+    if (first.empty()) {
+      first = space;
+    }
+    last = space;
+  }
+  // A single addressed operand says where the data came from; the result, if
+  // any, says where it went.
+  llvm::StringRef resultSpace;
+  for (Value result : op->getResults()) {
+    resultSpace = getMemorySpaceName(result.getType());
+    if (!resultSpace.empty()) {
+      break;
+    }
+  }
+
+  llvm::StringRef src = first;
+  llvm::StringRef dst = !resultSpace.empty() ? resultSpace : last;
+  if (src == dst) {
+    // Only one space was visible: it cannot be both ends of the transfer.
+    dst = {};
+  }
+
+  auto guessed = guessTransferSpaces(isCube, isLoad);
+  return {src.empty() ? guessed.first : src,
+          dst.empty() ? guessed.second : dst};
 }
 
 int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
@@ -337,6 +451,7 @@ int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
   case HWUnit::VecMTE2:
     return config.getMTE2StartupLatency();
   case HWUnit::FixPipe:
+  case HWUnit::FixPipeUB:
     return config.getFixPipeStartupLatency();
   case HWUnit::MTE3:
     return config.getMTE3StartupLatency();
@@ -425,11 +540,12 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
   return cost;
 }
 
-/// Cost of a bulk data transfer (memref.copy / hivm store).
-OpCost estimateTransfer(Type shapedType, bool isCube, bool isLoad,
+/// Cost of a bulk data transfer between two memory spaces.
+OpCost estimateTransfer(Type shapedType, llvm::StringRef srcSpace,
+                        llvm::StringRef dstSpace,
                         const HardwareConfig &config) {
   OpCost cost;
-  cost.unit = getTransferUnit(isCube, isLoad);
+  cost.unit = getTransferUnit(srcSpace, dstSpace);
 
   auto bytes = getShapedByteSize(shapedType);
   if (!bytes) {
@@ -438,7 +554,6 @@ OpCost estimateTransfer(Type shapedType, bool isCube, bool isLoad,
   }
   cost.bytes = *bytes;
 
-  auto [srcSpace, dstSpace] = getTransferSpaces(cost.unit);
   int64_t transferCycles = config.estimateTransferCycles(
       srcSpace, dstSpace, *bytes, config.getActiveBandwidthCores());
   cost.cycles = transferCycles + getTransferStartupLatency(cost.unit, config);
@@ -583,28 +698,35 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     return estimateMatmul(matmulOp, config);
   }
 
-  // hivm.hir.fixpipe is the Cube write-back engine: it drains the accumulator
-  // through the FixPipe unit. Costing it as generic compute both used the
-  // wrong formula and loaded the wrong unit.
+  // hivm.hir.fixpipe drains the Cube accumulator. On 910_95 it may land in UB
+  // instead of HBM, which is a different engine entirely, so the destination
+  // is read from the operands rather than assumed.
   if (isa<hivm::FixpipeOp>(op)) {
     Type shapedType = getRepresentativeShapedType(op);
+    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, /*isCube=*/true,
+                                                      /*isLoad=*/false);
+    if (srcSpace.empty()) {
+      srcSpace = "l0c"; // fixpipe always reads the accumulator
+    }
     if (!shapedType) {
       OpCost cost;
-      cost.unit = HWUnit::FixPipe;
+      cost.unit = getTransferUnit(srcSpace, dstSpace);
       cost.confidence = CostConfidence::UnknownSize;
       return cost;
     }
-    return estimateTransfer(shapedType, /*isCube=*/true, /*isLoad=*/false,
-                            config);
+    return estimateTransfer(shapedType, srcSpace, dstSpace, config);
   }
 
   if (auto copyOp = dyn_cast<memref::CopyOp>(op)) {
     // A copy into a local allocation is a load; a copy out of one is a
-    // write-back. Local-to-local copies are treated as loads.
+    // write-back. Used only when the memrefs carry no address space.
     const bool targetIsLocal = isBackedByLocalAlloc(copyOp.getTarget());
     const bool sourceIsLocal = isBackedByLocalAlloc(copyOp.getSource());
     const bool isLoad = targetIsLocal || !sourceIsLocal;
-    return estimateTransfer(copyOp.getTarget().getType(), isCube, isLoad,
+    auto [srcSpace, dstSpace] =
+        resolveTransferSpaces(copyOp.getSource().getType(),
+                              copyOp.getTarget().getType(), isCube, isLoad);
+    return estimateTransfer(copyOp.getTarget().getType(), srcSpace, dstSpace,
                             config);
   }
 
@@ -612,24 +734,28 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   // data mover, not to the vector ALU.
   if (isa<hivm::CopyOp>(op)) {
     Type shapedType = getRepresentativeShapedType(op);
+    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, isCube,
+                                                     /*isLoad=*/true);
     if (!shapedType) {
       OpCost cost;
-      cost.unit = getTransferUnit(isCube, /*isLoad=*/true);
+      cost.unit = getTransferUnit(srcSpace, dstSpace);
       cost.confidence = CostConfidence::UnknownSize;
       return cost;
     }
-    return estimateTransfer(shapedType, isCube, /*isLoad=*/true, config);
+    return estimateTransfer(shapedType, srcSpace, dstSpace, config);
   }
 
   if (CVPipeline::isStoreLike(op)) {
     Type shapedType = getRepresentativeShapedType(op);
+    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, isCube,
+                                                     /*isLoad=*/false);
     if (!shapedType) {
       OpCost cost;
-      cost.unit = getTransferUnit(isCube, /*isLoad=*/false);
+      cost.unit = getTransferUnit(srcSpace, dstSpace);
       cost.confidence = CostConfidence::UnknownSize;
       return cost;
     }
-    return estimateTransfer(shapedType, isCube, /*isLoad=*/false, config);
+    return estimateTransfer(shapedType, srcSpace, dstSpace, config);
   }
 
   // Anything left that touches no shaped value is scalar bookkeeping: index
@@ -885,9 +1011,13 @@ int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
     return it == unitCycles.end() ? 0 : it->second;
   };
 
+  // FixPipeUB is Cube-side work even though it lands in Vector memory: it is
+  // the Cube's own drain engine. Leaving it out here would silently drop its
+  // cycles from the estimate entirely.
   int64_t cubePathCycles = std::max({cyclesOf(HWUnit::Cube),
                                      cyclesOf(HWUnit::CubeMTE2),
-                                     cyclesOf(HWUnit::FixPipe)});
+                                     cyclesOf(HWUnit::FixPipe),
+                                     cyclesOf(HWUnit::FixPipeUB)});
 
   int64_t vectorTransferCycles =
       config.areMutexUnits("vec_mte2", "mte3")
@@ -1089,9 +1219,18 @@ int getVerbosity() {
 }
 
 void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
+  // An explicitly constructed path wins; otherwise the environment selects the
+  // profile, so that a 910_95 run does not silently get 910B numbers.
+  std::string configPath = hardwareConfigPath.str();
+  if (configPath.empty()) {
+    if (const char *fromEnv = std::getenv(kHardwareConfigEnvVar)) {
+      configPath = fromEnv;
+    }
+  }
+
   std::string configError;
-  auto config = mlir::ascend::loadHardwareConfigForAnalysis(hardwareConfigPath,
-                                                            configError);
+  auto config =
+      mlir::ascend::loadHardwareConfigForAnalysis(configPath, configError);
   if (!config) {
     LOG_DEBUG("failed to load hardware config: " << configError);
     return;

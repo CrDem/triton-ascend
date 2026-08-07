@@ -39,17 +39,24 @@ def AscendModel_Dialect : Dialect {
 // Hardware Unit Enum
 //===----------------------------------------------------------------------===//
 
-def HWUnit_Cube     : I32EnumAttrCase<"Cube", 0, "cube">;
-def HWUnit_CubeMTE2 : I32EnumAttrCase<"CubeMTE2", 1, "cube_mte2">;
-def HWUnit_FixPipe  : I32EnumAttrCase<"FixPipe", 2, "fixpipe">;
-def HWUnit_Vector   : I32EnumAttrCase<"Vector", 3, "vector">;
-def HWUnit_VecMTE2  : I32EnumAttrCase<"VecMTE2", 4, "vec_mte2">;
-def HWUnit_MTE3     : I32EnumAttrCase<"MTE3", 5, "mte3">;
-def HWUnit_Scalar   : I32EnumAttrCase<"Scalar", 6, "scalar">;
+def HWUnit_Cube      : I32EnumAttrCase<"Cube", 0, "cube">;
+def HWUnit_CubeMTE2  : I32EnumAttrCase<"CubeMTE2", 1, "cube_mte2">;
+def HWUnit_FixPipe   : I32EnumAttrCase<"FixPipe", 2, "fixpipe">;
+def HWUnit_Vector    : I32EnumAttrCase<"Vector", 3, "vector">;
+def HWUnit_VecMTE2   : I32EnumAttrCase<"VecMTE2", 4, "vec_mte2">;
+def HWUnit_MTE3      : I32EnumAttrCase<"MTE3", 5, "mte3">;
+def HWUnit_Scalar    : I32EnumAttrCase<"Scalar", 6, "scalar">;
+// 910_95 drains the Cube accumulator straight into UB instead of going out to
+// HBM and back. It is a separate engine from the HBM write-back, so it gets
+// its own unit; on a part where the two share one pipe, declaring them a mutex
+// clique in the hardware profile serialises them without a code change.
+// Appended rather than inserted so the existing values stay stable.
+def HWUnit_FixPipeUB : I32EnumAttrCase<"FixPipeUB", 7, "fixpipe_ub">;
 
 def HWUnitAttr : I32EnumAttr<"HWUnit", "Hardware execution unit", [
   HWUnit_Cube, HWUnit_CubeMTE2, HWUnit_FixPipe,
-  HWUnit_Vector, HWUnit_VecMTE2, HWUnit_MTE3, HWUnit_Scalar
+  HWUnit_Vector, HWUnit_VecMTE2, HWUnit_MTE3, HWUnit_Scalar,
+  HWUnit_FixPipeUB
 ]> {
   let cppNamespace = "::mlir::ascend";
 }

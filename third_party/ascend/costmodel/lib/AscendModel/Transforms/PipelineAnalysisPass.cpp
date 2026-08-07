@@ -192,7 +192,8 @@ struct PipelineAnalysisPass
     // (tilesim pipe_exclusive_config only pairs AIV MTE2<->MTE3).
     int64_t cubePathCycles =
         std::max({hwUnitCycles[HWUnit::Cube], hwUnitCycles[HWUnit::CubeMTE2],
-                  hwUnitCycles[HWUnit::FixPipe]});
+                  hwUnitCycles[HWUnit::FixPipe],
+                  hwUnitCycles[HWUnit::FixPipeUB]});
 
     // Vector path. Vector compute overlaps with load/store transfers, but on
     // 910B AIV the MTE2 (load) and MTE3 (store) units share one physical

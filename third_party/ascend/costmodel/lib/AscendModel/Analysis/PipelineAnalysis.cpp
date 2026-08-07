@@ -153,6 +153,9 @@ void PipelineScheduler::initPipelines() {
   pipelines.emplace(HWUnit::VecMTE2, HWUnitPipeline(HWUnit::VecMTE2));
   pipelines.emplace(HWUnit::MTE3, HWUnitPipeline(HWUnit::MTE3));
   pipelines.emplace(HWUnit::Scalar, HWUnitPipeline(HWUnit::Scalar));
+  // 910_95 Cube-to-UB write-back. A unit without a pipeline here is silently
+  // dropped by schedule(), so every HWUnit must appear.
+  pipelines.emplace(HWUnit::FixPipeUB, HWUnitPipeline(HWUnit::FixPipeUB));
 }
 
 void PipelineScheduler::addOperation(PipelineOp op) {
@@ -316,8 +319,9 @@ void PipelineScheduler::printUtilizationReport(llvm::raw_ostream &os) const {
   os << "All units can execute in parallel (fully pipelined)\n\n";
 
   // Group by path for clarity
-  os << "Cube Path (HBM -> L1 -> L0A/B -> Cube -> L0C -> HBM):\n";
-  for (HWUnit unit : {HWUnit::CubeMTE2, HWUnit::Cube, HWUnit::FixPipe}) {
+  os << "Cube Path (HBM -> L1 -> L0A/B -> Cube -> L0C -> HBM/UB):\n";
+  for (HWUnit unit :
+       {HWUnit::CubeMTE2, HWUnit::Cube, HWUnit::FixPipe, HWUnit::FixPipeUB}) {
     auto it = pipelines.find(unit);
     if (it == pipelines.end())
       continue;
