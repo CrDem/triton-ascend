@@ -924,6 +924,42 @@ std::optional<int64_t> evaluateWithBindings(Value value,
     }
     return *lhs / *rhs;
   }
+  // Rounding divisions matter more than they look: AddControlFlowCondition
+  // rewrites every pipelined loop's upper bound as
+  //   lb + step * (ceildiv(ceildiv(ub - lb, step) * buffers, x) + ifCount)
+  // so without these a loop with entirely constant bounds still looks dynamic.
+  if (isa<arith::CeilDivUIOp>(def)) {
+    if (*rhs == 0) {
+      return std::nullopt;
+    }
+    auto unsignedLhs = static_cast<uint64_t>(*lhs);
+    auto unsignedRhs = static_cast<uint64_t>(*rhs);
+    return static_cast<int64_t>((unsignedLhs + unsignedRhs - 1) / unsignedRhs);
+  }
+  if (isa<arith::CeilDivSIOp>(def)) {
+    if (*rhs == 0) {
+      return std::nullopt;
+    }
+    int64_t quotient = *lhs / *rhs;
+    int64_t remainder = *lhs % *rhs;
+    // Truncation rounds towards zero; step back up when the exact result was
+    // positive and inexact.
+    if (remainder != 0 && ((remainder > 0) == (*rhs > 0))) {
+      ++quotient;
+    }
+    return quotient;
+  }
+  if (isa<arith::FloorDivSIOp>(def)) {
+    if (*rhs == 0) {
+      return std::nullopt;
+    }
+    int64_t quotient = *lhs / *rhs;
+    int64_t remainder = *lhs % *rhs;
+    if (remainder != 0 && ((remainder < 0) != (*rhs < 0))) {
+      --quotient;
+    }
+    return quotient;
+  }
   if (isa<arith::RemSIOp, arith::RemUIOp>(def)) {
     if (*rhs == 0) {
       return std::nullopt;
@@ -942,9 +978,9 @@ std::optional<int64_t> evaluateWithBindings(Value value,
 /// Trip count of a loop once the supplied bindings are taken into account.
 std::optional<int64_t>
 resolveTripCount(scf::ForOp forOp, const TripCountOptions &options) {
-  if (options.argBindings.empty() && options.gridBindings.empty()) {
-    return std::nullopt;
-  }
+  // Runs even with no bindings: a bound can be entirely constant yet still
+  // defeat the simpler static analysis, because the pipelining rewrite buries
+  // it under rounding divisions.
   auto lower = evaluateWithBindings(forOp.getLowerBound(), options);
   auto upper = evaluateWithBindings(forOp.getUpperBound(), options);
   auto step = evaluateWithBindings(forOp.getStep(), options);
