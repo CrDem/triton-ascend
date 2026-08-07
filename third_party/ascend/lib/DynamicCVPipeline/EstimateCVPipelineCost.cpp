@@ -406,43 +406,49 @@ resolveTransferSpaces(Type srcType, Type dstType, bool isCube, bool isLoad) {
   return {src, dst};
 }
 
-/// Spaces of a data-movement op that does not expose source and target
-/// directly. Destination-passing style puts the buffer written to last, so the
-/// first addressed operand is read from and the last is written to.
+/// Both ends of an hivm data-movement operation.
+///
+/// hivm.hir.fixpipe and hivm.hir.copy are both built as (source, destination)
+/// -- see InterCoreTransferAndSync, which creates them and labels the operands.
+/// The roles come from that convention rather than from scanning for whichever
+/// operand happens to carry an address space: fixpipe's source is often still a
+/// tensor, so such a scan finds only the destination and, taking it for the
+/// source, turns a Cube drain into a vector store.
+struct TransferEnds {
+  Value source;
+  Value dest;
+};
+
+std::optional<TransferEnds> getHivmTransferEnds(Operation *op) {
+  if (op->getNumOperands() < 2) {
+    return std::nullopt;
+  }
+  return TransferEnds{op->getOperand(0), op->getOperand(1)};
+}
+
+/// Spaces of an hivm transfer, per side, falling back independently so that an
+/// unreadable end never shifts the other end's role.
 std::pair<llvm::StringRef, llvm::StringRef>
-getDataMovementSpaces(Operation *op, bool isCube, bool isLoad) {
-  llvm::StringRef first;
-  llvm::StringRef last;
-  for (Value operand : op->getOperands()) {
-    llvm::StringRef space = getMemorySpaceName(operand.getType());
-    if (space.empty()) {
-      continue;
-    }
-    if (first.empty()) {
-      first = space;
-    }
-    last = space;
+resolveHivmTransferSpaces(Operation *op, llvm::StringRef fallbackSrc,
+                          llvm::StringRef fallbackDst) {
+  llvm::StringRef src;
+  llvm::StringRef dst;
+  if (auto ends = getHivmTransferEnds(op)) {
+    src = getMemorySpaceName(ends->source.getType());
+    dst = getMemorySpaceName(ends->dest.getType());
   }
-  // A single addressed operand says where the data came from; the result, if
-  // any, says where it went.
-  llvm::StringRef resultSpace;
-  for (Value result : op->getResults()) {
-    resultSpace = getMemorySpaceName(result.getType());
-    if (!resultSpace.empty()) {
-      break;
-    }
-  }
+  return {src.empty() ? fallbackSrc : src, dst.empty() ? fallbackDst : dst};
+}
 
-  llvm::StringRef src = first;
-  llvm::StringRef dst = !resultSpace.empty() ? resultSpace : last;
-  if (src == dst) {
-    // Only one space was visible: it cannot be both ends of the transfer.
-    dst = {};
+/// Size of a transfer: what lands in the destination, falling back to whatever
+/// shaped value the operation exposes.
+Type getTransferSizingType(Operation *op) {
+  if (auto ends = getHivmTransferEnds(op)) {
+    if (isa<ShapedType>(ends->dest.getType())) {
+      return ends->dest.getType();
+    }
   }
-
-  auto guessed = guessTransferSpaces(isCube, isLoad);
-  return {src.empty() ? guessed.first : src,
-          dst.empty() ? guessed.second : dst};
+  return getRepresentativeShapedType(op);
 }
 
 int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
@@ -702,12 +708,13 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   // instead of HBM, which is a different engine entirely, so the destination
   // is read from the operands rather than assumed.
   if (isa<hivm::FixpipeOp>(op)) {
-    Type shapedType = getRepresentativeShapedType(op);
-    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, /*isCube=*/true,
-                                                      /*isLoad=*/false);
-    if (srcSpace.empty()) {
-      srcSpace = "l0c"; // fixpipe always reads the accumulator
-    }
+    // The source is the accumulator by definition; only the destination is in
+    // question, and on 910_95 it decides whether this is a FixPipe to HBM or
+    // the on-chip drain into UB.
+    auto [srcSpace, dstSpace] =
+        resolveHivmTransferSpaces(op, /*fallbackSrc=*/"l0c",
+                                  /*fallbackDst=*/"hbm");
+    Type shapedType = getTransferSizingType(op);
     if (!shapedType) {
       OpCost cost;
       cost.unit = getTransferUnit(srcSpace, dstSpace);
@@ -733,9 +740,12 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   // hivm.hir.copy moves a buffer, it does not compute over it: it belongs to a
   // data mover, not to the vector ALU.
   if (isa<hivm::CopyOp>(op)) {
-    Type shapedType = getRepresentativeShapedType(op);
-    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, isCube,
-                                                     /*isLoad=*/true);
+    // The CV pipeline emits these to stage data between the cores; on 910_95
+    // the destination is often L1, keeping the traffic on chip.
+    auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
+    auto [srcSpace, dstSpace] =
+        resolveHivmTransferSpaces(op, guessed.first, guessed.second);
+    Type shapedType = getTransferSizingType(op);
     if (!shapedType) {
       OpCost cost;
       cost.unit = getTransferUnit(srcSpace, dstSpace);
@@ -747,8 +757,7 @@ std::optional<OpCost> estimateOpCost(Operation *op,
 
   if (CVPipeline::isStoreLike(op)) {
     Type shapedType = getRepresentativeShapedType(op);
-    auto [srcSpace, dstSpace] = getDataMovementSpaces(op, isCube,
-                                                     /*isLoad=*/false);
+    auto [srcSpace, dstSpace] = guessTransferSpaces(isCube, /*isLoad=*/false);
     if (!shapedType) {
       OpCost cost;
       cost.unit = getTransferUnit(srcSpace, dstSpace);
