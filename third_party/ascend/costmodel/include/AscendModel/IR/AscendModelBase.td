@@ -52,11 +52,21 @@ def HWUnit_Scalar    : I32EnumAttrCase<"Scalar", 6, "scalar">;
 // clique in the hardware profile serialises them without a code change.
 // Appended rather than inserted so the existing values stay stable.
 def HWUnit_FixPipeUB : I32EnumAttrCase<"FixPipeUB", 7, "fixpipe_ub">;
+// On-chip staging between UB and L1, which this target can do without a round
+// trip through HBM or L2. These are movers in their own right, not a mode of
+// the off-chip ones: UB can be draining into L1 at the same time as it streams
+// out to L2, so they overlap that traffic rather than queue behind it. Keeping
+// them separate also lets a report tell on-chip staging apart from real
+// off-chip traffic, which is the difference that matters when reading where a
+// kernel spends its time. A part where they do share a pipe is expressed by a
+// mutex clique in the hardware profile, without a code change.
+def HWUnit_MTE3ToL1  : I32EnumAttrCase<"MTE3ToL1", 8, "mte3_ub_l1">;
+def HWUnit_MTE1ToUB  : I32EnumAttrCase<"MTE1ToUB", 9, "mte1_l1_ub">;
 
 def HWUnitAttr : I32EnumAttr<"HWUnit", "Hardware execution unit", [
   HWUnit_Cube, HWUnit_CubeMTE2, HWUnit_FixPipe,
   HWUnit_Vector, HWUnit_VecMTE2, HWUnit_MTE3, HWUnit_Scalar,
-  HWUnit_FixPipeUB
+  HWUnit_FixPipeUB, HWUnit_MTE3ToL1, HWUnit_MTE1ToUB
 ]> {
   let cppNamespace = "::mlir::ascend";
 }

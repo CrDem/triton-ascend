@@ -153,9 +153,12 @@ void PipelineScheduler::initPipelines() {
   pipelines.emplace(HWUnit::VecMTE2, HWUnitPipeline(HWUnit::VecMTE2));
   pipelines.emplace(HWUnit::MTE3, HWUnitPipeline(HWUnit::MTE3));
   pipelines.emplace(HWUnit::Scalar, HWUnitPipeline(HWUnit::Scalar));
-  // Cube-to-UB write-back. A unit without a pipeline here is silently
-  // dropped by schedule(), so every HWUnit must appear.
+  // Cube-to-UB write-back and the on-chip UB<->L1 staging. A unit without a
+  // pipeline here is silently dropped by schedule(), so every HWUnit must
+  // appear.
   pipelines.emplace(HWUnit::FixPipeUB, HWUnitPipeline(HWUnit::FixPipeUB));
+  pipelines.emplace(HWUnit::MTE3ToL1, HWUnitPipeline(HWUnit::MTE3ToL1));
+  pipelines.emplace(HWUnit::MTE1ToUB, HWUnitPipeline(HWUnit::MTE1ToUB));
 }
 
 void PipelineScheduler::addOperation(PipelineOp op) {
@@ -343,8 +346,9 @@ void PipelineScheduler::printUtilizationReport(llvm::raw_ostream &os) const {
     }
   }
 
-  os << "\nVector Path (HBM -> UB -> Vector -> UB -> HBM):\n";
-  for (HWUnit unit : {HWUnit::VecMTE2, HWUnit::Vector, HWUnit::MTE3}) {
+  os << "\nVector Path (HBM/L1 -> UB -> Vector -> UB -> HBM/L1):\n";
+  for (HWUnit unit : {HWUnit::VecMTE2, HWUnit::Vector, HWUnit::MTE3,
+                      HWUnit::MTE1ToUB, HWUnit::MTE3ToL1}) {
     auto it = pipelines.find(unit);
     if (it == pipelines.end())
       continue;

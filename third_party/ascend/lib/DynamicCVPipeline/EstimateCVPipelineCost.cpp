@@ -414,12 +414,16 @@ HWUnit getTransferUnit(llvm::StringRef src, llvm::StringRef dst) {
     return dst == "ub" ? HWUnit::FixPipeUB : HWUnit::FixPipe;
   }
   if (dst == "l1" || dst == "l0a" || dst == "l0b") {
-    // Feeding the Cube: from HBM/L2 this is its MTE2; from UB it is
-    // the vector store engine writing on-chip instead of out to HBM.
-    return src == "ub" ? HWUnit::MTE3 : HWUnit::CubeMTE2;
+    // Feeding the Cube: from HBM/L2 this is its MTE2; from UB it is the vector
+    // store engine writing on chip instead of out to HBM, which this target
+    // can do directly -- the bandwidth table has a ub:l1 entry, so no round
+    // trip through L2 is charged.
+    return src == "ub" ? HWUnit::MTE3ToL1 : HWUnit::CubeMTE2;
   }
   if (dst == "ub") {
-    return HWUnit::VecMTE2; // from HBM/L2, or from L1 on the newer topology
+    // From L1 this is the on-chip return path, again direct (l1:ub); from
+    // HBM/L2 it is an ordinary vector load.
+    return src == "l1" ? HWUnit::MTE1ToUB : HWUnit::VecMTE2;
   }
   if (src == "ub") {
     return HWUnit::MTE3;
@@ -506,11 +510,15 @@ int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
   switch (unit) {
   case HWUnit::CubeMTE2:
   case HWUnit::VecMTE2:
+  // Reading L1 into UB is still the load engine starting up.
+  case HWUnit::MTE1ToUB:
     return config.getMTE2StartupLatency();
   case HWUnit::FixPipe:
   case HWUnit::FixPipeUB:
     return config.getFixPipeStartupLatency();
   case HWUnit::MTE3:
+  // Writing UB out to L1 is still the store engine starting up.
+  case HWUnit::MTE3ToL1:
     return config.getMTE3StartupLatency();
   default:
     return 0;
@@ -1220,10 +1228,26 @@ int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
                                      cyclesOf(HWUnit::FixPipe),
                                      cyclesOf(HWUnit::FixPipeUB)});
 
-  int64_t vectorTransferCycles =
+  // Off-chip traffic. The AIV load and store movers share one physical
+  // pipeline on some parts, which is what the mutex clique in the profile
+  // says; there they serialise instead of overlapping.
+  const int64_t offChipTransferCycles =
       config.areMutexUnits("vec_mte2", "mte3")
           ? cyclesOf(HWUnit::VecMTE2) + cyclesOf(HWUnit::MTE3)
           : std::max(cyclesOf(HWUnit::VecMTE2), cyclesOf(HWUnit::MTE3));
+
+  // On-chip UB<->L1 staging has movers of its own: UB can be draining into L1
+  // at the same time as it streams out to L2/HBM, so this overlaps the traffic
+  // above rather than queueing behind it. If a part turns out to share a pipe
+  // after all, declaring the units a mutex clique in the hardware profile
+  // serialises them with no code change.
+  const int64_t onChipTransferCycles =
+      config.areMutexUnits("mte1_l1_ub", "mte3_ub_l1")
+          ? cyclesOf(HWUnit::MTE1ToUB) + cyclesOf(HWUnit::MTE3ToL1)
+          : std::max(cyclesOf(HWUnit::MTE1ToUB), cyclesOf(HWUnit::MTE3ToL1));
+
+  int64_t vectorTransferCycles =
+      std::max(offChipTransferCycles, onChipTransferCycles);
   int64_t vectorPathCycles =
       std::max(cyclesOf(HWUnit::Vector), vectorTransferCycles);
 

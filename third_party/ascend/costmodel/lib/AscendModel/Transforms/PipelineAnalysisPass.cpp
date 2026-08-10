@@ -206,6 +206,18 @@ struct PipelineAnalysisPass
     else
       vecTransfer =
           std::max(hwUnitCycles[HWUnit::VecMTE2], hwUnitCycles[HWUnit::MTE3]);
+
+    // On-chip UB<->L1 staging runs on movers of its own, so it overlaps the
+    // off-chip traffic above. Zero unless something upstream assigns those
+    // units, so this leaves existing behaviour alone.
+    int64_t onChipTransfer;
+    if (config.areMutexUnits("mte1_l1_ub", "mte3_ub_l1"))
+      onChipTransfer =
+          hwUnitCycles[HWUnit::MTE1ToUB] + hwUnitCycles[HWUnit::MTE3ToL1];
+    else
+      onChipTransfer = std::max(hwUnitCycles[HWUnit::MTE1ToUB],
+                                hwUnitCycles[HWUnit::MTE3ToL1]);
+    vecTransfer = std::max(vecTransfer, onChipTransfer);
     int64_t vectorPathCycles =
         std::max(hwUnitCycles[HWUnit::Vector], vecTransfer);
 

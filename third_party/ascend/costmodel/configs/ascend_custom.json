@@ -186,7 +186,7 @@
       "supports_cast": true
     },
     "ub_to_l1": {
-      "description": "On-chip Vector-to-Cube staging: UB to L1, avoiding the HBM round trip. PLACEHOLDER bandwidth.",
+      "description": "On-chip Vector-to-Cube staging: UB to L1, avoiding the HBM round trip. Reported as unit mte3_ub_l1 and modelled as a mover of its own, so it overlaps off-chip mte3 traffic: UB can drain to L1 and stream to L2 at the same time. PLACEHOLDER bandwidth.",
       "src_space": "ub",
       "dst_space": "l1",
       "bandwidth_gbps": 200,
@@ -194,7 +194,7 @@
       "alignment_bytes": 32
     },
     "l1_to_ub": {
-      "description": "On-chip Cube-to-Vector staging: L1 to UB. PLACEHOLDER bandwidth.",
+      "description": "On-chip Cube-to-Vector staging: L1 to UB. Reported as unit mte1_l1_ub and modelled as a mover of its own, so it overlaps off-chip vec_mte2 traffic. PLACEHOLDER bandwidth.",
       "src_space": "l1",
       "dst_space": "ub",
       "bandwidth_gbps": 200,
@@ -345,7 +345,7 @@
       ]
     },
     "mutex_groups": {
-      "description": "Hardware units that share a physical pipeline and cannot execute in parallel (tilesim MutexComponents / pipe_exclusive_config). Each clique is an array of costmodel unit names (cube/cube_mte2/fixpipe/vector/vec_mte2/mte3/scalar). 910B: AIV MTE2 (vec load) and MTE3 (vec store) share one pipeline -> they serialize, so the vector-path roofline uses max(vector, vec_mte2 + mte3) instead of max(vector, vec_mte2, mte3). UNVERIFIED for this target: the vec_mte2/mte3 clique is inherited from 910B, and whether fixpipe and fixpipe_ub share one physical pipe is not known. If they do, add [\"fixpipe\", \"fixpipe_ub\"] as a clique here -- that serialises them with no code change.",
+      "description": "Hardware units that share a physical pipeline and cannot execute in parallel (tilesim MutexComponents / pipe_exclusive_config). Each clique is an array of costmodel unit names (cube/cube_mte2/fixpipe/fixpipe_ub/vector/vec_mte2/mte3/mte3_ub_l1/mte1_l1_ub/scalar). 910B: AIV MTE2 (vec load) and MTE3 (vec store) share one pipeline -> they serialize, so the vector-path roofline uses max(vector, vec_mte2 + mte3) instead of max(vector, vec_mte2, mte3). UNVERIFIED for this target, and all three of these are answered by adding a clique here rather than by changing code: (1) the vec_mte2/mte3 clique is inherited from 910B; (2) whether fixpipe and fixpipe_ub share one physical pipe -- if so add [\"fixpipe\", \"fixpipe_ub\"]; (3) the on-chip movers mte3_ub_l1 and mte1_l1_ub are modelled as independent of each other and of the off-chip ones, so UB can drain to L1 while streaming to L2 -- if any of those pairs really shares a pipe, add it as a clique.",
       "cliques": [
         [
           "vec_mte2",
