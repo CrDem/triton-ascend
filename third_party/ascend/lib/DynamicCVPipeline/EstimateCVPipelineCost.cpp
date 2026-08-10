@@ -1553,14 +1553,21 @@ struct CoreBusyCycles {
   int64_t bound() const { return std::max(cube, vector); }
 };
 
-/// Order the blocks so that a producer is scheduled before its consumers.
+/// Order the blocks so that a producer is scheduled before its consumers, and
+/// so that each core keeps its blocks in the order it will issue them.
 ///
-/// Program order will not do. ReorderOpsByBlockId makes the blocks of one core
-/// topological among themselves, but SeparateCVScope then groups the module by
-/// core, so every Vector block can precede every Cube block in the IR even
-/// when a Cube block produces what a Vector block consumes. Scheduling in that
-/// order would treat each such edge as loop-carried and drop it -- silently
-/// discarding exactly the cross-core barriers this model exists to honour.
+/// Program order alone will not do. ReorderOpsByBlockId makes the blocks of one
+/// core topological among themselves, but SeparateCVScope then groups the
+/// module by core, so every Vector block can precede every Cube block in the IR
+/// even when a Cube block produces what a Vector block consumes. Scheduling in
+/// that order would treat each such edge as loop-carried and drop it --
+/// silently discarding exactly the cross-core barriers this model exists to
+/// honour.
+///
+/// Dependency order alone will not do either: it leaves an unconstrained block
+/// free to float to the front and fill a gap the hardware does not have, which
+/// understates the critical path. Hence the same-core chain below, which pins
+/// each core's sequence to program order and lets only cross-core edges move.
 ///
 /// Kahn's algorithm, with ties broken by program order so the result is
 /// deterministic. A genuine cycle (a loop-carried dependency) cannot be
@@ -1581,29 +1588,63 @@ topologicalBlockOrder(const CostBreakdown &breakdown) {
   }
 
   llvm::DenseSet<std::pair<int64_t, int64_t>> seenEdge;
+  // The two edge kinds overlap: a memory dependency shows up both as a
+  // transfer group and as a dataflow edge. Counting it twice would leave a
+  // permanent in-degree and force the cycle-breaking path.
+  auto addEdge = [&](int64_t producer, int64_t consumer) {
+    if (producer == consumer || !inDegree.count(producer) ||
+        !inDegree.count(consumer)) {
+      return;
+    }
+    if (!seenEdge.insert({producer, consumer}).second) {
+      return;
+    }
+    successors[producer].push_back(consumer);
+    inDegree[consumer] += 1;
+  };
+
   auto addEdges = [&](const BlockDepMap &deps) {
     for (const auto &entry : deps) {
-      const int64_t consumer = entry.first;
-      if (!inDegree.count(consumer)) {
-        continue;
-      }
       for (int64_t producer : entry.second) {
-        if (producer == consumer || !inDegree.count(producer)) {
-          continue;
-        }
-        // The two edge kinds overlap: a memory dependency shows up both as a
-        // transfer group and as a dataflow edge. Counting it twice would leave
-        // a permanent in-degree and force the cycle-breaking path.
-        if (!seenEdge.insert({producer, consumer}).second) {
-          continue;
-        }
-        successors[producer].push_back(consumer);
-        inDegree[consumer] += 1;
+        addEdge(producer, entry.first);
       }
     }
   };
   addEdges(breakdown.syncDeps);
   addEdges(breakdown.dataDeps);
+
+  // A core issues its blocks in program order and never reorders them, so
+  // consecutive blocks on one core are chained here. Without this the sort is
+  // free to slide an unconstrained block into a gap that the hardware does not
+  // actually have, which understates the critical path. A block whose
+  // operations disagree about their core sits in both chains.
+  int64_t lastCube = 0;
+  int64_t lastVector = 0;
+  bool haveCube = false;
+  bool haveVector = false;
+  for (int64_t id : programOrder) {
+    auto entry = breakdown.blocks.find(id);
+    if (entry == breakdown.blocks.end()) {
+      continue;
+    }
+    const BlockStats &stats = entry->second;
+    const bool onCube = stats.mixedCore || stats.isCube;
+    const bool onVector = stats.mixedCore || !stats.isCube;
+    if (onCube) {
+      if (haveCube) {
+        addEdge(lastCube, id);
+      }
+      lastCube = id;
+      haveCube = true;
+    }
+    if (onVector) {
+      if (haveVector) {
+        addEdge(lastVector, id);
+      }
+      lastVector = id;
+      haveVector = true;
+    }
+  }
 
   llvm::SmallVector<int64_t> order;
   llvm::DenseSet<int64_t> emitted;
