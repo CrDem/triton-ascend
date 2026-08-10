@@ -22,10 +22,12 @@
 
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/StringRef.h"
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -143,6 +145,9 @@ std::optional<int> getTightlyCoupledBufferId(Value allocVal);
 // `bufferization.to_tensor`'s source. Returns the input unchanged when no
 // such cast is found.
 Value traceBackToMemrefAlloc(Value v);
+bool allResultHasOneUser(Operation *op);
+
+int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
 
 } // namespace CVPipeline
 } // namespace mlir
