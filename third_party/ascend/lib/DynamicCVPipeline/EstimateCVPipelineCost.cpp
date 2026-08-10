@@ -45,16 +45,16 @@
 // the larger of two bounds:
 //
 //   resource   -- the busiest core's total busy time;
-//   recurrence -- the barrier chain paid for every iteration, divided by the
-//                 inter-core buffer depth the pipeline actually allocated.
+//   recurrence -- the buffer that is held longest relative to how many copies
+//                 of it the pipeline allocated.
 //
-// The second is what a plain "II * (N - 1) + latency" gets wrong. That formula
-// assumes the pipeline reaches steady state, which needs buffering deep enough
-// to hide the chain; AllocMultiCache defaults to a *single* inter-core buffer,
-// so on a kernel that alternates Cube and Vector nothing is hidden and the
-// chain is paid every iteration. Deep buffering leaves the resource bound
-// standing, one buffer gives the fully serialised cost, and the maximum
-// reproduces both.
+// The recurrence term is what a plain "II * (N - 1) + latency" gets wrong.
+// That formula assumes the pipeline reaches steady state, which needs enough
+// buffering to hide the dependency; the inter-core depth defaults to one, so
+// on a kernel that alternates Cube and Vector the next iteration cannot start
+// writing a buffer until this one has finished reading it. Deep buffering
+// leaves the resource bound standing, a single buffer exposes the alternation,
+// and the maximum of the two crosses over on its own.
 //
 // The number is intended for *ranking* CV pipeline variants against each other,
 // not for absolute latency prediction.
@@ -135,7 +135,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1820,97 +1819,80 @@ bool edgeCrossesCores(const BlockStats &producer, const BlockStats &consumer) {
   return producer.isCube != consumer.isCube;
 }
 
-/// The dependency chain that constrains the kernel most, once buffering is
-/// taken into account.
+/// The buffer whose reuse constrains the kernel most.
 ///
-/// Separate from the schedule above, which also serialises blocks that merely
-/// share a core. Sharing a core is a *resource* constraint and is already
-/// counted by that core's total busy time; what matters here is the ordering
-/// the IR actually requires, because that is what buffering can overlap from
-/// one iteration to the next. Every dependency counts -- Cube to Vector, Cube
-/// to Cube, Vector to Vector -- each gated by the buffer depth for its kind.
+/// Every dependency between blocks is carried by a buffer, and that buffer is
+/// occupied from the moment its producer starts writing until its consumer has
+/// finished reading. The next iteration cannot reuse it until then, so with B
+/// buffers allocated for that transfer the kernel cannot go faster than
+/// occupancy/B.
 ///
-/// A chain of length L that is buffered B deep costs L/B per iteration, so the
-/// bound is the largest L/B over all chains. Chains are compared by that ratio
-/// rather than by length alone: a shorter chain through a single-buffered
-/// barrier constrains more than a longer, deeply buffered one.
-struct DependencyChain {
-  int64_t cycles = 0;      ///< length of the chain that produced the bound
-  int64_t bufferDepth = 1; ///< tightest buffer depth anywhere along it
-  int64_t bound = 0;       ///< cycles / bufferDepth
+/// The bound is taken per edge, not over a whole chain: each transfer has its
+/// own buffers, so a producer waits only for *its* consumer to release *its*
+/// buffer, not for the far end of the chain. Treating the chain as one buffer
+/// would charge the alternation several times over.
+///
+/// Occupancy is read off the loop-weighted schedule, so it already includes
+/// any unrelated work the two cores do in between -- the buffer really is held
+/// across that too -- and it is already scaled by the iteration count.
+///
+/// Every kind of dependency counts: Cube to Vector, Cube to Cube, Vector to
+/// Vector. Only the depth differs, since crossing cores goes through an
+/// inter-core buffer and staying on one core through an intra-core one.
+struct BufferRecurrence {
+  int64_t producer = kNoBlockId;
+  int64_t consumer = kNoBlockId;
+  int64_t occupancy = 0; ///< how long the buffer is held, loop-weighted
+  int64_t depth = 1;
+  int64_t bound = 0; ///< occupancy / depth
+  bool crossesCores = false;
 };
 
-DependencyChain longestDependencyChain(const CostBreakdown &breakdown,
-                                       llvm::ArrayRef<int64_t> order,
-                                       const HardwareConfig &config,
-                                       const FusionFactors &fusion,
-                                       const BufferDepths &depths) {
-  // "No dependency edge on this chain yet", so a block with no producers is
-  // not reported as being buffer-limited by anything.
-  const int64_t unbuffered = std::numeric_limits<int64_t>::max();
+BufferRecurrence tightestBufferRecurrence(
+    const CostBreakdown &breakdown,
+    const llvm::MapVector<int64_t, BlockSchedule> &schedule,
+    const BufferDepths &depths) {
+  BufferRecurrence tightest;
 
-  struct Reached {
-    int64_t cycles = 0;
-    int64_t depth = 0;
+  auto consider = [&](const BlockDepMap &deps) {
+    for (const auto &entry : deps) {
+      const int64_t consumerId = entry.first;
+      auto consumerSlot = schedule.find(consumerId);
+      auto consumerStats = breakdown.blocks.find(consumerId);
+      if (consumerSlot == schedule.end() ||
+          consumerStats == breakdown.blocks.end()) {
+        continue;
+      }
+      for (int64_t producerId : entry.second) {
+        auto producerSlot = schedule.find(producerId);
+        auto producerStats = breakdown.blocks.find(producerId);
+        if (producerSlot == schedule.end() ||
+            producerStats == breakdown.blocks.end()) {
+          continue;
+        }
+        const int64_t occupancy =
+            consumerSlot->second.finish - producerSlot->second.start;
+        if (occupancy <= 0) {
+          continue; // the consumer was scheduled first: a loop-carried edge
+        }
+        const bool crosses =
+            edgeCrossesCores(producerStats->second, consumerStats->second);
+        const int64_t depth = depths.forEdge(crosses);
+        const int64_t bound = occupancy / std::max<int64_t>(1, depth);
+        if (bound > tightest.bound) {
+          tightest.producer = producerId;
+          tightest.consumer = consumerId;
+          tightest.occupancy = occupancy;
+          tightest.depth = depth;
+          tightest.bound = bound;
+          tightest.crossesCores = crosses;
+        }
+      }
+    }
   };
-  llvm::DenseMap<int64_t, Reached> reached;
-
-  DependencyChain best;
-  best.bufferDepth = 1;
-
-  for (int64_t id : order) {
-    auto entry = breakdown.blocks.find(id);
-    if (entry == breakdown.blocks.end()) {
-      continue;
-    }
-    const BlockStats &stats = entry->second;
-    const int64_t cycles =
-        computeBlockCycles(stats, config, fusion, /*perIteration=*/false);
-
-    int64_t incoming = 0;
-    int64_t depth = unbuffered;
-    // Tracked separately from `incoming`, so an edge from a zero-cost block
-    // (a pure barrier block, say) still contributes its buffer depth.
-    bool sawEdge = false;
-    auto consider = [&](const BlockDepMap &deps) {
-      auto it = deps.find(id);
-      if (it == deps.end()) {
-        return;
-      }
-      for (int64_t producer : it->second) {
-        auto reachedProducer = reached.find(producer);
-        auto producerEntry = breakdown.blocks.find(producer);
-        if (reachedProducer == reached.end() ||
-            producerEntry == breakdown.blocks.end()) {
-          continue; // back edge: the producer belongs to a later pass
-        }
-        const int64_t edgeDepth = depths.forEdge(
-            edgeCrossesCores(producerEntry->second, stats));
-        if (!sawEdge || reachedProducer->second.cycles > incoming) {
-          sawEdge = true;
-          incoming = reachedProducer->second.cycles;
-          depth = std::min(reachedProducer->second.depth, edgeDepth);
-        }
-      }
-    };
-    consider(breakdown.syncDeps);
-    consider(breakdown.dataDeps);
-
-    Reached &slot = reached[id];
-    slot.cycles = incoming + cycles;
-    slot.depth = depth;
-
-    // Compared by ratio, so a tightly buffered short chain can win.
-    const int64_t effectiveDepth = depth == unbuffered ? 1 : depth;
-    const int64_t bound =
-        depth == unbuffered ? 0 : slot.cycles / effectiveDepth;
-    if (bound > best.bound) {
-      best.bound = bound;
-      best.cycles = slot.cycles;
-      best.bufferDepth = effectiveDepth;
-    }
-  }
-  return best;
+  consider(breakdown.syncDeps);
+  consider(breakdown.dataDeps);
+  return tightest;
 }
 
 /// Everything the module estimate is assembled from, kept together so the
@@ -1928,14 +1910,17 @@ struct ModuleEstimate {
   int64_t serialisedBound = 0;
   /// Buffer depths as recorded on the module by BufferCountManager.
   BufferDepths buffers;
-  /// The dependency chain that constrains the kernel most, and its bound.
-  DependencyChain chain;
+  /// The buffer whose reuse constrains the kernel most, and its bound.
+  BufferRecurrence recurrence;
   int64_t recurrenceBound = 0;
   int64_t total = 0;
 
   /// Blocks in the order they were scheduled: dependency order, not IR order.
   llvm::SmallVector<int64_t> order;
   llvm::MapVector<int64_t, BlockSchedule> iterationSchedule;
+  /// The same schedule on loop-weighted costs, which is what buffer occupancy
+  /// is measured against.
+  llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
   CoreBusyCycles weightedBusy;
   CoreBusyCycles iterationBusy;
 };
@@ -1967,10 +1952,9 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
   estimate.buffers = buffers;
   estimate.order = topologicalBlockOrder(breakdown);
 
-  llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
   estimate.serialisedBound = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/false,
-      weightedSchedule, estimate.weightedBusy);
+      estimate.weightedSchedule, estimate.weightedBusy);
   estimate.throughputBound = estimate.weightedBusy.bound();
 
   estimate.iterationLatency = scheduleBlockGraph(
@@ -1978,9 +1962,9 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
       estimate.iterationSchedule, estimate.iterationBusy);
   estimate.initiationInterval = estimate.iterationBusy.bound();
 
-  estimate.chain = longestDependencyChain(breakdown, estimate.order, config,
-                                          fusion, buffers);
-  estimate.recurrenceBound = estimate.chain.bound;
+  estimate.recurrence = tightestBufferRecurrence(
+      breakdown, estimate.weightedSchedule, buffers);
+  estimate.recurrenceBound = estimate.recurrence.bound;
   estimate.total =
       std::max(estimate.throughputBound, estimate.recurrenceBound);
   return estimate;
@@ -2187,17 +2171,22 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
        estimate.throughputBound);
   line("    of which Cube", estimate.weightedBusy.cube);
   line("    of which Vector", estimate.weightedBusy.vector);
-  line(resourceBound ? "  recurrence bound: chain / buffers"
-                     : "> recurrence bound: chain / buffers",
+  line(resourceBound ? "  recurrence bound: buffer reuse"
+                     : "> recurrence bound: buffer reuse",
        estimate.recurrenceBound);
-  line("    tightest dependency chain", estimate.chain.cycles);
-  os << "[" << DEBUG_TYPE << "]         buffered " << estimate.chain.bufferDepth
-     << " deep";
-  if (estimate.chain.bufferDepth == 1) {
-    os << " -- a single buffer, so consecutive iterations cannot overlap"
-          " across it at all";
+  const BufferRecurrence &tight = estimate.recurrence;
+  if (tight.bound > 0) {
+    os << "[" << DEBUG_TYPE << "]         tightest buffer: block "
+       << describeBlockId(tight.producer) << " -> "
+       << describeBlockId(tight.consumer) << ", held " << tight.occupancy
+       << " cycles, " << (tight.crossesCores ? "inter-core" : "intra-core")
+       << " depth " << tight.depth;
+    if (tight.depth == 1) {
+      os << " -- a single buffer, so the next iteration cannot start writing"
+            " it until this one is done reading";
+    }
+    os << "\n";
   }
-  os << "\n";
   line("  every dependency serialised, no overlap", estimate.serialisedBound);
   line("TOTAL", estimate.total);
 

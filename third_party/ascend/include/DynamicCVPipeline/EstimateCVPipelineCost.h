@@ -45,10 +45,10 @@ namespace triton {
 /// blocks score differently.
 ///
 /// It is the larger of a resource bound (the busiest core's busy time) and a
-/// recurrence bound (the Cube/Vector barrier chain paid once per iteration,
-/// divided by the inter-core buffer depth the pipeline allocated). The second
-/// matters because that depth defaults to one, which lets nothing overlap
-/// across a barrier.
+/// recurrence bound (the buffer held longest, divided by how many copies of it
+/// the pipeline allocated). The second matters because the inter-core depth
+/// defaults to one, so the next iteration cannot start writing a buffer until
+/// this one has finished reading it.
 inline constexpr llvm::StringLiteral kCVPipelineEstimatedCycles =
     "ascend.cv_pipeline_estimated_cycles";
 
