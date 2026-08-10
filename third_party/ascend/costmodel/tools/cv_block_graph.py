@@ -24,19 +24,24 @@ from dataclasses import dataclass, field
 
 PREFIX = r"\[estimate-cv-pipeline-cost\]"
 
-# "      12  CUBE      508015728    2  fixpipe_ub   hivm.hir.fixpipe x2"
+# "      12  CUBE       3288       0      3288    1    2  -      fixpipe_ub   ..."
+#   id  core  cycles  start  finish  seg  ops  waits  unit  contents
 BLOCK_RE = re.compile(
     PREFIX + r"\s+(?P<id>-{2}|\d+)\s+(?P<core>CUBE|VECTOR|MIXED)\s+"
-    r"(?P<cycles>\d+)\s+(?P<ops>\d+)\s+(?P<unit>\S+)\s+(?P<contents>.*?)\s*$"
+    r"(?P<cycles>\d+)\s+(?P<start>\d+)\s+(?P<finish>\d+)\s+"
+    r"(?P<segments>\d+)\s+(?P<ops>\d+)\s+(?P<waits>\S+)\s+(?P<unit>\S+)"
+    r"\s+(?P<contents>.*?)\s*$"
 )
 # "    block 7 <- 12, 3"
 DEP_RE = re.compile(PREFIX + r"\s+block\s+(?P<id>\d+)\s+<-\s+(?P<producers>.*?)\s*$")
 # "block sync (waits on a flag the other block sets):"
 DEP_KIND_RE = re.compile(PREFIX + r"\s+block\s+(?P<kind>sync|dataflow)\s+\(")
-# "Ascend custom (...): 622502989 cycles roofline (336488.102 us), ..."
+# "Ascend custom (...): 62250 cycles (33.6 us) over 14 block(s), 41500 cycles
+#  if fully overlapped, ..."
 TOTAL_RE = re.compile(
-    PREFIX + r"\s+(?P<hardware>.+?):\s+(?P<cycles>\d+)\s+cycles roofline"
-    r"\s+\((?P<us>[\d.]+)\s+us\)"
+    PREFIX + r"\s+(?P<hardware>.+?):\s+(?P<cycles>\d+)\s+cycles"
+    r"\s+\((?P<us>[\d.]+)\s+us\)\s+over\s+\d+\s+block\(s\),"
+    r"\s+(?P<roofline>\d+)\s+cycles if fully overlapped"
 )
 
 
@@ -48,6 +53,12 @@ class Block:
     ops: int
     unit: str
     contents: str
+    # Position in the one-iteration schedule, and what held the block up:
+    # a block id, "core" (its own core was still busy) or "-" (nothing).
+    start: int = 0
+    finish: int = 0
+    segments: int = 1
+    waits: str = "-"
     sync_on: list[int] = field(default_factory=list)
     reads_from: list[int] = field(default_factory=list)
 
@@ -68,6 +79,9 @@ class Report:
     hardware: str = "?"
     total_cycles: int = 0
     total_us: float = 0.0
+    # The same module with Cube and Vector assumed to overlap unconditionally.
+    # The gap to total_cycles is what the barriers cost.
+    roofline_cycles: int = 0
 
 
 def parse(lines) -> Report:
@@ -83,6 +97,7 @@ def parse(lines) -> Report:
             report.hardware = m.group("hardware")
             report.total_cycles = int(m.group("cycles"))
             report.total_us = float(m.group("us"))
+            report.roofline_cycles = int(m.group("roofline"))
             continue
         if (m := BLOCK_RE.search(line)) is not None:
             raw_id = m.group("id")
@@ -94,6 +109,10 @@ def parse(lines) -> Report:
                 ops=int(m.group("ops")),
                 unit=m.group("unit"),
                 contents=m.group("contents"),
+                start=int(m.group("start")),
+                finish=int(m.group("finish")),
+                segments=int(m.group("segments")),
+                waits=m.group("waits"),
             )
             continue
         if (m := DEP_RE.search(line)) is not None:
@@ -129,14 +148,27 @@ def emit_text(report: Report, out) -> None:
 
     print(f"hardware: {report.hardware}", file=out)
     print(f"module estimate: {report.total_cycles} cycles "
-          f"({report.total_us:.3f} us)\n", file=out)
+          f"({report.total_us:.3f} us)", file=out)
+    if report.roofline_cycles:
+        penalty = report.total_cycles - report.roofline_cycles
+        share = 100.0 * penalty / report.roofline_cycles
+        print(f"if Cube and Vector overlapped freely: "
+              f"{report.roofline_cycles} cycles "
+              f"(barriers cost {penalty}, +{share:.1f}%)", file=out)
+    split = [b for b in report.blocks.values() if b.segments > 1]
+    if split:
+        ids = ", ".join(b.name for b in sorted(split, key=lambda b: b.id))
+        print(f"{len(split)} block(s) with a barrier inside them: {ids}",
+              file=out)
+    print(file=out)
 
-    print(f"{'block':>11}  {'core':<7}{'cycles':>12}  {'bottleneck':<12} "
-          f"{'':<22} contents", file=out)
+    print(f"{'block':>11}  {'core':<7}{'cycles':>12}  {'waits':<7}"
+          f"{'bottleneck':<12} {'':<22} contents", file=out)
     for block in ordered:
         bar = "#" * max(1, round(20 * block.cycles / widest))
         print(f"{block.name:>11}  {block.core:<7}{block.cycles:>12}  "
-              f"{block.unit:<12} {bar:<22} {block.contents}", file=out)
+              f"{block.waits:<7}{block.unit:<12} {bar:<22} {block.contents}",
+              file=out)
 
     print("\nper-core totals (blocks on one core run one after another):",
           file=out)
@@ -147,9 +179,9 @@ def emit_text(report: Report, out) -> None:
     if sync:
         print("\nsync edges (consumer waits on a flag the producer sets).",
               file=out)
-        print("These are the hard barriers. The estimate assumes Cube and "
-              "Vector overlap\nfully and does not account for them yet, so it "
-              "is a lower bound:", file=out)
+        print("These are the hard barriers: the consumer cannot start before "
+              "the producer\nfinishes, which is what the estimate charges for "
+              "on top of the roofline:", file=out)
         for consumer, producer in sync:
             print(f"  block {consumer} <- block {producer}", file=out)
 

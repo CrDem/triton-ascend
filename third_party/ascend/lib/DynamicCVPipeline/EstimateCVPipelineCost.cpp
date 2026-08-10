@@ -29,15 +29,30 @@
 // end of the CV pipeline and reads the decisions the compiler actually made:
 // the Cube/Vector split is taken from the ssbuffer.core_type attributes stamped
 // by OpClassifierPass rather than re-derived. Only the hardware cost formulas
-// (HardwareConfig) and the roofline combination (PipelineScheduler) are reused
-// from the costmodel.
+// (HardwareConfig) are reused from the costmodel; the schedule itself is built
+// here, over blocks rather than over the costmodel's own operation list.
 //
-// Scope of this version: per-operation costs are accumulated per hardware unit
-// and combined with the roofline model. Data dependencies between operations
-// are NOT modelled yet, so the result is a lower bound on the critical path
-// rather than a schedule. Multi-buffering / cross-core sync are likewise not
-// modelled. The number is intended for *ranking* CV pipeline variants against
-// each other, not for absolute latency prediction.
+// The estimate is assembled from compute blocks, because the block is what the
+// pipeline plans, schedules and synchronises -- and because a variant that
+// merely regroups the same operations has to score differently, which a single
+// roofline over all operations cannot do.
+//
+// A block costs its own roofline, scaled by an intra-block fusion factor. The
+// blocks are then scheduled under two constraints: a core runs one block at a
+// time, and a block that waits on a synchronisation flag cannot start before
+// the block that sets it has finished. Cube and Vector therefore still overlap,
+// but only as far as the barriers recorded in the IR allow. The module total is
+//
+//   total = II * (N - 1) + latency of one iteration
+//
+// with II the busiest core's busy time. Charging N critical paths would ignore
+// that multi-buffering overlaps iterations; charging N initiation intervals
+// would ignore the cost of filling the pipeline. With no barrier between the
+// cores the latency term collapses onto II and the result is exactly the old
+// roofline, so barriers only ever add what the IR actually asks for.
+//
+// The number is intended for *ranking* CV pipeline variants against each other,
+// not for absolute latency prediction.
 //
 // Because a single number hides how much of it was actually modelled, every
 // operation is classified (see CostConfidence) and a per-operation-kind
@@ -65,6 +80,15 @@
 // describes them:
 //
 //   TRITON_ASCEND_CV_COST_HARDWARE_CONFIG=/path/to/ascend_custom.json
+//
+// Operations inside one block issue back to back on one core, so intermediates
+// can stay in registers rather than making a round trip through memory. Each
+// operation is nonetheless charged as a separate full pass, which over-counts.
+// These scale a block's cost to compensate, per core because the two fuse for
+// different reasons. Both default to 1.0, i.e. off:
+//
+//   TRITON_ASCEND_CV_COST_FUSION_CUBE=0.8
+//   TRITON_ASCEND_CV_COST_FUSION_VECTOR=0.8
 //
 //===----------------------------------------------------------------------===//
 
@@ -144,6 +168,23 @@ constexpr const char *kDefaultTripCountEnvVar =
 /// anything other than the built-in default, which is a 910B.
 constexpr const char *kHardwareConfigEnvVar =
     "TRITON_ASCEND_CV_COST_HARDWARE_CONFIG";
+
+/// Fraction of a block's cost that survives intra-block fusion, per core.
+/// Operations inside one compute block are issued back to back on one core, so
+/// intermediate results can stay in registers instead of making a round trip
+/// through memory; the model charges each operation as a separate full pass and
+/// therefore over-counts. These scale a block's cost to compensate.
+///
+/// Separate knobs per core because the two fuse for different reasons: the
+/// Vector core chains elementwise instructions, the Cube core mostly does not.
+/// 1.0 disables the correction, which is the default -- an unmeasured factor
+/// should not silently change everyone's numbers.
+///
+/// These belong in the hardware profile eventually; they are read from the
+/// environment for now so they can be swept without a rebuild.
+constexpr const char *kFusionCubeEnvVar = "TRITON_ASCEND_CV_COST_FUSION_CUBE";
+constexpr const char *kFusionVectorEnvVar =
+    "TRITON_ASCEND_CV_COST_FUSION_VECTOR";
 
 using mlir::ascend::HardwareConfig;
 using mlir::ascend::HWUnit;
@@ -1107,6 +1148,47 @@ TripCountOptions readTripCountOptions() {
 }
 
 //===----------------------------------------------------------------------===//
+// Intra-block fusion
+//===----------------------------------------------------------------------===//
+
+/// How much of a block's summed operation cost is actually paid, per core.
+struct FusionFactors {
+  double cube = 1.0;
+  double vector = 1.0;
+  /// Whether the caller asked for any correction at all. Tracked rather than
+  /// compared against 1.0 so the report can say "off" without a float equality
+  /// test, and so an explicit 1.0 still reads as a deliberate choice.
+  bool enabled = false;
+};
+
+/// Read one factor, ignoring anything outside (0, 1]. Above 1 would mean a
+/// block costs more than its parts, which is not what this models; at or below
+/// zero it would make blocks free. Leaves `factor` alone and reports false when
+/// the variable is unset or unusable.
+bool readFusionFactor(const char *envVar, double &factor) {
+  const char *raw = std::getenv(envVar);
+  if (!raw) {
+    return false;
+  }
+  double value = 0.0;
+  if (llvm::StringRef(raw).trim().getAsDouble(value) || value <= 0.0 ||
+      value > 1.0) {
+    LOG_DEBUG("ignoring invalid fusion factor for " << envVar << ": " << raw);
+    return false;
+  }
+  factor = value;
+  return true;
+}
+
+FusionFactors readFusionFactors() {
+  FusionFactors factors;
+  const bool cubeSet = readFusionFactor(kFusionCubeEnvVar, factors.cube);
+  const bool vectorSet = readFusionFactor(kFusionVectorEnvVar, factors.vector);
+  factors.enabled = cubeSet || vectorSet;
+  return factors;
+}
+
+//===----------------------------------------------------------------------===//
 // Roofline combination
 //===----------------------------------------------------------------------===//
 
@@ -1182,17 +1264,50 @@ struct DynamicLoopStats {
   int64_t assumedTripCount = 1;
 };
 
+/// A run of operations inside one block with no synchronisation between them.
+///
+/// Fusion is what a segment is for. Operations that issue back to back on one
+/// core can keep intermediates out of memory, but a barrier ends that: the core
+/// stops, and whatever follows starts a fresh chain. Most blocks turn out to be
+/// a single segment -- InterCoreTransferAndSync places its set after the
+/// producing block's last operation and its wait before the consuming block's
+/// first one -- but the cube-to-vector direct-store path puts a wait right
+/// before the store it guards, which can sit anywhere in the block. Splitting
+/// here means that case is handled instead of assumed away.
+struct BlockSegment {
+  llvm::DenseMap<HWUnit, int64_t> unitCycles;        ///< loop-weighted
+  llvm::DenseMap<HWUnit, int64_t> unitCyclesOneIter; ///< per iteration
+  int64_t costedOps = 0;
+};
+
 /// One compute block, as planned by PlanComputeBlock and identified by
 /// ssbuffer.block_id. The block is the unit the CV pipeline actually schedules
-/// and synchronises, so it is the natural granularity to report cost at:
-/// operations inside one block run on one core, back to back.
+/// and synchronises, so it is the natural granularity to cost at: operations
+/// inside one block run on one core, back to back, and ReorderOpsByBlockId has
+/// already made them contiguous in the IR.
 struct BlockStats {
   bool isCube = false;
   bool mixedCore = false; ///< set if the block's ops disagree, which is a bug
   int64_t costedOps = 0;
-  int64_t workCycles = 0; ///< sum over operations
+  int64_t workCycles = 0;     ///< sum over operations, loop-weighted
+  int64_t loopMultiplier = 1; ///< iterations the block runs for
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
+  llvm::DenseMap<HWUnit, int64_t> unitCyclesOneIter;
+  llvm::SmallVector<BlockSegment> segments;
   llvm::MapVector<llvm::StringRef, int64_t> opCounts;
+
+  /// Segments that actually carry work. More than one means a barrier landed
+  /// in the middle of the block, so it cannot be treated as one fused unit.
+  int64_t countWorkingSegments() const {
+    int64_t working = 0;
+    for (const BlockSegment &segment : segments) {
+      if (segment.costedOps > 0) {
+        ++working;
+      }
+    }
+    return working;
+  }
+  bool hasInteriorBarrier() const { return countWorkingSegments() > 1; }
 };
 
 /// Synchronisation edges between blocks, read from what the pipeline stamped
@@ -1243,25 +1358,39 @@ void collectSyncDeps(ModuleOp module,
   }
 }
 
-/// Block a value was produced in, walking back through operations that carry
-/// no block id of their own (views, casts) so the chain is not broken by them.
-std::optional<int64_t> getProducingBlock(Value value, int depth = 0) {
-  if (depth > 8) {
-    return std::nullopt;
+/// Dataflow edges between blocks, read from what DataDependencyAnalysis
+/// recorded rather than re-derived here.
+///
+/// That analysis already resolves the cases an SSA walk gets wrong: values
+/// carried through scf.for iter_args, producer/consumer pairs joined only by a
+/// memory effect, and transposed operands. It is pass-local and holds raw
+/// Operation pointers that later passes invalidate by cloning, so it publishes
+/// its block-level result to the module under kBlockDeps, keyed by block id --
+/// ids survive cloning, pointers do not.
+///
+/// Two caveats, both conservative here. RefineArgsBlockId can move an operation
+/// to a different block afterwards, so an edge may outlive the reason it was
+/// added; and blocks created after the analysis carry no edges at all. Either
+/// way the schedule only ever loses ordering it could have enforced, which
+/// moves the estimate towards the roofline rather than away from it.
+void collectDataDeps(ModuleOp module,
+                     llvm::MapVector<int64_t, llvm::SetVector<int64_t>> &deps) {
+  auto edges = module->getAttrOfType<ArrayAttr>(CVPipeline::kBlockDeps);
+  if (!edges) {
+    return;
   }
-  Operation *def = value.getDefiningOp();
-  if (!def) {
-    return std::nullopt;
-  }
-  if (auto blockId = CVPipeline::getOpBlockId(def)) {
-    return static_cast<int64_t>(*blockId);
-  }
-  for (Value operand : def->getOperands()) {
-    if (auto found = getProducingBlock(operand, depth + 1)) {
-      return found;
+  for (Attribute entry : edges) {
+    auto edge = dyn_cast<DictionaryAttr>(entry);
+    if (!edge) {
+      continue;
     }
+    auto producer = edge.getAs<IntegerAttr>("producer");
+    auto consumer = edge.getAs<IntegerAttr>("consumer");
+    if (!producer || !consumer || producer.getInt() == consumer.getInt()) {
+      continue;
+    }
+    deps[consumer.getInt()].insert(producer.getInt());
   }
-  return std::nullopt;
 }
 
 /// Sentinel for operations the pipeline left without a block id.
@@ -1275,8 +1404,8 @@ struct CostBreakdown {
   llvm::SmallVector<Operation *> unknownSizeOps;
   llvm::MapVector<Operation *, DynamicLoopStats> dynamicLoops;
   llvm::MapVector<int64_t, BlockStats> blocks;
-  /// Block -> blocks whose values it reads, from SSA. Ordering within a
-  /// core that no transfer group covers.
+  /// Block -> blocks whose values it reads, as found by
+  /// DataDependencyAnalysis. Ordering that no transfer group covers.
   llvm::MapVector<int64_t, llvm::SetVector<int64_t>> dataDeps;
   /// Block -> blocks it waits on through a synchronisation flag. These are
   /// hard barriers: the consumer cannot start until the producer signals.
@@ -1292,23 +1421,29 @@ struct CostBreakdown {
     BlockStats &stats = blocks[id];
     if (stats.costedOps == 0) {
       stats.isCube = isCube;
+      stats.loopMultiplier = weight.multiplier;
     } else if (stats.isCube != isCube) {
       stats.mixedCore = true;
     }
     stats.costedOps += 1;
     stats.workCycles += cost.cycles * weight.multiplier;
     stats.unitCycles[cost.unit] += cost.cycles * weight.multiplier;
+    stats.unitCyclesOneIter[cost.unit] += cost.cycles;
     stats.opCounts[op->getName().getStringRef()] += 1;
 
-    // Edges to the blocks this operation reads from. Self-edges say nothing.
-    if (id == kNoBlockId) {
-      return;
+    if (stats.segments.empty()) {
+      stats.segments.push_back(BlockSegment{});
     }
-    for (Value operand : op->getOperands()) {
-      auto producer = getProducingBlock(operand);
-      if (producer && *producer != id) {
-        dataDeps[id].insert(*producer);
-      }
+    if (isSyncOp(op)) {
+      // The core stops here, so nothing after this point can fuse with what
+      // came before it. A barrier at the very start or end of the block leaves
+      // an empty segment, which countWorkingSegments() ignores.
+      stats.segments.push_back(BlockSegment{});
+    } else {
+      BlockSegment &segment = stats.segments.back();
+      segment.costedOps += 1;
+      segment.unitCycles[cost.unit] += cost.cycles * weight.multiplier;
+      segment.unitCyclesOneIter[cost.unit] += cost.cycles;
     }
   }
 
@@ -1341,6 +1476,213 @@ struct CostBreakdown {
     }
   }
 };
+
+//===----------------------------------------------------------------------===//
+// Block scheduling
+//===----------------------------------------------------------------------===//
+// The module estimate is built from blocks rather than from a single per-unit
+// roofline over every operation. That matters for the purpose this model
+// exists for: two variants that contain the same operations but group them
+// differently are indistinguishable to a global roofline, and grouping is
+// exactly what the CV pipeline decides.
+//
+// Two things constrain a block:
+//   * its core -- a core runs one block at a time, and ReorderOpsByBlockId has
+//     already put the blocks of one core in topological order;
+//   * its barriers -- a block that waits on a flag cannot start before the
+//     block that sets it has finished.
+// Everything else overlaps. So Cube and Vector still run concurrently, but only
+// as far as the barriers actually allow, instead of unconditionally.
+//
+// ASSUMPTION, and the one worth revisiting first: consecutive blocks on the
+// same core do not pipeline into each other. Within a block the units overlap
+// as before, but block B+1's loads are not allowed to start under block B's
+// compute even when no barrier separates them. Real hardware does overlap them
+// -- the issue queue moves on while a pipe drains -- so this is pessimistic,
+// and it is why the estimate now exceeds the plain roofline, which is still
+// reported next to it. It is modelled this way because the block is the unit
+// the pipeline reasons about, and because a model that let everything overlap
+// is exactly the one that could not tell two block partitions apart.
+
+/// Cost of one block after intra-block fusion, summed over its segments.
+/// Segments are serial with respect to each other (a barrier separates them),
+/// so their rooflines add; within a segment the units overlap as usual.
+int64_t computeBlockCycles(const BlockStats &stats,
+                           const HardwareConfig &config,
+                           const FusionFactors &fusion, bool perIteration) {
+  // A block that somehow mixes cores gets the more conservative factor.
+  double factor = stats.isCube ? fusion.cube : fusion.vector;
+  if (stats.mixedCore) {
+    factor = std::max(fusion.cube, fusion.vector);
+  }
+
+  int64_t total = 0;
+  for (const BlockSegment &segment : stats.segments) {
+    const llvm::DenseMap<HWUnit, int64_t> &units =
+        perIteration ? segment.unitCyclesOneIter : segment.unitCycles;
+    if (units.empty()) {
+      continue;
+    }
+    total += static_cast<int64_t>(combineRoofline(units, config) * factor);
+  }
+  return total;
+}
+
+/// When a block ran, and what held it up.
+struct BlockSchedule {
+  int64_t start = 0;
+  int64_t finish = 0;
+  int64_t cycles = 0;
+  /// Block whose completion decided this one's start, or kNoBlockId when
+  /// nothing did. Reported so a long critical path can be traced by eye.
+  int64_t criticalPred = kNoBlockId;
+  /// Set when the block was held up by its own core being busy rather than by
+  /// a dependency -- that is throughput pressure, not a serialisation problem.
+  bool waitedOnCore = false;
+};
+
+/// Busy time per core, which is the resource bound a schedule cannot beat.
+struct CoreBusyCycles {
+  int64_t cube = 0;
+  int64_t vector = 0;
+
+  int64_t bound() const { return std::max(cube, vector); }
+};
+
+/// ASAP schedule over the block graph.
+///
+/// Blocks are visited in program order, which the pipeline has already made
+/// topological within each core. An edge to a block that has not been scheduled
+/// yet is a back edge -- loop-carried -- and is skipped: this schedules one
+/// pass through the graph, and the iteration count is applied separately.
+int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
+                           const HardwareConfig &config,
+                           const FusionFactors &fusion, bool perIteration,
+                           llvm::MapVector<int64_t, BlockSchedule> &schedule,
+                           CoreBusyCycles &busy) {
+  int64_t cubeAvailable = 0;
+  int64_t vectorAvailable = 0;
+  int64_t makespan = 0;
+
+  for (const auto &entry : breakdown.blocks) {
+    const int64_t id = entry.first;
+    const BlockStats &stats = entry.second;
+    const int64_t cycles =
+        computeBlockCycles(stats, config, fusion, perIteration);
+
+    int64_t earliest = 0;
+    int64_t criticalPred = kNoBlockId;
+    auto considerDeps = [&](const BlockDepMap &deps) {
+      auto it = deps.find(id);
+      if (it == deps.end()) {
+        return;
+      }
+      for (int64_t producer : it->second) {
+        auto scheduled = schedule.find(producer);
+        if (scheduled == schedule.end()) {
+          continue; // back edge: the producer runs in a later pass
+        }
+        if (scheduled->second.finish > earliest) {
+          earliest = scheduled->second.finish;
+          criticalPred = producer;
+        }
+      }
+    };
+    // Flags first: those are the barriers the hardware really enforces.
+    considerDeps(breakdown.syncDeps);
+    considerDeps(breakdown.dataDeps);
+
+    const int64_t coreReady = stats.mixedCore
+                                  ? std::max(cubeAvailable, vectorAvailable)
+                              : stats.isCube ? cubeAvailable
+                                             : vectorAvailable;
+    const bool waitedOnCore = coreReady > earliest;
+    const int64_t start = std::max(earliest, coreReady);
+    const int64_t finish = start + cycles;
+
+    if (stats.mixedCore) {
+      cubeAvailable = finish;
+      vectorAvailable = finish;
+      busy.cube += cycles;
+      busy.vector += cycles;
+    } else if (stats.isCube) {
+      cubeAvailable = finish;
+      busy.cube += cycles;
+    } else {
+      vectorAvailable = finish;
+      busy.vector += cycles;
+    }
+
+    makespan = std::max(makespan, finish);
+    BlockSchedule &result = schedule[id];
+    result.start = start;
+    result.finish = finish;
+    result.cycles = cycles;
+    result.criticalPred = criticalPred;
+    result.waitedOnCore = waitedOnCore;
+  }
+  return makespan;
+}
+
+/// Everything the module estimate is assembled from, kept together so the
+/// report can show how the final number was reached rather than just assert it.
+struct ModuleEstimate {
+  /// Busy time of the busier core over the whole module. A schedule can never
+  /// beat this, and it is what the previous roofline-only model reported.
+  int64_t throughputBound = 0;
+  /// The same bound for a single iteration: the initiation interval.
+  int64_t initiationInterval = 0;
+  /// One pass through the block graph with barriers respected.
+  int64_t iterationLatency = 0;
+  /// II * (N - 1), expressed without needing a single global N.
+  int64_t steadyState = 0;
+  /// The same schedule run on loop-weighted block costs, which is what the
+  /// kernel would cost if consecutive iterations never overlapped at all.
+  /// Diagnostic only: it is the pessimistic bracket around the total, as the
+  /// roofline is the optimistic one.
+  int64_t serialisedBound = 0;
+  int64_t total = 0;
+
+  llvm::MapVector<int64_t, BlockSchedule> iterationSchedule;
+  CoreBusyCycles weightedBusy;
+  CoreBusyCycles iterationBusy;
+};
+
+/// Combine the block schedule into one number.
+///
+///   total = II * (N - 1) + latency of one iteration
+///
+/// Both terms are needed. Charging N critical paths would assume iterations
+/// never overlap, but AllocMultiCache inserts multi-buffering precisely so they
+/// do; charging N initiation intervals would assume the pipeline is always full
+/// and never has to be filled. When no barrier orders Cube against Vector the
+/// latency collapses onto the initiation interval and the result is exactly the
+/// old roofline, so this only ever adds the cost of serialisation that the IR
+/// actually asks for.
+ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
+                                     const HardwareConfig &config,
+                                     const FusionFactors &fusion) {
+  ModuleEstimate estimate;
+
+  llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
+  estimate.serialisedBound =
+      scheduleBlockGraph(breakdown, config, fusion, /*perIteration=*/false,
+                         weightedSchedule, estimate.weightedBusy);
+  estimate.throughputBound = estimate.weightedBusy.bound();
+
+  estimate.iterationLatency = scheduleBlockGraph(
+      breakdown, config, fusion, /*perIteration=*/true,
+      estimate.iterationSchedule, estimate.iterationBusy);
+  estimate.initiationInterval = estimate.iterationBusy.bound();
+
+  estimate.steadyState =
+      std::max<int64_t>(0, estimate.throughputBound -
+                               estimate.initiationInterval);
+  estimate.total =
+      estimate.steadyState +
+      std::max(estimate.iterationLatency, estimate.initiationInterval);
+  return estimate;
+}
 
 /// Cap on how many individual operations are listed per category, so a large
 /// kernel produces a readable report rather than a wall of text.
@@ -1403,52 +1745,86 @@ std::string describeBlockContents(const BlockStats &stats) {
   return stream.str();
 }
 
-/// Per-block report. The block is what the pipeline schedules and synchronises,
-/// so this is the view that maps onto what it decided; the per-operation table
-/// above says what it costs, this says where.
+std::string describeBlockId(int64_t id) {
+  return id == kNoBlockId ? std::string("--") : std::to_string(id);
+}
+
+llvm::StringRef describeBlockCore(const BlockStats &stats) {
+  return stats.mixedCore ? "MIXED" : stats.isCube ? "CUBE" : "VECTOR";
+}
+
+/// Per-block schedule. The block is what the pipeline schedules and
+/// synchronises, so this is the view that maps onto what it decided: the
+/// per-operation table says what things cost, this says when they run and what
+/// they had to wait for.
+///
+/// Rows are in program order, which is also the order they were scheduled in,
+/// so a critical path can be followed downwards through the "waits" column.
 void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
-                 const HardwareConfig &config) {
+                 const ModuleEstimate &estimate) {
   if (breakdown.blocks.empty()) {
     return;
   }
 
-  struct Row {
-    int64_t id;
-    const BlockStats *stats;
-    int64_t cycles; ///< the block's own roofline
-  };
-  llvm::SmallVector<Row> rows;
-  for (const auto &[id, stats] : breakdown.blocks) {
-    rows.push_back({id, &stats, combineRoofline(stats.unitCycles, config)});
-  }
-  llvm::sort(rows, [](const Row &lhs, const Row &rhs) {
-    return lhs.cycles > rhs.cycles;
-  });
+  os << "[" << DEBUG_TYPE
+     << "] block schedule for one iteration (ssbuffer.block_id, as planned by"
+        " PlanComputeBlock). A core runs one block at a time; blocks on"
+        " different cores overlap unless a barrier orders them. 'cycles' is"
+        " after intra-block fusion, 'waits' names the block whose completion"
+        " decided this one's start ('core' = its own core was still busy):\n";
+  os << "[" << DEBUG_TYPE
+     << "]    block  core     cycles      start     finish  seg  ops  waits"
+        "   bottleneck   contents\n";
 
-  os << "[" << DEBUG_TYPE
-     << "] per-block cost (ssbuffer.block_id, as planned by"
-        " PlanComputeBlock). Each block's cycles are its own roofline. They do"
-        " not add up to the module total because the model *assumes* Cube and"
-        " Vector overlap fully; the sync edges below say where that assumption"
-        " is wrong, but they do not constrain the estimate yet:\n";
-  os << "[" << DEBUG_TYPE
-     << "]    block  core        cycles  ops  bottleneck   contents\n";
-  for (const Row &row : rows) {
-    std::string blockName =
-        row.id == kNoBlockId ? std::string("  --") : std::to_string(row.id);
-    llvm::StringRef core = row.stats->mixedCore ? "MIXED"
-                           : row.stats->isCube  ? "CUBE"
-                                                : "VECTOR";
+  for (const auto &entry : breakdown.blocks) {
+    const int64_t id = entry.first;
+    const BlockStats &stats = entry.second;
+    auto scheduled = estimate.iterationSchedule.find(id);
+    if (scheduled == estimate.iterationSchedule.end()) {
+      continue;
+    }
+    const BlockSchedule &slot = scheduled->second;
+
+    std::string waits = slot.waitedOnCore
+                            ? std::string("core")
+                            : (slot.criticalPred == kNoBlockId
+                                   ? std::string("-")
+                                   : describeBlockId(slot.criticalPred));
+    const int64_t segments = stats.countWorkingSegments();
+    // Held in a local: right_justify keeps a StringRef, not a copy.
+    const std::string blockName = describeBlockId(id);
+
     os << "[" << DEBUG_TYPE << "] " << llvm::right_justify(blockName, 8) << "  "
-       << llvm::left_justify(core, 7)
-       << llvm::format("%12lld", static_cast<long long>(row.cycles))
-       << llvm::format("%5lld", static_cast<long long>(row.stats->costedOps))
-       << "  "
-       << llvm::left_justify(mlir::ascend::stringifyHWUnit(
-                                 getBlockBottleneck(*row.stats)),
-                             13)
-       << describeBlockContents(*row.stats) << "\n";
+       << llvm::left_justify(describeBlockCore(stats), 7)
+       << llvm::format("%9lld", static_cast<long long>(slot.cycles))
+       << llvm::format("%11lld", static_cast<long long>(slot.start))
+       << llvm::format("%11lld", static_cast<long long>(slot.finish))
+       << llvm::format("%5lld", static_cast<long long>(segments))
+       << llvm::format("%5lld", static_cast<long long>(stats.costedOps)) << "  "
+       << llvm::left_justify(waits, 7)
+       << llvm::left_justify(
+              mlir::ascend::stringifyHWUnit(getBlockBottleneck(stats)), 13)
+       << describeBlockContents(stats) << "\n";
   }
+
+  // Blocks whose barrier is not at an edge. These are the ones that break the
+  // "a block is one fused chain" assumption, so their count is worth knowing
+  // even when it is zero -- especially then, since it says the simple model
+  // holds for this kernel.
+  llvm::SmallVector<int64_t> interiorBarrierBlocks;
+  for (const auto &entry : breakdown.blocks) {
+    if (entry.second.hasInteriorBarrier()) {
+      interiorBarrierBlocks.push_back(entry.first);
+    }
+  }
+  os << "[" << DEBUG_TYPE << "] " << interiorBarrierBlocks.size()
+     << " block(s) contain a barrier between two runs of work, so they are"
+        " fused per segment rather than as a whole";
+  if (!interiorBarrierBlocks.empty()) {
+    os << ": ";
+    llvm::interleaveComma(interiorBarrierBlocks, os);
+  }
+  os << "\n";
 
   auto printDeps =
       [&](const llvm::MapVector<int64_t, llvm::SetVector<int64_t>> &deps,
@@ -1468,6 +1844,49 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
             "waits on a flag the other block sets");
   printDeps(breakdown.dataDeps, "dataflow",
             "reads a value the other block produced");
+}
+
+/// How the module number was assembled. Printed as a derivation rather than a
+/// result so that a surprising total can be attributed to a term.
+void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
+                   const FusionFactors &fusion, const HardwareConfig &config) {
+  auto line = [&](llvm::StringRef what, int64_t cycles) {
+    os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
+       << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
+       << llvm::format("%.3f", config.cyclesToMicroseconds(cycles)) << " us)\n";
+  };
+
+  os << "[" << DEBUG_TYPE << "] how the estimate is built:\n";
+  line("busiest core, whole module (roofline)", estimate.throughputBound);
+  line("  of which Cube", estimate.weightedBusy.cube);
+  line("  of which Vector", estimate.weightedBusy.vector);
+  line("initiation interval II (one iteration)",
+       estimate.initiationInterval);
+  line("one-iteration latency, barriers honoured", estimate.iterationLatency);
+  line("steady state = roofline - II", estimate.steadyState);
+  line("TOTAL = steady + max(latency, II)", estimate.total);
+  line("if iterations never overlapped", estimate.serialisedBound);
+
+  // The gap between the total and the roofline is precisely the cost of the
+  // barriers: it is zero when no barrier orders Cube against Vector.
+  const int64_t penalty = estimate.total - estimate.throughputBound;
+  os << "[" << DEBUG_TYPE << "]     serialisation charged by barriers: "
+     << penalty << " cycles";
+  if (estimate.throughputBound > 0) {
+    os << llvm::format(" (%.1f%% over the roofline)",
+                       100.0 * static_cast<double>(penalty) /
+                           static_cast<double>(estimate.throughputBound));
+  }
+  os << "\n";
+
+  os << "[" << DEBUG_TYPE << "]     intra-block fusion factors: cube="
+     << llvm::format("%.3f", fusion.cube) << ", vector="
+     << llvm::format("%.3f", fusion.vector);
+  if (!fusion.enabled) {
+    os << " (off; set " << kFusionCubeEnvVar << " / " << kFusionVectorEnvVar
+       << " to enable)";
+  }
+  os << "\n";
 }
 
 void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
@@ -1583,8 +2002,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   }
 
   const TripCountOptions tripCountOptions = readTripCountOptions();
+  const FusionFactors fusion = readFusionFactors();
 
-  mlir::ascend::PipelineScheduler scheduler(config.get());
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
   CostBreakdown breakdown;
   int64_t nextOpId = 0;
@@ -1605,46 +2024,39 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
       ++unknownOps;
     }
     breakdown.record(op, *cost, weight, runsOnCubeCore(op));
-
-    // NOTE: dependencies are intentionally not registered yet, so the
-    // scheduler's own critical path is not meaningful here; the reported
-    // number comes from the per-unit roofline below. Wiring memory-level
-    // dependencies in is what turns this into a real schedule.
-    mlir::ascend::PipelineOp pipelineOp;
-    pipelineOp.opId = nextOpId++;
-    pipelineOp.hwUnit = cost->unit;
-    pipelineOp.duration = cost->cycles;
-    pipelineOp.bytes = cost->bytes;
-    pipelineOp.flops = cost->flops;
-    pipelineOp.loopMultiplier = weight.multiplier;
-    pipelineOp.mlirOp = op;
-    pipelineOp.opName = op->getName().getStringRef().str();
-    scheduler.addOperation(pipelineOp);
+    ++nextOpId;
 
     unitCycles[cost->unit] += cost->cycles * weight.multiplier;
   });
 
-  // Synchronisation edges come from the pipeline's own transfer groups, so
-  // they are read once over the whole module rather than per operation.
+  // Both edge kinds are properties of the module, not of any one operation, so
+  // they are read once rather than per operation. Synchronisation edges come
+  // from the pipeline's transfer groups; dataflow edges from what
+  // DataDependencyAnalysis published.
   collectSyncDeps(module, breakdown.syncDeps);
+  collectDataDeps(module, breakdown.dataDeps);
 
   if (nextOpId == 0) {
     LOG_DEBUG("no costed operations found; skipping estimate");
     return;
   }
 
-  // Critical path over one iteration. With no dependencies registered this
-  // currently degenerates to the busiest unit's serial time; it is reported
-  // alongside the roofline so the two can be compared once dependency wiring
-  // makes it a real schedule.
-  scheduler.schedule();
-  int64_t scheduledCycles = scheduler.getTotalCycles();
+  // The estimate is assembled from the blocks, not from a single roofline over
+  // every operation: the whole point is that regrouping the same operations
+  // into different blocks has to change the number.
+  const ModuleEstimate estimate =
+      computeModuleEstimate(breakdown, *config, fusion);
+  const int64_t totalCycles = estimate.total;
 
-  int64_t totalCycles = combineRoofline(unitCycles, *config);
+  // Kept for comparison: what the model reported before blocks constrained it,
+  // i.e. Cube and Vector assumed to overlap unconditionally.
+  const int64_t rooflineCycles = combineRoofline(unitCycles, *config);
 
   Builder builder(module.getContext());
   module->setAttr(kCVPipelineEstimatedCycles,
                   builder.getI64IntegerAttr(totalCycles));
+  module->setAttr(kCVPipelineCostRoofline,
+                  builder.getI64IntegerAttr(rooflineCycles));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,
@@ -1677,18 +2089,38 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
       };
       llvm::SmallVector<Attribute> dependsOn = collect(breakdown.dataDeps);
       llvm::SmallVector<Attribute> syncsWith = collect(breakdown.syncDeps);
+
+      // Where the block landed in the one-iteration schedule. Absent only if
+      // the block carried no work at all.
+      int64_t start = 0;
+      int64_t finish = 0;
+      auto scheduled = estimate.iterationSchedule.find(blockId);
+      if (scheduled != estimate.iterationSchedule.end()) {
+        start = scheduled->second.start;
+        finish = scheduled->second.finish;
+      }
+
       blockAttrs.push_back(builder.getDictionaryAttr({
           builder.getNamedAttr("id", builder.getI64IntegerAttr(id)),
+          builder.getNamedAttr("core",
+                               builder.getStringAttr(describeBlockCore(stats))),
           builder.getNamedAttr(
-              "core", builder.getStringAttr(stats.mixedCore ? "MIXED"
-                                            : stats.isCube  ? "CUBE"
-                                                            : "VECTOR")),
+              "cycles", builder.getI64IntegerAttr(computeBlockCycles(
+                            stats, *config, fusion, /*perIteration=*/false))),
           builder.getNamedAttr(
-              "cycles",
-              builder.getI64IntegerAttr(
-                  combineRoofline(stats.unitCycles, *config))),
+              "iter_cycles", builder.getI64IntegerAttr(computeBlockCycles(
+                                 stats, *config, fusion,
+                                 /*perIteration=*/true))),
           builder.getNamedAttr("work_cycles",
                                builder.getI64IntegerAttr(stats.workCycles)),
+          builder.getNamedAttr(
+              "iterations", builder.getI64IntegerAttr(stats.loopMultiplier)),
+          builder.getNamedAttr("iter_start", builder.getI64IntegerAttr(start)),
+          builder.getNamedAttr("iter_finish",
+                               builder.getI64IntegerAttr(finish)),
+          builder.getNamedAttr(
+              "segments",
+              builder.getI64IntegerAttr(stats.countWorkingSegments())),
           builder.getNamedAttr("ops",
                                builder.getI64IntegerAttr(stats.costedOps)),
           builder.getNamedAttr(
@@ -1706,24 +2138,28 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
   auto reportTo = [&](llvm::raw_ostream &os) {
     os << "[" << DEBUG_TYPE << "] " << config->getName() << ": " << totalCycles
-       << " cycles roofline ("
+       << " cycles ("
        << llvm::format("%.3f", config->cyclesToMicroseconds(totalCycles))
-       << " us), " << scheduledCycles << " cycles critical path, " << nextOpId
+       << " us) over " << breakdown.blocks.size() << " block(s), "
+       << rooflineCycles << " cycles if fully overlapped, " << nextOpId
        << " ops costed, " << unknownOps << " of unknown cost, "
        << breakdown.genericOps << " without a dedicated model, "
        << breakdown.dynamicLoops.size() << " loop(s) of unknown trip count\n";
   };
 
+  auto reportDetail = [&](llvm::raw_ostream &os) {
+    printEstimate(os, estimate, fusion, *config);
+    printBlocks(os, breakdown, estimate);
+    printBreakdown(os, breakdown);
+  };
+
   const int verbosity = getVerbosity();
-  LLVM_DEBUG(reportTo(llvm::dbgs());
-             printBlocks(llvm::dbgs(), breakdown, *config);
-             printBreakdown(llvm::dbgs(), breakdown));
+  LLVM_DEBUG(reportTo(llvm::dbgs()); reportDetail(llvm::dbgs()));
   if (verbosity >= 1) {
     reportTo(llvm::errs());
   }
   if (verbosity >= 2) {
-    printBlocks(llvm::errs(), breakdown, *config);
-    printBreakdown(llvm::errs(), breakdown);
+    reportDetail(llvm::errs());
   }
 }
 

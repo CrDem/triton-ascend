@@ -58,6 +58,15 @@ inline constexpr llvm::StringLiteral kLoopCarriedL0C =
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
 inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
+/// Block-level dependency edges found by DataDependencyAnalysis, recorded on
+/// the module so they outlive the pass that computed them. An ArrayAttr of
+/// dictionaries {producer, consumer, kind}, where producer and consumer are
+/// ssbuffer.block_id values and kind is "v2c", "c2v" or "mem".
+///
+/// The analysis itself is pass-local and holds raw Operation pointers, which
+/// later passes invalidate by cloning; block ids survive that, so consumers
+/// downstream read this instead of re-deriving the graph from SSA.
+inline constexpr llvm::StringLiteral kBlockDeps = "ssbuffer.blockDeps";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kEnableUbRefineOpt =

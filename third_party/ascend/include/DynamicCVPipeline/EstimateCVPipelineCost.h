@@ -37,8 +37,21 @@ namespace triton {
 /// Consumers rank alternative CV-pipeline IR variants by this number: lower is
 /// better. Absent when the costmodel is not built into this binary, or when the
 /// estimate could not be produced.
+///
+/// Built from the compute blocks, not from a single roofline over all
+/// operations: a core runs one block at a time, and a block that waits on a
+/// synchronisation flag cannot start before the block that sets it finishes.
+/// That is what makes two variants containing the same operations in different
+/// blocks score differently.
 inline constexpr llvm::StringLiteral kCVPipelineEstimatedCycles =
     "ascend.cv_pipeline_estimated_cycles";
+
+/// The same module costed as if Cube and Vector overlapped unconditionally
+/// (i64) -- the busiest hardware unit's total busy time. This is a lower bound
+/// on any schedule, so the gap to kCVPipelineEstimatedCycles is exactly the
+/// time the model attributes to waiting on barriers.
+inline constexpr llvm::StringLiteral kCVPipelineCostRoofline =
+    "ascend.cv_pipeline_cost_roofline";
 
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
@@ -54,13 +67,18 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
 /// Per-compute-block results, as an array of dictionaries -- one per
 /// ssbuffer.block_id, plus one with id -1 for operations the pipeline left
 /// unassigned. Each entry carries:
-///   id, core ("CUBE"/"VECTOR"/"MIXED"), cycles (the block's own roofline),
-///   work_cycles (the plain sum), ops, bottleneck (busiest unit),
-///   depends_on (blocks whose values it reads).
+///   id, core ("CUBE"/"VECTOR"/"MIXED"), cycles (all iterations),
+///   iter_cycles (one iteration), work_cycles (the plain sum),
+///   iterations (how many times the block runs),
+///   iter_start / iter_finish (position in the one-iteration schedule),
+///   segments (runs of work separated by a barrier inside the block),
+///   ops, bottleneck (busiest unit), depends_on (blocks whose values it reads),
+///   sync_depends_on (blocks whose flag it waits on).
 ///
 /// The block is the unit the CV pipeline schedules and synchronises, so this is
-/// the view that maps onto its decisions. Block cycles deliberately do not sum
-/// to the module estimate: blocks on different cores overlap.
+/// the view that maps onto its decisions. Block cycles still do not sum to the
+/// module estimate -- blocks on different cores overlap wherever no barrier
+/// orders them -- but iter_start/iter_finish show exactly how much they did.
 inline constexpr llvm::StringLiteral kCVPipelineBlocks =
     "ascend.cv_pipeline_blocks";
 
