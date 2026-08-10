@@ -51,6 +51,7 @@ from triton.backends.ascend.utils import (
     _get_triton_mlir_opt_path,
     _get_triton_opt_path,
     _get_bishengir_opt_path,
+    _get_buffer_count_override,
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
     _is_auto_map_parallel_blocks_enabled,
@@ -227,17 +228,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod, metadata["enable_buffer_insert_optimization"])
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
 
-        _intra_val = metadata.get("intra_cache_num")
-        if _intra_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "INTRA", _intra_val)
-
-        _inter_val = metadata.get("inter_cache_num")
-        if _inter_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "INTER", _inter_val)
-
-        _load_val = metadata.get("load_cache_num")
-        if _load_val is not None:
-            ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
+        # Buffer counts for the dynamic CV pipeline. An explicit option wins;
+        # otherwise the environment may override, which is how a run can be
+        # made single-buffered (count 1) without touching the caller.
+        for _key, _kind in (("intra_cache_num", "INTRA"), ("inter_cache_num", "INTER"),
+                            ("load_cache_num", "LOAD")):
+            _val = metadata.get(_key)
+            if _val is None:
+                _val = _get_buffer_count_override(_kind)
+            if _val is not None:
+                ascend.passes.ttir.set_buffer_count(mod, _kind, _val)
 
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass

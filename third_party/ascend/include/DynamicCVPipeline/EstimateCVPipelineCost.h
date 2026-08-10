@@ -43,6 +43,12 @@ namespace triton {
 /// synchronisation flag cannot start before the block that sets it finishes.
 /// That is what makes two variants containing the same operations in different
 /// blocks score differently.
+///
+/// It is the larger of a resource bound (the busiest core's busy time) and a
+/// recurrence bound (the Cube/Vector barrier chain paid once per iteration,
+/// divided by the inter-core buffer depth the pipeline allocated). The second
+/// matters because that depth defaults to one, which lets nothing overlap
+/// across a barrier.
 inline constexpr llvm::StringLiteral kCVPipelineEstimatedCycles =
     "ascend.cv_pipeline_estimated_cycles";
 

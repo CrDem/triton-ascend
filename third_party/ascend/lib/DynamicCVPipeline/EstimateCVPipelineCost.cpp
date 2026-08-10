@@ -42,14 +42,19 @@
 // time, and a block that waits on a synchronisation flag cannot start before
 // the block that sets it has finished. Cube and Vector therefore still overlap,
 // but only as far as the barriers recorded in the IR allow. The module total is
+// the larger of two bounds:
 //
-//   total = II * (N - 1) + latency of one iteration
+//   resource   -- the busiest core's total busy time;
+//   recurrence -- the barrier chain paid for every iteration, divided by the
+//                 inter-core buffer depth the pipeline actually allocated.
 //
-// with II the busiest core's busy time. Charging N critical paths would ignore
-// that multi-buffering overlaps iterations; charging N initiation intervals
-// would ignore the cost of filling the pipeline. With no barrier between the
-// cores the latency term collapses onto II and the result is exactly the old
-// roofline, so barriers only ever add what the IR actually asks for.
+// The second is what a plain "II * (N - 1) + latency" gets wrong. That formula
+// assumes the pipeline reaches steady state, which needs buffering deep enough
+// to hide the chain; AllocMultiCache defaults to a *single* inter-core buffer,
+// so on a kernel that alternates Cube and Vector nothing is hidden and the
+// chain is paid every iteration. Deep buffering leaves the resource bound
+// standing, one buffer gives the fully serialised cost, and the maximum
+// reproduces both.
 //
 // The number is intended for *ranking* CV pipeline variants against each other,
 // not for absolute latency prediction.
@@ -130,6 +135,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1768,6 +1774,145 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
   return makespan;
 }
 
+/// How deeply the pipeline is buffered, i.e. how many iterations can be in
+/// flight across a dependency before the producer has to wait for a buffer to
+/// come free.
+///
+/// These are read from the module, not assumed. BufferCountManager stamps them
+/// (and Python overrides them per configuration through set_buffer_count), so
+/// the attribute is the value this compilation actually used. The fallbacks
+/// below only apply when the attribute is missing altogether, and match
+/// BufferCountManager's own defaults -- inter-core is *one*, meaning nothing
+/// overlaps across a Cube/Vector barrier at all.
+struct BufferDepths {
+  int64_t intra = 2;
+  int64_t inter = 1;
+
+  /// Depth that gates an edge: crossing cores goes through an inter-core
+  /// buffer, staying on one core through an intra-core one.
+  int64_t forEdge(bool crossesCores) const {
+    return crossesCores ? inter : intra;
+  }
+};
+
+BufferDepths readBufferDepths(ModuleOp module) {
+  BufferDepths depths;
+  auto read = [&](llvm::StringLiteral name, int64_t &slot) {
+    if (auto attr = module->getAttrOfType<IntegerAttr>(name)) {
+      if (attr.getInt() >= 1) {
+        slot = attr.getInt();
+      }
+    }
+  };
+  read(CVPipeline::kIntraBufCount, depths.intra);
+  read(CVPipeline::kInterCoreBufCount, depths.inter);
+  return depths;
+}
+
+/// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
+/// goes through an inter-core buffer rather than an intra-core one. A block
+/// whose operations disagree about their core touches both, so any edge to it
+/// is treated as crossing -- the tighter of the two readings.
+bool edgeCrossesCores(const BlockStats &producer, const BlockStats &consumer) {
+  if (producer.mixedCore || consumer.mixedCore) {
+    return true;
+  }
+  return producer.isCube != consumer.isCube;
+}
+
+/// The dependency chain that constrains the kernel most, once buffering is
+/// taken into account.
+///
+/// Separate from the schedule above, which also serialises blocks that merely
+/// share a core. Sharing a core is a *resource* constraint and is already
+/// counted by that core's total busy time; what matters here is the ordering
+/// the IR actually requires, because that is what buffering can overlap from
+/// one iteration to the next. Every dependency counts -- Cube to Vector, Cube
+/// to Cube, Vector to Vector -- each gated by the buffer depth for its kind.
+///
+/// A chain of length L that is buffered B deep costs L/B per iteration, so the
+/// bound is the largest L/B over all chains. Chains are compared by that ratio
+/// rather than by length alone: a shorter chain through a single-buffered
+/// barrier constrains more than a longer, deeply buffered one.
+struct DependencyChain {
+  int64_t cycles = 0;      ///< length of the chain that produced the bound
+  int64_t bufferDepth = 1; ///< tightest buffer depth anywhere along it
+  int64_t bound = 0;       ///< cycles / bufferDepth
+};
+
+DependencyChain longestDependencyChain(const CostBreakdown &breakdown,
+                                       llvm::ArrayRef<int64_t> order,
+                                       const HardwareConfig &config,
+                                       const FusionFactors &fusion,
+                                       const BufferDepths &depths) {
+  // "No dependency edge on this chain yet", so a block with no producers is
+  // not reported as being buffer-limited by anything.
+  const int64_t unbuffered = std::numeric_limits<int64_t>::max();
+
+  struct Reached {
+    int64_t cycles = 0;
+    int64_t depth = 0;
+  };
+  llvm::DenseMap<int64_t, Reached> reached;
+
+  DependencyChain best;
+  best.bufferDepth = 1;
+
+  for (int64_t id : order) {
+    auto entry = breakdown.blocks.find(id);
+    if (entry == breakdown.blocks.end()) {
+      continue;
+    }
+    const BlockStats &stats = entry->second;
+    const int64_t cycles =
+        computeBlockCycles(stats, config, fusion, /*perIteration=*/false);
+
+    int64_t incoming = 0;
+    int64_t depth = unbuffered;
+    // Tracked separately from `incoming`, so an edge from a zero-cost block
+    // (a pure barrier block, say) still contributes its buffer depth.
+    bool sawEdge = false;
+    auto consider = [&](const BlockDepMap &deps) {
+      auto it = deps.find(id);
+      if (it == deps.end()) {
+        return;
+      }
+      for (int64_t producer : it->second) {
+        auto reachedProducer = reached.find(producer);
+        auto producerEntry = breakdown.blocks.find(producer);
+        if (reachedProducer == reached.end() ||
+            producerEntry == breakdown.blocks.end()) {
+          continue; // back edge: the producer belongs to a later pass
+        }
+        const int64_t edgeDepth = depths.forEdge(
+            edgeCrossesCores(producerEntry->second, stats));
+        if (!sawEdge || reachedProducer->second.cycles > incoming) {
+          sawEdge = true;
+          incoming = reachedProducer->second.cycles;
+          depth = std::min(reachedProducer->second.depth, edgeDepth);
+        }
+      }
+    };
+    consider(breakdown.syncDeps);
+    consider(breakdown.dataDeps);
+
+    Reached &slot = reached[id];
+    slot.cycles = incoming + cycles;
+    slot.depth = depth;
+
+    // Compared by ratio, so a tightly buffered short chain can win.
+    const int64_t effectiveDepth = depth == unbuffered ? 1 : depth;
+    const int64_t bound =
+        depth == unbuffered ? 0 : slot.cycles / effectiveDepth;
+    if (bound > best.bound) {
+      best.bound = bound;
+      best.cycles = slot.cycles;
+      best.bufferDepth = effectiveDepth;
+    }
+  }
+  return best;
+}
+
 /// Everything the module estimate is assembled from, kept together so the
 /// report can show how the final number was reached rather than just assert it.
 struct ModuleEstimate {
@@ -1778,13 +1923,14 @@ struct ModuleEstimate {
   int64_t initiationInterval = 0;
   /// One pass through the block graph with barriers respected.
   int64_t iterationLatency = 0;
-  /// II * (N - 1), expressed without needing a single global N.
-  int64_t steadyState = 0;
-  /// The same schedule run on loop-weighted block costs, which is what the
-  /// kernel would cost if consecutive iterations never overlapped at all.
-  /// Diagnostic only: it is the pessimistic bracket around the total, as the
-  /// roofline is the optimistic one.
+  /// The full schedule run on loop-weighted block costs: what the kernel costs
+  /// if nothing whatsoever overlaps between iterations.
   int64_t serialisedBound = 0;
+  /// Buffer depths as recorded on the module by BufferCountManager.
+  BufferDepths buffers;
+  /// The dependency chain that constrains the kernel most, and its bound.
+  DependencyChain chain;
+  int64_t recurrenceBound = 0;
   int64_t total = 0;
 
   /// Blocks in the order they were scheduled: dependency order, not IR order.
@@ -1794,21 +1940,31 @@ struct ModuleEstimate {
   CoreBusyCycles iterationBusy;
 };
 
-/// Combine the block schedule into one number.
+/// Combine the block schedule into one number, as the larger of two bounds.
 ///
-///   total = II * (N - 1) + latency of one iteration
+///   resource bound   -- the busiest core's total busy time. No schedule beats
+///                       it, and it is what a roofline-only model reports.
+///   recurrence bound -- the tightest dependency chain, costed for every
+///                       iteration and divided by how many iterations its
+///                       buffers let run at once.
 ///
-/// Both terms are needed. Charging N critical paths would assume iterations
-/// never overlap, but AllocMultiCache inserts multi-buffering precisely so they
-/// do; charging N initiation intervals would assume the pipeline is always full
-/// and never has to be filled. When no barrier orders Cube against Vector the
-/// latency collapses onto the initiation interval and the result is exactly the
-/// old roofline, so this only ever adds the cost of serialisation that the IR
-/// actually asks for.
+/// The second is what a plain modulo-scheduling formula gets wrong here.
+/// "total = II * (N - 1) + latency" assumes the pipeline reaches steady state,
+/// i.e. that buffering is deep enough to hide the chain; the inter-core depth
+/// defaults to one, so on a kernel that alternates Cube and Vector nothing is
+/// hidden and the chain is paid every iteration. Taking the maximum reproduces
+/// both extremes: deep buffering leaves the resource bound standing, a single
+/// buffer gives the serialised cost, and the two cross over on their own.
+///
+/// The initiation interval and one-iteration latency are still computed, but
+/// as diagnostics -- with blocks running different numbers of times they
+/// cannot be composed into a single global "II * (N - 1)".
 ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
                                      const HardwareConfig &config,
-                                     const FusionFactors &fusion) {
+                                     const FusionFactors &fusion,
+                                     const BufferDepths &buffers) {
   ModuleEstimate estimate;
+  estimate.buffers = buffers;
   estimate.order = topologicalBlockOrder(breakdown);
 
   llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
@@ -1822,12 +1978,11 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
       estimate.iterationSchedule, estimate.iterationBusy);
   estimate.initiationInterval = estimate.iterationBusy.bound();
 
-  estimate.steadyState =
-      std::max<int64_t>(0, estimate.throughputBound -
-                               estimate.initiationInterval);
+  estimate.chain = longestDependencyChain(breakdown, estimate.order, config,
+                                          fusion, buffers);
+  estimate.recurrenceBound = estimate.chain.bound;
   estimate.total =
-      estimate.steadyState +
-      std::max(estimate.iterationLatency, estimate.initiationInterval);
+      std::max(estimate.throughputBound, estimate.recurrenceBound);
   return estimate;
 }
 
@@ -2021,26 +2176,54 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
        << llvm::format("%.3f", config.cyclesToMicroseconds(cycles)) << " us)\n";
   };
 
-  os << "[" << DEBUG_TYPE << "] how the estimate is built:\n";
-  line("busiest core, whole module (roofline)", estimate.throughputBound);
-  line("  of which Cube", estimate.weightedBusy.cube);
-  line("  of which Vector", estimate.weightedBusy.vector);
-  line("initiation interval II (one iteration)",
-       estimate.initiationInterval);
-  line("one-iteration latency, barriers honoured", estimate.iterationLatency);
-  line("steady state = roofline - II", estimate.steadyState);
-  line("TOTAL = steady + max(latency, II)", estimate.total);
-  line("if iterations never overlapped", estimate.serialisedBound);
+  const bool resourceBound =
+      estimate.throughputBound >= estimate.recurrenceBound;
 
-  // The gap between the total and the roofline is precisely the cost of the
-  // barriers: it is zero when no barrier orders Cube against Vector.
+  os << "[" << DEBUG_TYPE
+     << "] how the estimate is built (the total is the larger of the two"
+        " bounds):\n";
+  line(resourceBound ? "> resource bound: busiest core"
+                     : "  resource bound: busiest core",
+       estimate.throughputBound);
+  line("    of which Cube", estimate.weightedBusy.cube);
+  line("    of which Vector", estimate.weightedBusy.vector);
+  line(resourceBound ? "  recurrence bound: chain / buffers"
+                     : "> recurrence bound: chain / buffers",
+       estimate.recurrenceBound);
+  line("    tightest dependency chain", estimate.chain.cycles);
+  os << "[" << DEBUG_TYPE << "]         buffered " << estimate.chain.bufferDepth
+     << " deep";
+  if (estimate.chain.bufferDepth == 1) {
+    os << " -- a single buffer, so consecutive iterations cannot overlap"
+          " across it at all";
+  }
+  os << "\n";
+  line("  every dependency serialised, no overlap", estimate.serialisedBound);
+  line("TOTAL", estimate.total);
+
+  os << "[" << DEBUG_TYPE << "]     buffer depths read from the module: intra "
+     << estimate.buffers.intra << ", inter-core " << estimate.buffers.inter
+     << "\n";
+
+  os << "[" << DEBUG_TYPE << "]     per iteration, for reference: II "
+     << estimate.initiationInterval << " cycles, barrier chain "
+     << estimate.iterationLatency << " cycles";
+  if (estimate.initiationInterval > 0) {
+    os << llvm::format(" (%.2fx II)",
+                       static_cast<double>(estimate.iterationLatency) /
+                           static_cast<double>(estimate.initiationInterval));
+  }
+  os << "\n";
+
+  // The gap to the roofline is what the barriers cost. Zero means either that
+  // nothing orders Cube against Vector, or that buffering hides all of it.
   const int64_t penalty = estimate.total - estimate.throughputBound;
-  os << "[" << DEBUG_TYPE << "]     serialisation charged by barriers: "
+  os << "[" << DEBUG_TYPE << "]     charged by barriers over the roofline: "
      << penalty << " cycles";
   if (estimate.throughputBound > 0) {
-    os << llvm::format(" (%.1f%% over the roofline)",
-                       100.0 * static_cast<double>(penalty) /
-                           static_cast<double>(estimate.throughputBound));
+    os << llvm::format(" (%.1f%%)", 100.0 * static_cast<double>(penalty) /
+                                        static_cast<double>(
+                                            estimate.throughputBound));
   }
   os << "\n";
 
@@ -2212,8 +2395,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // The estimate is assembled from the blocks, not from a single roofline over
   // every operation: the whole point is that regrouping the same operations
   // into different blocks has to change the number.
-  const ModuleEstimate estimate =
-      computeModuleEstimate(breakdown, *config, fusion);
+  const ModuleEstimate estimate = computeModuleEstimate(
+      breakdown, *config, fusion, readBufferDepths(module));
   const int64_t totalCycles = estimate.total;
 
   // Kept for comparison: what the model reported before blocks constrained it,
