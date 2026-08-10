@@ -1431,14 +1431,17 @@ struct CostBreakdown {
     stats.unitCyclesOneIter[cost.unit] += cost.cycles;
     stats.opCounts[op->getName().getStringRef()] += 1;
 
+    // emplace_back rather than push_back({}): DenseMap's default constructor
+    // is explicit, so brace copy-initialising a struct that contains one does
+    // not compile.
     if (stats.segments.empty()) {
-      stats.segments.push_back(BlockSegment{});
+      stats.segments.emplace_back();
     }
     if (isSyncOp(op)) {
       // The core stops here, so nothing after this point can fuse with what
       // came before it. A barrier at the very start or end of the block leaves
       // an empty segment, which countWorkingSegments() ignores.
-      stats.segments.push_back(BlockSegment{});
+      stats.segments.emplace_back();
     } else {
       BlockSegment &segment = stats.segments.back();
       segment.costedOps += 1;
