@@ -117,6 +117,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -1552,13 +1553,108 @@ struct CoreBusyCycles {
   int64_t bound() const { return std::max(cube, vector); }
 };
 
-/// ASAP schedule over the block graph.
+/// Order the blocks so that a producer is scheduled before its consumers.
 ///
-/// Blocks are visited in program order, which the pipeline has already made
-/// topological within each core. An edge to a block that has not been scheduled
-/// yet is a back edge -- loop-carried -- and is skipped: this schedules one
-/// pass through the graph, and the iteration count is applied separately.
+/// Program order will not do. ReorderOpsByBlockId makes the blocks of one core
+/// topological among themselves, but SeparateCVScope then groups the module by
+/// core, so every Vector block can precede every Cube block in the IR even
+/// when a Cube block produces what a Vector block consumes. Scheduling in that
+/// order would treat each such edge as loop-carried and drop it -- silently
+/// discarding exactly the cross-core barriers this model exists to honour.
+///
+/// Kahn's algorithm, with ties broken by program order so the result is
+/// deterministic. A genuine cycle (a loop-carried dependency) cannot be
+/// ordered: the earliest remaining block in program order is emitted anyway
+/// and its unsatisfied incoming edges are the ones dropped, which is the
+/// intended reading -- this schedules one pass through the graph.
+llvm::SmallVector<int64_t>
+topologicalBlockOrder(const CostBreakdown &breakdown) {
+  llvm::SmallVector<int64_t> programOrder;
+  for (const auto &entry : breakdown.blocks) {
+    programOrder.push_back(entry.first);
+  }
+
+  llvm::MapVector<int64_t, llvm::SmallVector<int64_t>> successors;
+  llvm::DenseMap<int64_t, int64_t> inDegree;
+  for (int64_t id : programOrder) {
+    inDegree[id] = 0;
+  }
+
+  llvm::DenseSet<std::pair<int64_t, int64_t>> seenEdge;
+  auto addEdges = [&](const BlockDepMap &deps) {
+    for (const auto &entry : deps) {
+      const int64_t consumer = entry.first;
+      if (!inDegree.count(consumer)) {
+        continue;
+      }
+      for (int64_t producer : entry.second) {
+        if (producer == consumer || !inDegree.count(producer)) {
+          continue;
+        }
+        // The two edge kinds overlap: a memory dependency shows up both as a
+        // transfer group and as a dataflow edge. Counting it twice would leave
+        // a permanent in-degree and force the cycle-breaking path.
+        if (!seenEdge.insert({producer, consumer}).second) {
+          continue;
+        }
+        successors[producer].push_back(consumer);
+        inDegree[consumer] += 1;
+      }
+    }
+  };
+  addEdges(breakdown.syncDeps);
+  addEdges(breakdown.dataDeps);
+
+  llvm::SmallVector<int64_t> order;
+  llvm::DenseSet<int64_t> emitted;
+  auto emit = [&](int64_t id) {
+    order.push_back(id);
+    emitted.insert(id);
+    auto it = successors.find(id);
+    if (it == successors.end()) {
+      return;
+    }
+    for (int64_t consumer : it->second) {
+      inDegree[consumer] -= 1;
+    }
+  };
+
+  while (order.size() < programOrder.size()) {
+    int64_t next = 0;
+    bool found = false;
+    for (int64_t id : programOrder) {
+      if (!emitted.count(id) && inDegree[id] <= 0) {
+        next = id;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      // Cyclic: fall back to program order for the rest of this round.
+      for (int64_t id : programOrder) {
+        if (!emitted.count(id)) {
+          next = id;
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      break; // cannot happen, but never loop forever on a malformed graph
+    }
+    emit(next);
+  }
+  return order;
+}
+
+/// ASAP schedule over the block graph, in dependency order.
+///
+/// An edge from a block that has not been scheduled yet survived the
+/// topological sort only because it closes a cycle, i.e. it is loop-carried;
+/// it is skipped, since this schedules one pass through the graph and the
+/// iteration count is applied separately.
 int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
+                           llvm::ArrayRef<int64_t> order,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration,
                            llvm::MapVector<int64_t, BlockSchedule> &schedule,
@@ -1567,9 +1663,13 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
   int64_t vectorAvailable = 0;
   int64_t makespan = 0;
 
-  for (const auto &entry : breakdown.blocks) {
-    const int64_t id = entry.first;
-    const BlockStats &stats = entry.second;
+  for (int64_t blockId : order) {
+    auto blockEntry = breakdown.blocks.find(blockId);
+    if (blockEntry == breakdown.blocks.end()) {
+      continue;
+    }
+    const int64_t id = blockId;
+    const BlockStats &stats = blockEntry->second;
     const int64_t cycles =
         computeBlockCycles(stats, config, fusion, perIteration);
 
@@ -1646,6 +1746,8 @@ struct ModuleEstimate {
   int64_t serialisedBound = 0;
   int64_t total = 0;
 
+  /// Blocks in the order they were scheduled: dependency order, not IR order.
+  llvm::SmallVector<int64_t> order;
   llvm::MapVector<int64_t, BlockSchedule> iterationSchedule;
   CoreBusyCycles weightedBusy;
   CoreBusyCycles iterationBusy;
@@ -1666,15 +1768,16 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
                                      const HardwareConfig &config,
                                      const FusionFactors &fusion) {
   ModuleEstimate estimate;
+  estimate.order = topologicalBlockOrder(breakdown);
 
   llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
-  estimate.serialisedBound =
-      scheduleBlockGraph(breakdown, config, fusion, /*perIteration=*/false,
-                         weightedSchedule, estimate.weightedBusy);
+  estimate.serialisedBound = scheduleBlockGraph(
+      breakdown, estimate.order, config, fusion, /*perIteration=*/false,
+      weightedSchedule, estimate.weightedBusy);
   estimate.throughputBound = estimate.weightedBusy.bound();
 
   estimate.iterationLatency = scheduleBlockGraph(
-      breakdown, config, fusion, /*perIteration=*/true,
+      breakdown, estimate.order, config, fusion, /*perIteration=*/true,
       estimate.iterationSchedule, estimate.iterationBusy);
   estimate.initiationInterval = estimate.iterationBusy.bound();
 
@@ -1761,8 +1864,9 @@ llvm::StringRef describeBlockCore(const BlockStats &stats) {
 /// per-operation table says what things cost, this says when they run and what
 /// they had to wait for.
 ///
-/// Rows are in program order, which is also the order they were scheduled in,
-/// so a critical path can be followed downwards through the "waits" column.
+/// Rows are ordered by start time rather than by block id or IR position, so
+/// the table reads as a timeline and a critical path can be followed downwards
+/// through the "waits" column.
 void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
                  const ModuleEstimate &estimate) {
   if (breakdown.blocks.empty()) {
@@ -1779,14 +1883,31 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
      << "]    block  core     cycles      start     finish  seg  ops  waits"
         "   bottleneck   contents\n";
 
+  // Sorted by start time so the table reads as a timeline and the critical
+  // path can be followed downwards through the "waits" column.
+  struct Row {
+    int64_t id;
+    const BlockStats *stats;
+    const BlockSchedule *slot;
+  };
+  llvm::SmallVector<Row> rows;
   for (const auto &entry : breakdown.blocks) {
-    const int64_t id = entry.first;
-    const BlockStats &stats = entry.second;
-    auto scheduled = estimate.iterationSchedule.find(id);
-    if (scheduled == estimate.iterationSchedule.end()) {
-      continue;
+    auto scheduled = estimate.iterationSchedule.find(entry.first);
+    if (scheduled != estimate.iterationSchedule.end()) {
+      rows.push_back({entry.first, &entry.second, &scheduled->second});
     }
-    const BlockSchedule &slot = scheduled->second;
+  }
+  llvm::sort(rows, [](const Row &lhs, const Row &rhs) {
+    if (lhs.slot->start != rhs.slot->start) {
+      return lhs.slot->start < rhs.slot->start;
+    }
+    return lhs.slot->finish < rhs.slot->finish;
+  });
+
+  for (const Row &row : rows) {
+    const int64_t id = row.id;
+    const BlockStats &stats = *row.stats;
+    const BlockSchedule &slot = *row.slot;
 
     std::string waits = slot.waitedOnCore
                             ? std::string("core")
@@ -1814,10 +1935,10 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
   // "a block is one fused chain" assumption, so their count is worth knowing
   // even when it is zero -- especially then, since it says the simple model
   // holds for this kernel.
-  llvm::SmallVector<int64_t> interiorBarrierBlocks;
+  llvm::SmallVector<std::string> interiorBarrierBlocks;
   for (const auto &entry : breakdown.blocks) {
     if (entry.second.hasInteriorBarrier()) {
-      interiorBarrierBlocks.push_back(entry.first);
+      interiorBarrierBlocks.push_back(describeBlockId(entry.first));
     }
   }
   os << "[" << DEBUG_TYPE << "] " << interiorBarrierBlocks.size()
@@ -1910,14 +2031,15 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
 
   os << "[" << DEBUG_TYPE << "] cost breakdown by operation kind"
      << " (share is of total work, not of the estimate):\n";
-  os << "[" << DEBUG_TYPE << "]     count       cycles   share  confidence  "
-     << "  unit        operation\n";
+  os << "[" << DEBUG_TYPE << "]     count       cycles   share  confidence    "
+     << "unit        operation\n";
   for (const auto &[name, stats] : rows) {
     os << "[" << DEBUG_TYPE << "] "
        << llvm::format("%9lld", static_cast<long long>(stats.count))
        << llvm::format("%13lld", static_cast<long long>(stats.weightedCycles))
        << llvm::format("%7.1f%%", 100.0 * stats.weightedCycles / total) << "  "
-       << llvm::left_justify(stringifyConfidence(stats.confidence), 12)
+       // "not-modelled" is itself 12 wide, so 12 leaves no gap at all.
+       << llvm::left_justify(stringifyConfidence(stats.confidence), 14)
        << llvm::left_justify(mlir::ascend::stringifyHWUnit(stats.unit), 12)
        << name << "\n";
   }
@@ -1943,8 +2065,10 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
   listKinds(CostConfidence::Generic,
             "charged by element count only, i.e. with no dedicated cost model");
   listKinds(CostConfidence::NotModelled,
-            "recognised but charged zero: they occupy hardware time this pass "
-            "does not account for yet (synchronisation, scalar work)");
+            "recognised but charged zero cycles of their own. For the "
+            "synchronisation ops that is now right: the stall they cause is "
+            "modelled by the block schedule instead, so charging the op too "
+            "would count it twice. Scalar work really is unaccounted for");
 
   printOpList(os, "operation(s) with a non-static shape, contributing 0 cycles",
               breakdown.unknownSizeOps);
