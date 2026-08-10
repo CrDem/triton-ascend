@@ -30,6 +30,7 @@
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.h"
 
 #include "DynamicCVPipeline/Common/Utils.h"
+#include <iostream>
 
 using namespace mlir;
 using namespace triton;
@@ -69,6 +70,7 @@ void PatternMatchRewritePass::runOnOperation() {
   GreedyRewriteConfig config = GreedyRewriteConfig().setUseTopDownTraversal();
   if (llvm::failed(
           applyPatternsGreedily(moduleOp, std::move(patterns), config))) {
+    std::cout << "[VDV DEBUG] match and rewrite failed" << std::endl;
     LOG_DEBUG("matchAndRewrite does not converge!");
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);
     return;

@@ -33,6 +33,8 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 
+#include <iostream>
+
 static constexpr const char *DEBUG_TYPE = "SplitDataflow";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
@@ -71,9 +73,11 @@ void SplitDataflowPass::runOnOperation() {
 
   // Step 7: Refine block id for iteration variables in main loops
   pm.addPass(createRefineArgsBlockIdPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
+      std::cout << "[VDV DEBUG] SplitDataFlow failed" << std::endl;
       module->emitError() << "[" << DEBUG_TYPE << "] Pass failed!";
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     }

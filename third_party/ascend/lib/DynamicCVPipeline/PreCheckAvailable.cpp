@@ -29,6 +29,8 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
 
+#include <iostream>
+
 using namespace mlir;
 using namespace triton;
 
@@ -56,6 +58,7 @@ void PreCheckAvailablePass::runOnOperation() {
   pm.addPass(createPreCheckMatmulPass());
 
   if (failed(runPipeline(pm, module))) {
+    std::cout << "[DEBUG VDV] PreCheckAvailablePass failed" << std::endl;
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
     return;
   }

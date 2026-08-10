@@ -25,6 +25,8 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 
+#include <iostream>
+
 static constexpr const char *DEBUG_TYPE = "analyze-data-flow";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
@@ -55,6 +57,7 @@ void AnalyzeDataFlowPass::runOnOperation() {
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
+      std::cout << "[VDV DEBUG] AnalyzeDataFlow failed - FALLBACK" << std::endl;
       LDBG("Pass failed; fallback to compilation without dynamic CV pipeline.");
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     }

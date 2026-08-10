@@ -29,6 +29,8 @@
 
 #include "mlir/Pass/PassManager.h"
 
+#include <iostream>
+
 using namespace mlir;
 using namespace triton;
 
@@ -65,6 +67,7 @@ void ComputeBlockOptPass::runOnOperation() {
 
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
+      std::cout << "[VDV DEBUG] ComputeBlockOpt failed" << std::endl;
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     }
     return;

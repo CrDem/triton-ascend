@@ -38,6 +38,8 @@
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 
+#include <iostream>
+
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
@@ -114,6 +116,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
     int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
                               : CVPipeline::ERRCODE_FAILED;
+    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     restoreModuleFromBackup(moduleOp, moduleBackup);
     moduleBackup->destroy();
     moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,

@@ -32,6 +32,7 @@
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp/PatternMatchRewrites.h"
 
+#include <iostream>
 using namespace mlir;
 using namespace triton;
 using namespace CVSplit;
@@ -63,6 +64,9 @@ void StandardizeOpPass::runOnOperation() {
   op->walk([&](linalg::MatmulOp matmulOp) {
     if (matmulOp->hasAttr(CVPipeline::kMayNotExec)) {
       findMayNotExec = true;
+      if (findMayNotExec) {
+        std::cout << "[VDV DEBUG] StadradizeOpPass failed, MM maynot execute" << std::endl;
+      }
     }
   });
 

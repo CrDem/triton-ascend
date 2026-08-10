@@ -33,6 +33,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Debug.h"
 
+#include <iostream>
+
 static constexpr const char *DEBUG_TYPE = "analyze-args-in-forOps";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(...)                                                              \
@@ -129,6 +131,10 @@ static bool checkMultiBlockUse(
     const llvm::DenseMap<unsigned, TensorArgBlockInfo> &argBlockInfo) {
   for (auto &p : argBlockInfo) {
     if (p.second.blockIds.size() > 1) {
+      std::cout << "[VDV DEBUG] error arg " << p.first << " ";
+      for (int Elem : p.second.blockIds)
+          std::cout << "blockId " << Elem << " ";
+      std::cout << std::endl;
       LDBG("[INFO]: Found tensor iter_arg using in multi block_ids!\n");
       return true;
     }
@@ -197,7 +203,7 @@ bool checkTensorArgsInMainLoop(ModuleOp module) {
 
     if (hasTensorArgInDifferentBlockIds(forOp)) {
       shouldReturn = true;
-      return WalkResult::interrupt();
+      //return WalkResult::interrupt();
     }
 
     return WalkResult::advance();
@@ -297,12 +303,14 @@ void AnalyzeArgsPass::runOnOperation() {
   LDBG("Before AnalyzeArgs:\n" << module << "\n");
 
   if (failed(isInterceptedModule(module))) {
+    std::cout << "[VDV DEBUG] AnalyzeArgsPass - isInterceptedModule failed" << std::endl;
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
     return;
   }
 
   if (checkTensorArgsInMainLoop(module) &&
       checkSubfBroadcastMismatchInVectorMainLoop(module)) {
+    std::cout << "[VDV DEBUG] AnalyzeArgsPass - checkTensorArgs in main loop failed - FALLBACK" << std::endl;
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
     return;
   }

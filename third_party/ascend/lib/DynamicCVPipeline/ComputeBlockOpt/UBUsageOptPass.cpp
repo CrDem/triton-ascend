@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <optional>
 #include <queue>
+#include <iostream>
 
 #define DEBUG_TYPE "ub-usage-opt"
 #define LOG_DEBUG(msg)                                                         \
@@ -717,6 +718,7 @@ bool applyRecordChange(DenseMap<int, int> &recordChange,
     if (willCreateCycle(willaddOps, willaddOps[0]->getBlock(), memGraph,
                         targetBlockId, bm)
             .value_or(true)) {
+      std::cout << "Find cycle when apply change for blockId: " << targetBlockId << std::endl;
       LOG_DEBUG("Find cycle when apply change for blockId: " << targetBlockId
                                                              << "\n");
       for (auto nodeId : willaddNodes) {
@@ -761,21 +763,32 @@ llvm::LogicalResult UBUsageOptPass::UBUsageOptimization(
   for (const auto &nodes : needUbOpts) {
     candidateCnt += static_cast<int>(nodes.size());
     for (auto opid : nodes) {
+      std::string printableStr;
+      llvm::raw_string_ostream os(printableStr);
+      nodeId2op[opid]->print(os);
+      std::cout << "maybe need opt: " << printableStr  << "\t id = " << opid << std::endl;
       LOG_DEBUG("maybe need opt: " << *nodeId2op[opid] << "\t id = " << opid
                                    << "\n");
     }
   }
   LOG_DEBUG("Find " << candidateCnt << " op maybe need UB optimization\n");
+  std::cout << "Find " << candidateCnt << " op maybe need UB optimization" << std::endl;
   llvm::DenseMap<int, int> recordChange =
       collectRecordChange(needUbOpts, linkOut, linkIn, linkSize, linkStart,
                           linkEnd, nodeBlockId, nodeCoreType, nodeId2op);
+  std::cout << "Need change blockId for " << recordChange.size() << " nodes" << std::endl;
   LOG_DEBUG("Need change blockId for " << recordChange.size() << " nodes\n");
   for (auto rec : recordChange) {
     auto node = nodeId2op[rec.first];
+    std::string printableStr;
+    llvm::raw_string_ostream os(printableStr);
+    node->print(os);
+    std::cout << "Change " << printableStr << " TO " << rec.second << std::endl;
     LOG_DEBUG("Change " << *node << " TO " << rec.second << "\n");
   }
 
   if (applyRecordChange(recordChange, nodeId2op, memGraph, bm)) {
+    std::cout << "Some skiped when apply UB usage optimization changes.\n";
     LOG_DEBUG("Some skiped when apply UB usage optimization changes.\n");
   }
   return llvm::success();
@@ -932,19 +945,23 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
   for (Block *block : blocks) {
     if (UBUsageOptimization(block, memDepGraph, bm).failed()) {
       LOG_DEBUG("UB usage optimization failed in block.\n");
+      std::cout <<  "UB usage optimization failed in block:" << std::endl;
     }
     if (isUBRefineOptEnabled) {
       if (optBroadcast(block, memDepGraph, bm).failed()) {
         LOG_DEBUG("Broadcast check failed in block.\n");
+        std::cout << "Broadcast check failed in block." << std::endl;
       }
 
       if (optSmallBlock(block, memDepGraph, bm).failed()) {
         LOG_DEBUG("Small block optimization failed in block.\n");
+        std::cout << "Small block optimization failed in block." << std::endl;
       }
     }
   }
 
   LOG_DEBUG("=== Pass UBUsageOpt complete ===\n");
+  std::cout << "=== Pass UBUsageOpt complete ===" << std::endl;
 }
 
 namespace mlir {

@@ -1122,7 +1122,8 @@ void TritonToLinalgPass::runOnOperation() {
 
   // 9. Clean up dead code and simplify IR.
   PassManager pm(&getContext(), moduleOp.getOperationName());
-  pm.addPass(createCSEPass());
+  // VDV remove CSE
+  // pm.addPass(createCSEPass());
   pm.addPass(createCanonicalizerPass());
   if (failed(runPipeline(pm, getOperation()))) {
     signalPassFailure();

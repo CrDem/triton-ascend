@@ -28,6 +28,8 @@
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
 
+#include <iostream>
+
 using namespace mlir;
 using namespace triton;
 
@@ -72,10 +74,12 @@ void PreCheckBlacklistPass::runOnOperation() {
   });
 
   if (!foundBlacklistOp) {
+    std::cout << "[VDV DEBUG] no blacklist ops - PASSED" << std::endl;
     LDBG("No blacklist operations found, passed.");
     return;
   }
 
+  std::cout << "[VDV DEBUG] blacklist ops found scope or scf.while - FALLBACK" << std::endl;
   LDBG("SSBUFFER will be skipped because "
        << foundOpName
        << " operation was found, which indicates that it has been optimized "
