@@ -117,6 +117,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Pass/PassRegistry.h"
 
@@ -1059,19 +1060,102 @@ struct LoopWeight {
   /// Iteration count assumed for `dynamicLoop`, so the report can say what
   /// the estimate is actually based on.
   int64_t assumedTripCount = 1;
+  /// How many mutually exclusive branches the operation sits in, multiplied
+  /// over every enclosing two-sided scf.if. Exactly one of those branches runs
+  /// per iteration, so charging all of them would multiply the work by this
+  /// factor. See computeBranchDivisors for why only two-sided ifs count.
+  int64_t branchDivisor = 1;
+
+  /// The operation's contribution over every iteration it runs in.
+  int64_t weighted(int64_t cycles) const {
+    return cycles * multiplier / branchDivisor;
+  }
+  /// The same for a single iteration.
+  int64_t perIteration(int64_t cycles) const { return cycles / branchDivisor; }
 };
 
-/// How many times an operation executes, given the enclosing loop nest.
+/// Divisor to apply to every operation inside an scf.if, keyed by that if.
+///
+/// The CV pipeline builds multi-buffering out of branches: with two buffers,
+/// AllocMultiCache emits the producing operations twice, once per buffer, and
+/// AddControlFlowCondition wraps them so exactly one copy runs per iteration.
+/// Summing both copies makes multi-buffering look like twice the work, which
+/// is why raising inter_core_buf_count used to make a kernel score worse
+/// instead of better.
+///
+/// Both spellings the pipeline emits are handled, and they are not the same
+/// question:
+///
+///   * a two-sided if -- work in both arms -- is a genuine either/or. Over a
+///     long loop the predicate alternates, so each arm runs about half the
+///     iterations and the honest total is the average of the arms, i.e. every
+///     operation in either arm charged at half. For arms of equal cost, which
+///     is what buffer rotation produces, that is exactly one arm.
+///   * a one-sided if -- a guard with no else, or with an else that does no
+///     work -- is a predicated stage, and in steady state such a guard holds
+///     on all but the prologue and epilogue iterations. Charging it in full is
+///     right to within those few iterations, so it gets a divisor of one.
+///
+/// Deciding by "does this arm contain work" rather than by "does an else
+/// region exist" is what keeps an empty else from halving real work.
+///
+/// Nested ifs multiply, so a three-deep rotation built out of two-sided ifs
+/// comes out at 1/8 rather than 1/3. Buffer counts that high are already
+/// warned against by BufferCountManager, so this is left as is.
+llvm::DenseMap<Operation *, int64_t>
+computeBranchDivisors(ModuleOp module, const HardwareConfig &config) {
+  llvm::DenseMap<Operation *, int64_t> divisors;
+
+  auto regionDoesWork = [&](Region &region) {
+    bool found = false;
+    region.walk([&](Operation *op) {
+      auto cost = estimateOpCost(op, config);
+      if (cost && cost->cycles > 0) {
+        found = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    return found;
+  };
+
+  module.walk([&](scf::IfOp ifOp) {
+    int64_t arms = 0;
+    if (regionDoesWork(ifOp.getThenRegion())) {
+      ++arms;
+    }
+    if (!ifOp.getElseRegion().empty() &&
+        regionDoesWork(ifOp.getElseRegion())) {
+      ++arms;
+    }
+    // One arm (or none) means there is nothing to choose between.
+    divisors[ifOp.getOperation()] = arms > 1 ? arms : 1;
+  });
+  return divisors;
+}
+
+/// How many times an operation executes, given the enclosing loop nest and the
+/// exclusive branches it sits in.
 ///
 /// Each loop is resolved in three steps, most trustworthy first: constant
 /// bounds in the IR, then the caller's argument bindings, then the assumed
 /// default. Only a loop that reaches the third step is reported, since only
 /// then is the number a guess.
-LoopWeight getLoopWeight(Operation *op, const TripCountOptions &options) {
+LoopWeight
+getLoopWeight(Operation *op, const TripCountOptions &options,
+              const llvm::DenseMap<Operation *, int64_t> &branchDivisors) {
   LoopWeight weight;
   // Walking outwards, so the first unresolved loop met is the innermost one.
   for (Operation *parent = op->getParentOp(); parent;
        parent = parent->getParentOp()) {
+    if (auto ifOp = dyn_cast<scf::IfOp>(parent)) {
+      auto found = branchDivisors.find(ifOp.getOperation());
+      if (found != branchDivisors.end()) {
+        weight.branchDivisor *= found->second;
+      }
+      continue;
+    }
+
     auto forOp = dyn_cast<scf::ForOp>(parent);
     if (!forOp) {
       continue;
@@ -1441,6 +1525,10 @@ struct CostBreakdown {
   /// hard barriers: the consumer cannot start until the producer signals.
   llvm::MapVector<int64_t, llvm::SetVector<int64_t>> syncDeps;
   int64_t genericOps = 0;
+  /// Operations sitting in a mutually exclusive branch, charged at a fraction
+  /// of their cost because only one branch runs. Reported so a jump in the
+  /// estimate can be traced to branch structure rather than looking arbitrary.
+  int64_t branchedOps = 0;
   int64_t totalWeightedCycles = 0;
 
   void recordBlock(Operation *op, const OpCost &cost, const LoopWeight &weight,
@@ -1456,9 +1544,9 @@ struct CostBreakdown {
       stats.mixedCore = true;
     }
     stats.costedOps += 1;
-    stats.workCycles += cost.cycles * weight.multiplier;
-    stats.unitCycles[cost.unit] += cost.cycles * weight.multiplier;
-    stats.unitCyclesOneIter[cost.unit] += cost.cycles;
+    stats.workCycles += weight.weighted(cost.cycles);
+    stats.unitCycles[cost.unit] += weight.weighted(cost.cycles);
+    stats.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
     stats.opCounts[op->getName().getStringRef()] += 1;
 
     // emplace_back rather than push_back({}): DenseMap's default constructor
@@ -1475,8 +1563,8 @@ struct CostBreakdown {
     } else {
       BlockSegment &segment = stats.segments.back();
       segment.costedOps += 1;
-      segment.unitCycles[cost.unit] += cost.cycles * weight.multiplier;
-      segment.unitCyclesOneIter[cost.unit] += cost.cycles;
+      segment.unitCycles[cost.unit] += weight.weighted(cost.cycles);
+      segment.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
     }
   }
 
@@ -1486,13 +1574,16 @@ struct CostBreakdown {
 
     OpKindStats &stats = byOpKind[op->getName().getStringRef()];
     stats.count += 1;
-    stats.weightedCycles += cost.cycles * weight.multiplier;
+    stats.weightedCycles += weight.weighted(cost.cycles);
     stats.unit = cost.unit;
     if (confidenceRank(cost.confidence) > confidenceRank(stats.confidence)) {
       stats.confidence = cost.confidence;
     }
 
-    totalWeightedCycles += cost.cycles * weight.multiplier;
+    totalWeightedCycles += weight.weighted(cost.cycles);
+    if (weight.branchDivisor > 1) {
+      ++branchedOps;
+    }
     if (cost.confidence == CostConfidence::Generic) {
       ++genericOps;
     }
@@ -1504,7 +1595,7 @@ struct CostBreakdown {
     if (weight.dynamicLoop && cost.cycles > 0) {
       DynamicLoopStats &loopStats = dynamicLoops[weight.dynamicLoop];
       loopStats.costedOps += 1;
-      loopStats.bodyCycles += cost.cycles * weight.multiplier;
+      loopStats.bodyCycles += weight.weighted(cost.cycles);
       loopStats.assumedTripCount = weight.assumedTripCount;
     }
   }
@@ -2177,7 +2268,8 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
 /// How the module number was assembled. Printed as a derivation rather than a
 /// result so that a surprising total can be attributed to a term.
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
-                   const FusionFactors &fusion, const HardwareConfig &config) {
+                   const FusionFactors &fusion, const HardwareConfig &config,
+                   int64_t branchedOps) {
   auto line = [&](llvm::StringRef what, int64_t cycles) {
     os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
        << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
@@ -2217,6 +2309,13 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE << "]     buffer depths read from the module: intra "
      << estimate.buffers.intra << ", inter-core " << estimate.buffers.inter
      << "\n";
+
+  // Multi-buffering is built out of branches, so raising a buffer count adds
+  // copies of the producing operations. Without this line the estimate would
+  // move for reasons nothing else in the report explains.
+  os << "[" << DEBUG_TYPE << "]     " << branchedOps
+     << " operation(s) in mutually exclusive branches, charged at a fraction"
+        " of their cost because only one branch runs per iteration\n";
 
   os << "[" << DEBUG_TYPE << "]     per iteration, for reference: II "
      << estimate.initiationInterval << " cycles, barrier chain "
@@ -2367,6 +2466,11 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
   const TripCountOptions tripCountOptions = readTripCountOptions();
   const FusionFactors fusion = readFusionFactors();
+  // Worked out once up front: deciding whether an scf.if is a real either/or
+  // means looking at both its arms, which cannot be done while walking a
+  // single operation.
+  const llvm::DenseMap<Operation *, int64_t> branchDivisors =
+      computeBranchDivisors(module, *config);
 
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
   CostBreakdown breakdown;
@@ -2379,7 +2483,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
       return;
     }
 
-    LoopWeight weight = getLoopWeight(op, tripCountOptions);
+    LoopWeight weight = getLoopWeight(op, tripCountOptions, branchDivisors);
     // Counts operations whose own cost could not be computed. An operation in
     // a loop of unknown trip count is not one of those: its per-iteration cost
     // is known, it is the iteration count that is not, which is accounted for
@@ -2390,7 +2494,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     breakdown.record(op, *cost, weight, runsOnCubeCore(op));
     ++nextOpId;
 
-    unitCycles[cost->unit] += cost->cycles * weight.multiplier;
+    unitCycles[cost->unit] += weight.weighted(cost->cycles);
   });
 
   // Both edge kinds are properties of the module, not of any one operation, so
@@ -2512,7 +2616,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   };
 
   auto reportDetail = [&](llvm::raw_ostream &os) {
-    printEstimate(os, estimate, fusion, *config);
+    printEstimate(os, estimate, fusion, *config, breakdown.branchedOps);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);
   };
