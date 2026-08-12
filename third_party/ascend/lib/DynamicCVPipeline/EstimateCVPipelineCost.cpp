@@ -1898,9 +1898,27 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
 /// below only apply when the attribute is missing altogether, and match
 /// BufferCountManager's own defaults -- inter-core is *one*, meaning nothing
 /// overlaps across a Cube/Vector barrier at all.
+/// Most inter-core buffering the pipeline can actually produce.
+///
+/// AddMultiBufferOuterScope reduces the count to a yes/no --
+/// `isDoubleBuf = (interCoreBufNum > 1)` -- and never looks at the number
+/// again, so asking for three buffers yields exactly the IR that two do.
+/// Dividing by a larger number here would credit the schedule with an overlap
+/// the IR does not contain, and would make the model prefer a configuration
+/// that compiles to something identical.
+constexpr int64_t kMaxUsefulInterCoreDepth = 2;
+
 struct BufferDepths {
   int64_t intra = 2;
   int64_t inter = 1;
+  /// What the module asked for, before the clamp above. Kept so the report can
+  /// say that a larger value was requested and had no effect, rather than
+  /// leaving that to be discovered by experiment.
+  int64_t requestedInter = 1;
+  /// Read only to report it. Nothing here divides by it: GM-load prefetching
+  /// is the business of DecoupleComputeAndMemory, which this pipeline does not
+  /// run, so raising it changes neither the IR nor the estimate.
+  int64_t requestedLoad = 1;
 
   /// Depth that gates an edge: crossing cores goes through an inter-core
   /// buffer, staying on one core through an intra-core one.
@@ -1909,6 +1927,11 @@ struct BufferDepths {
   }
 };
 
+/// Buffer depths as this compilation actually used them.
+///
+/// The intra-core count is taken at face value: AddMultiBufferInnerScope
+/// creates exactly that many UB allocations from it. The inter-core count is
+/// clamped, because the pipeline only distinguishes one from more than one.
 BufferDepths readBufferDepths(ModuleOp module) {
   BufferDepths depths;
   auto read = [&](llvm::StringLiteral name, int64_t &slot) {
@@ -1919,7 +1942,9 @@ BufferDepths readBufferDepths(ModuleOp module) {
     }
   };
   read(CVPipeline::kIntraBufCount, depths.intra);
-  read(CVPipeline::kInterCoreBufCount, depths.inter);
+  read(CVPipeline::kInterCoreBufCount, depths.requestedInter);
+  read(CVPipeline::kLoadStoreBufCount, depths.requestedLoad);
+  depths.inter = std::min(depths.requestedInter, kMaxUsefulInterCoreDepth);
   return depths;
 }
 
@@ -2309,6 +2334,20 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE << "]     buffer depths read from the module: intra "
      << estimate.buffers.intra << ", inter-core " << estimate.buffers.inter
      << "\n";
+  if (estimate.buffers.requestedInter > estimate.buffers.inter) {
+    os << "[" << DEBUG_TYPE << "]       note: inter_core_buf_count="
+       << estimate.buffers.requestedInter
+       << " was requested, but the pipeline only distinguishes 1 from more"
+          " than 1 -- it compiles to the same IR as "
+       << estimate.buffers.inter << ", so that is what is costed\n";
+  }
+  if (estimate.buffers.requestedLoad > 1) {
+    os << "[" << DEBUG_TYPE << "]       note: load_store_buf_count="
+       << estimate.buffers.requestedLoad
+       << " was requested, but GM-load prefetching is applied by"
+          " DecoupleComputeAndMemory, which this pipeline does not run, so it"
+          " changes neither the IR nor this estimate\n";
+  }
 
   // Multi-buffering is built out of branches, so raising a buffer count adds
   // copies of the producing operations. Without this line the estimate would
