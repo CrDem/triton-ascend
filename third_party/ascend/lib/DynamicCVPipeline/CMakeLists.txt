@@ -36,6 +36,7 @@ file(GLOB PRE_CHECK_AVAILABLE_SRC_FILES CONFIGURE_DEPENDS
 
 add_triton_library(DynamicCVPipeline
   AddDynamicCVPipeline.cpp
+  MainLoopUnroll.cpp
   PreCheckAvailable.cpp
 
   StandardizeOp.cpp
@@ -71,6 +72,8 @@ add_triton_library(DynamicCVPipeline
   MLIRLinalgTransformOps
   MLIRLinalgTransforms
   MLIRSCFTransformOps
+  MLIRSCFTransforms
+  MLIRSCFUtils
   MLIRTransformDialect
   MLIRTransformDialectTransforms
   MLIRTransforms
