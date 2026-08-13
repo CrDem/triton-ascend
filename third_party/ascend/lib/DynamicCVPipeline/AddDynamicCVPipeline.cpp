@@ -94,9 +94,13 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   // dataflow is split, so that the inter core transfers, their sync flags and
   // the multi buffers below are planned for each unrolled copy separately.
   // The pass is a no-op unless a factor > 1 was requested.
-  MainLoopUnrollOptions unrollOptions;
-  unrollOptions.unrollFactor = this->mainLoopUnrollFactor;
-  pm.addPass(createMainLoopUnrollPass(unrollOptions));
+  if (this-> mainLoopUnrollFactor > 1)
+  { 
+    MainLoopUnrollOptions unrollOptions;
+    unrollOptions.unrollFactor = this->mainLoopUnrollFactor;
+    pm.addPass(createMainLoopUnrollPass(unrollOptions));
+  }
+
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
   pm.addPass(createAllocMultiCachePass());
