@@ -37,14 +37,15 @@
 // merely regroups the same operations has to score differently, which a single
 // roofline over all operations cannot do.
 //
-// A block costs its own roofline, scaled by an intra-block fusion factor. The
-// blocks are then scheduled under two constraints: a core runs one block at a
-// time, and a block that waits on a synchronisation flag cannot start before
-// the block that sets it has finished. Cube and Vector therefore still overlap,
-// but only as far as the barriers recorded in the IR allow. The module total is
-// the larger of two bounds:
+// Operations are costed per hardware pipe and scheduled per pipe: each pipe
+// runs one thing at a time, but a block does not occupy its whole core, so
+// block B+1's loads run underneath block B's compute the way the hardware
+// actually issues them. What does order blocks is the IR's own barriers -- a
+// block waiting on a synchronisation flag cannot start before the block that
+// sets it has finished -- plus barriers found inside a block, which split it
+// into serial segments. The module total is the larger of two bounds:
 //
-//   resource   -- the busiest core's total busy time;
+//   resource   -- the busiest pipe's total busy time;
 //   recurrence -- the buffer that is held longest relative to how many copies
 //                 of it the pipeline allocated.
 //
@@ -1297,20 +1298,35 @@ FusionFactors readFusionFactors() {
 /// pair, which shares one physical pipeline and therefore serialises; the
 /// hardware profile declares that via its mutex groups. Cube and Vector cores
 /// run concurrently, so the module costs as much as the slower of the two.
-int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
-                        const HardwareConfig &config) {
-  auto cyclesOf = [&](HWUnit unit) -> int64_t {
-    auto it = unitCycles.find(unit);
-    return it == unitCycles.end() ? 0 : it->second;
-  };
+int64_t cyclesOfUnit(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
+                     HWUnit unit) {
+  auto it = unitCycles.find(unit);
+  return it == unitCycles.end() ? 0 : it->second;
+}
 
-  // FixPipeUB is Cube-side work even though it lands in Vector memory: it is
-  // the Cube's own drain engine. Leaving it out here would silently drop its
-  // cycles from the estimate entirely.
-  int64_t cubePathCycles = std::max({cyclesOf(HWUnit::Cube),
-                                     cyclesOf(HWUnit::CubeMTE2),
-                                     cyclesOf(HWUnit::FixPipe),
-                                     cyclesOf(HWUnit::FixPipeUB)});
+/// Busy time of the Cube core's own pipes.
+///
+/// FixPipeUB is Cube-side work even though it lands in Vector memory: it is the
+/// Cube's own drain engine. Leaving it out would silently drop its cycles.
+int64_t cubePathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
+                         const HardwareConfig &config) {
+  auto cyclesOf = [&](HWUnit unit) { return cyclesOfUnit(unitCycles, unit); };
+
+  // Two engines drain the accumulator, to HBM and to UB. Modelled as
+  // independent unless the profile declares them a mutex clique.
+  const int64_t drainCycles =
+      config.areMutexUnits("fixpipe", "fixpipe_ub")
+          ? cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB)
+          : std::max(cyclesOf(HWUnit::FixPipe), cyclesOf(HWUnit::FixPipeUB));
+
+  return std::max({cyclesOf(HWUnit::Cube), cyclesOf(HWUnit::CubeMTE2),
+                   drainCycles});
+}
+
+/// Busy time of the Vector core's own pipes.
+int64_t vectorPathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
+                           const HardwareConfig &config) {
+  auto cyclesOf = [&](HWUnit unit) { return cyclesOfUnit(unitCycles, unit); };
 
   // Off-chip traffic. The AIV load and store movers share one physical
   // pipeline on some parts, which is what the mutex clique in the profile
@@ -1330,12 +1346,35 @@ int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
           ? cyclesOf(HWUnit::MTE1ToUB) + cyclesOf(HWUnit::MTE3ToL1)
           : std::max(cyclesOf(HWUnit::MTE1ToUB), cyclesOf(HWUnit::MTE3ToL1));
 
-  int64_t vectorTransferCycles =
-      std::max(offChipTransferCycles, onChipTransferCycles);
-  int64_t vectorPathCycles =
-      std::max(cyclesOf(HWUnit::Vector), vectorTransferCycles);
+  return std::max(cyclesOf(HWUnit::Vector),
+                  std::max(offChipTransferCycles, onChipTransferCycles));
+}
 
-  return std::max(cubePathCycles, vectorPathCycles);
+int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
+                        const HardwareConfig &config) {
+  return std::max(cubePathRoofline(unitCycles, config),
+                  vectorPathRoofline(unitCycles, config));
+}
+
+/// Availability slot a unit occupies while scheduling.
+///
+/// Units that share one physical pipeline must share one slot, or the schedule
+/// would let a single engine do two things at once. Which pairs share is a
+/// property of the part, declared as a mutex clique in the hardware profile, so
+/// this reads the profile rather than hard-coding a topology.
+HWUnit getPipeResource(HWUnit unit, const HardwareConfig &config) {
+  if (unit == HWUnit::MTE3 && config.areMutexUnits("vec_mte2", "mte3")) {
+    return HWUnit::VecMTE2;
+  }
+  if (unit == HWUnit::MTE3ToL1 &&
+      config.areMutexUnits("mte1_l1_ub", "mte3_ub_l1")) {
+    return HWUnit::MTE1ToUB;
+  }
+  if (unit == HWUnit::FixPipeUB &&
+      config.areMutexUnits("fixpipe", "fixpipe_ub")) {
+    return HWUnit::FixPipe;
+  }
+  return unit;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1604,41 +1643,49 @@ struct CostBreakdown {
 //===----------------------------------------------------------------------===//
 // Block scheduling
 //===----------------------------------------------------------------------===//
-// The module estimate is built from blocks rather than from a single per-unit
-// roofline over every operation. That matters for the purpose this model
-// exists for: two variants that contain the same operations but group them
-// differently are indistinguishable to a global roofline, and grouping is
-// exactly what the CV pipeline decides.
-//
-// Two things constrain a block:
-//   * its core -- a core runs one block at a time, and ReorderOpsByBlockId has
-//     already put the blocks of one core in topological order;
+// Three things constrain a block:
+//   * pipe availability -- a pipe runs one thing at a time, and pipes that
+//     share physical hardware share one slot (getPipeResource);
 //   * its barriers -- a block that waits on a flag cannot start before the
-//     block that sets it has finished.
-// Everything else overlaps. So Cube and Vector still run concurrently, but only
-// as far as the barriers actually allow, instead of unconditionally.
+//     block that sets it has finished;
+//   * segments -- a barrier *inside* a block really does stop the core, so the
+//     runs of work either side of it are serial with respect to each other.
+// Everything else overlaps, including consecutive blocks on the same core:
+// the issue queue moves on while a pipe drains, so block B+1's loads run under
+// block B's compute whenever they need different pipes.
 //
-// ASSUMPTION, and the one worth revisiting first: consecutive blocks on the
-// same core do not pipeline into each other. Within a block the units overlap
-// as before, but block B+1's loads are not allowed to start under block B's
-// compute even when no barrier separates them. Real hardware does overlap them
-// -- the issue queue moves on while a pipe drains -- so this is pessimistic,
-// and it is why the estimate now exceeds the plain roofline, which is still
-// reported next to it. It is modelled this way because the block is the unit
-// the pipeline reasons about, and because a model that let everything overlap
-// is exactly the one that could not tell two block partitions apart.
+// An earlier version instead gave each core a single availability slot, so a
+// block occupied its whole core for its whole duration. That charged ordinary
+// pipe overlap as serial time and came out about 30% above measurement, with
+// the error growing as buffering shrank -- the pessimism landed hardest on the
+// configuration that had the least overlap to give away.
+//
+// Note what this means for the two terms of the estimate. The resource bound is
+// now partition-invariant: per-pipe busy time does not care how operations were
+// grouped, which is physically right. Sensitivity to the partition lives in the
+// schedule, and therefore in the recurrence bound -- which is also right, since
+// grouping changes where the barriers fall, not how much work there is.
 
-/// Cost of one block after intra-block fusion, summed over its segments.
-/// Segments are serial with respect to each other (a barrier separates them),
-/// so their rooflines add; within a segment the units overlap as usual.
+/// Intra-block fusion factor for a block, by the core it runs on. A block that
+/// somehow mixes cores gets the more conservative of the two.
+double getFusionFactor(const BlockStats &stats, const FusionFactors &fusion) {
+  if (stats.mixedCore) {
+    return std::max(fusion.cube, fusion.vector);
+  }
+  return stats.isCube ? fusion.cube : fusion.vector;
+}
+
+/// Cost of one block on its own, after intra-block fusion, summed over its
+/// segments. Segments are serial with respect to each other (a barrier
+/// separates them), so their rooflines add; within a segment the units overlap.
+///
+/// Reported rather than scheduled: the schedule works per unit, so a block's
+/// span there also depends on what the units were already busy with. The
+/// difference between this and (finish - start) is contention with neighbours.
 int64_t computeBlockCycles(const BlockStats &stats,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration) {
-  // A block that somehow mixes cores gets the more conservative factor.
-  double factor = stats.isCube ? fusion.cube : fusion.vector;
-  if (stats.mixedCore) {
-    factor = std::max(fusion.cube, fusion.vector);
-  }
+  const double factor = getFusionFactor(stats, fusion);
 
   int64_t total = 0;
   for (const BlockSegment &segment : stats.segments) {
@@ -1660,18 +1707,18 @@ struct BlockSchedule {
   /// Block whose completion decided this one's start, or kNoBlockId when
   /// nothing did. Reported so a long critical path can be traced by eye.
   int64_t criticalPred = kNoBlockId;
-  /// Set when the block was held up by its own core being busy rather than by
-  /// a dependency -- that is throughput pressure, not a serialisation problem.
+  /// Set when the block was held up by a pipe it needed still being busy,
+  /// rather than by a dependency -- that is throughput pressure, not a
+  /// serialisation problem, and it is answered by giving the pipe less work
+  /// rather than by moving barriers.
   bool waitedOnCore = false;
 };
 
-/// Busy time per core, which is the resource bound a schedule cannot beat.
-struct CoreBusyCycles {
-  int64_t cube = 0;
-  int64_t vector = 0;
-
-  int64_t bound() const { return std::max(cube, vector); }
-};
+/// Busy time per hardware unit. The roofline over these is the resource bound
+/// no schedule can beat, and unlike a per-core total it does not depend on how
+/// operations were grouped into blocks -- which is correct: grouping changes
+/// when a pipe stalls, not how much work it has to do.
+using UnitBusyCycles = llvm::DenseMap<HWUnit, int64_t>;
 
 /// Order the blocks so that a producer is scheduled before its consumers, and
 /// so that each core keeps its blocks in the order it will issue them.
@@ -1808,7 +1855,20 @@ topologicalBlockOrder(const CostBreakdown &breakdown) {
   return order;
 }
 
-/// ASAP schedule over the block graph, in dependency order.
+/// ASAP schedule over the block graph, in dependency order, at the granularity
+/// of a single hardware pipe.
+///
+/// A core issues its blocks in order, but it does not wait for one to retire
+/// before starting the next: the issue queue moves on while a pipe drains, so
+/// block B+1's loads run underneath block B's compute whenever they need
+/// different pipes. Treating a block as occupying its whole core -- which is
+/// what an earlier version did -- charged that overlap as serial time and
+/// inflated the estimate by about 30% against measurement.
+///
+/// So each pipe carries its own availability. A block's segments are still
+/// serial with respect to each other, because a barrier inside a block really
+/// does stop the core; and pipes that share physical hardware share one
+/// availability slot, per getPipeResource.
 ///
 /// An edge from a block that has not been scheduled yet survived the
 /// topological sort only because it closes a cycle, i.e. it is loop-carried;
@@ -1819,9 +1879,8 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration,
                            llvm::MapVector<int64_t, BlockSchedule> &schedule,
-                           CoreBusyCycles &busy) {
-  int64_t cubeAvailable = 0;
-  int64_t vectorAvailable = 0;
+                           UnitBusyCycles &busy) {
+  llvm::DenseMap<HWUnit, int64_t> pipeAvailable;
   int64_t makespan = 0;
 
   for (int64_t blockId : order) {
@@ -1831,8 +1890,6 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
     }
     const int64_t id = blockId;
     const BlockStats &stats = blockEntry->second;
-    const int64_t cycles =
-        computeBlockCycles(stats, config, fusion, perIteration);
 
     int64_t earliest = 0;
     int64_t criticalPred = kNoBlockId;
@@ -1856,34 +1913,48 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
     considerDeps(breakdown.syncDeps);
     considerDeps(breakdown.dataDeps);
 
-    const int64_t coreReady = stats.mixedCore
-                                  ? std::max(cubeAvailable, vectorAvailable)
-                              : stats.isCube ? cubeAvailable
-                                             : vectorAvailable;
-    const bool waitedOnCore = coreReady > earliest;
-    const int64_t start = std::max(earliest, coreReady);
-    const int64_t finish = start + cycles;
+    const double factor = getFusionFactor(stats, fusion);
 
-    if (stats.mixedCore) {
-      cubeAvailable = finish;
-      vectorAvailable = finish;
-      busy.cube += cycles;
-      busy.vector += cycles;
-    } else if (stats.isCube) {
-      cubeAvailable = finish;
-      busy.cube += cycles;
-    } else {
-      vectorAvailable = finish;
-      busy.vector += cycles;
+    // `cursor` is when the current segment may begin: the dependency-ready
+    // time for the first, and the previous segment's end after that.
+    int64_t cursor = earliest;
+    int64_t firstStart = earliest;
+    bool sawWork = false;
+    bool waitedOnPipe = false;
+
+    for (const BlockSegment &segment : stats.segments) {
+      const llvm::DenseMap<HWUnit, int64_t> &units =
+          perIteration ? segment.unitCyclesOneIter : segment.unitCycles;
+      int64_t segmentFinish = cursor;
+      for (const auto &entry : units) {
+        const int64_t cycles = static_cast<int64_t>(entry.second * factor);
+        if (cycles <= 0) {
+          continue;
+        }
+        const HWUnit pipe = getPipeResource(entry.first, config);
+        int64_t &available = pipeAvailable[pipe];
+        if (available > cursor) {
+          waitedOnPipe = true;
+        }
+        const int64_t begin = std::max(cursor, available);
+        available = begin + cycles;
+        segmentFinish = std::max(segmentFinish, available);
+        busy[entry.first] += cycles;
+        if (!sawWork || begin < firstStart) {
+          firstStart = begin;
+        }
+        sawWork = true;
+      }
+      cursor = segmentFinish;
     }
 
-    makespan = std::max(makespan, finish);
+    makespan = std::max(makespan, cursor);
     BlockSchedule &result = schedule[id];
-    result.start = start;
-    result.finish = finish;
-    result.cycles = cycles;
+    result.start = firstStart;
+    result.finish = cursor;
+    result.cycles = computeBlockCycles(stats, config, fusion, perIteration);
     result.criticalPred = criticalPred;
-    result.waitedOnCore = waitedOnCore;
+    result.waitedOnCore = waitedOnPipe;
   }
   return makespan;
 }
@@ -2038,12 +2109,14 @@ BufferRecurrence tightestBufferRecurrence(
 /// Everything the module estimate is assembled from, kept together so the
 /// report can show how the final number was reached rather than just assert it.
 struct ModuleEstimate {
-  /// Busy time of the busier core over the whole module. A schedule can never
-  /// beat this, and it is what the previous roofline-only model reported.
+  /// Roofline over the per-pipe busy times: the busiest pipe decides, and no
+  /// schedule can beat it. Independent of how operations were grouped into
+  /// blocks, which is correct -- grouping changes stalls, not workload.
   int64_t throughputBound = 0;
   /// The same bound for a single iteration: the initiation interval.
   int64_t initiationInterval = 0;
-  /// One pass through the block graph with barriers respected.
+  /// One pass through the block graph with barriers and pipe contention
+  /// respected. Unlike throughputBound this *does* depend on the grouping.
   int64_t iterationLatency = 0;
   /// The full schedule run on loop-weighted block costs: what the kernel costs
   /// if nothing whatsoever overlaps between iterations.
@@ -2061,14 +2134,14 @@ struct ModuleEstimate {
   /// The same schedule on loop-weighted costs, which is what buffer occupancy
   /// is measured against.
   llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
-  CoreBusyCycles weightedBusy;
-  CoreBusyCycles iterationBusy;
+  UnitBusyCycles weightedBusy;
+  UnitBusyCycles iterationBusy;
 };
 
 /// Combine the block schedule into one number, as the larger of two bounds.
 ///
-///   resource bound   -- the busiest core's total busy time. No schedule beats
-///                       it, and it is what a roofline-only model reports.
+///   resource bound   -- the busiest hardware pipe's total busy time. No
+///                       schedule beats it, whatever the block partition.
 ///   recurrence bound -- the tightest dependency chain, costed for every
 ///                       iteration and divided by how many iterations its
 ///                       buffers let run at once.
@@ -2095,12 +2168,12 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
   estimate.serialisedBound = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/false,
       estimate.weightedSchedule, estimate.weightedBusy);
-  estimate.throughputBound = estimate.weightedBusy.bound();
+  estimate.throughputBound = combineRoofline(estimate.weightedBusy, config);
 
   estimate.iterationLatency = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/true,
       estimate.iterationSchedule, estimate.iterationBusy);
-  estimate.initiationInterval = estimate.iterationBusy.bound();
+  estimate.initiationInterval = combineRoofline(estimate.iterationBusy, config);
 
   estimate.recurrence = tightestBufferRecurrence(
       breakdown, estimate.weightedSchedule, buffers);
@@ -2195,10 +2268,12 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
 
   os << "[" << DEBUG_TYPE
      << "] block schedule for one iteration (ssbuffer.block_id, as planned by"
-        " PlanComputeBlock). A core runs one block at a time; blocks on"
-        " different cores overlap unless a barrier orders them. 'cycles' is"
-        " after intra-block fusion, 'waits' names the block whose completion"
-        " decided this one's start ('core' = its own core was still busy):\n";
+        " PlanComputeBlock). Each pipe runs one thing at a time, so blocks"
+        " overlap wherever they need different pipes; only barriers order them."
+        " 'cycles' is what the block costs alone after fusion, so finish-start"
+        " above it is contention with neighbours. 'waits' names the block whose"
+        " completion decided this one's start ('core' = a pipe it needed was"
+        " still busy):\n";
   os << "[" << DEBUG_TYPE
      << "]    block  core     cycles      start     finish  seg  ops  waits"
         "   bottleneck   contents\n";
@@ -2307,11 +2382,29 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE
      << "] how the estimate is built (the total is the larger of the two"
         " bounds):\n";
-  line(resourceBound ? "> resource bound: busiest core"
-                     : "  resource bound: busiest core",
+  line(resourceBound ? "> resource bound: busiest pipe"
+                     : "  resource bound: busiest pipe",
        estimate.throughputBound);
-  line("    of which Cube", estimate.weightedBusy.cube);
-  line("    of which Vector", estimate.weightedBusy.vector);
+  line("    Cube path", cubePathRoofline(estimate.weightedBusy, config));
+  line("    Vector path", vectorPathRoofline(estimate.weightedBusy, config));
+
+  // Which pipe actually decides, and by how much. A pipe that is only just
+  // ahead means the kernel is balanced and the bound will move under any
+  // change; one far ahead of the rest is the thing worth attacking.
+  llvm::SmallVector<std::pair<HWUnit, int64_t>> pipes(
+      estimate.weightedBusy.begin(), estimate.weightedBusy.end());
+  llvm::sort(pipes, [](const auto &lhs, const auto &rhs) {
+    return lhs.second > rhs.second;
+  });
+  os << "[" << DEBUG_TYPE << "]     busiest pipes:";
+  for (size_t i = 0; i < pipes.size() && i < 4; ++i) {
+    if (pipes[i].second <= 0) {
+      break;
+    }
+    os << (i ? ", " : " ") << mlir::ascend::stringifyHWUnit(pipes[i].first)
+       << " " << pipes[i].second;
+  }
+  os << "\n";
   line(resourceBound ? "  recurrence bound: buffer reuse"
                      : "> recurrence bound: buffer reuse",
        estimate.recurrenceBound);

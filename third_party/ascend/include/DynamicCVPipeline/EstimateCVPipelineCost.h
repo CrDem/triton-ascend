@@ -38,11 +38,12 @@ namespace triton {
 /// better. Absent when the costmodel is not built into this binary, or when the
 /// estimate could not be produced.
 ///
-/// Built from the compute blocks, not from a single roofline over all
-/// operations: a core runs one block at a time, and a block that waits on a
-/// synchronisation flag cannot start before the block that sets it finishes.
-/// That is what makes two variants containing the same operations in different
-/// blocks score differently.
+/// Built from a schedule over the compute blocks. Each hardware pipe runs one
+/// thing at a time, so blocks overlap wherever they need different pipes; what
+/// orders them is the IR's own barriers -- a block waiting on a synchronisation
+/// flag cannot start before the block that sets it finishes. That is what makes
+/// two variants containing the same operations in different blocks score
+/// differently.
 ///
 /// It is the larger of a resource bound (the busiest core's busy time) and a
 /// recurrence bound (the buffer held longest, divided by how many copies of it
