@@ -494,6 +494,30 @@ def make_launcher(constants, signature, metadata):
                           lock_init_val if hasattr(metadata, 'lock_init_val') else 0)
     lock_num = int(metadata.lock_num) \
                           if hasattr(metadata, 'lock_num') else -1
+    has_unordered_sync_block_lock = bool(getattr(metadata, "has_unordered_sync_block_lock", False))
+    unordered_sync_block_lock_stride_i64 = (1 + 2 * 1024) * 8
+    # Zero the sync_block_lock buffer ON THE COMPUTE STREAM.
+    if has_unordered_sync_block_lock and lock_num > 0:
+        lock_init_stmt = f"""
+    std::vector<int64_t> lockInitData({lock_num}, 0);
+    constexpr uint64_t syncBlockLockStrideI64 = {unordered_sync_block_lock_stride_i64};
+    int64_t syncBlockLockParticipantNum = static_cast<int64_t>(
+        std::min(blockNum, static_cast<uint32_t>(1024)));
+    for (uint64_t lockOffset = 0; lockOffset < {lock_num};
+         lockOffset += syncBlockLockStrideI64) {{
+      lockInitData[lockOffset] = syncBlockLockParticipantNum;
+    }}
+    ret = rtMemcpy(syncBlockLock_ptr, syncBlockLockSize,
+                   reinterpret_cast<void *>(lockInitData.data()),
+                   syncBlockLockSize, RT_MEMCPY_HOST_TO_DEVICE);"""
+    elif lock_init_value == 0:
+        lock_init_stmt = ("ret = rtMemsetAsync(syncBlockLock_ptr, syncBlockLockSize, 0, "
+                          "syncBlockLockSize, stream);")
+    else:
+        lock_init_stmt = (f"std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});\n"
+                          "    ret = rtMemcpy(syncBlockLock_ptr, syncBlockLockSize, "
+                          "reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize, "
+                          "RT_MEMCPY_HOST_TO_DEVICE);")
     bs_task_type = metadata.bs_task_type if hasattr(metadata, 'bs_task_type') else 0
     mix_mode = metadata.mix_mode
     compile_on_910_95 = metadata.compile_on_910_95
@@ -663,18 +687,18 @@ def make_launcher(constants, signature, metadata):
     npu_utils_mod = getattr(npu_utils_inst, "npu_utils_mod", None)
     npu_utils_so_path = getattr(npu_utils_mod, "__file__", "")
     cpp_npu_utils_dlopen = f"""
-typedef void* (*triton_allocate_workspace_legacy_t)(uint64_t);
+typedef void* (*triton_allocate_workspace_t)(uint64_t, void**);
 typedef void* (*triton_allocate_sync_block_lock_t)(uint64_t, void*, void**);
 typedef void  (*triton_async_launch_t)(void*, const char*);
 typedef void  (*triton_release_retained_tensor_t)(void*);
 
-static triton_allocate_workspace_legacy_t g_allocate_workspace_legacy = nullptr;
+static triton_allocate_workspace_t g_allocate_workspace = nullptr;
 static triton_allocate_sync_block_lock_t g_allocate_sync_block_lock = nullptr;
 static triton_async_launch_t g_async_launch = nullptr;
 static triton_release_retained_tensor_t g_release_retained_tensor = nullptr;
 
 static bool npu_utils_ready() {{
-    return g_allocate_workspace_legacy &&
+    return g_allocate_workspace &&
            g_allocate_sync_block_lock &&
            g_async_launch &&
            g_release_retained_tensor;
@@ -688,7 +712,7 @@ static void init_npu_utils() {{
         fprintf(stderr, "Error: dlopen %s failed: %s\\n", so_path, dlerror());
         return;
     }}
-    g_allocate_workspace_legacy = (triton_allocate_workspace_legacy_t)dlsym(handle, "triton_allocate_workspace_legacy");
+    g_allocate_workspace = (triton_allocate_workspace_t)dlsym(handle, "triton_allocate_workspace");
     g_allocate_sync_block_lock = (triton_allocate_sync_block_lock_t)dlsym(handle, "triton_allocate_sync_block_lock");
     g_async_launch = (triton_async_launch_t)dlsym(handle, "triton_async_launch");
     g_release_retained_tensor = (triton_release_retained_tensor_t)dlsym(handle, "triton_release_retained_tensor");
@@ -708,21 +732,15 @@ static void release_npu_tensor_handle(void* handle) {{
     # and the program-id/grid axis it applies to. Each program now covers H tiles
     # along that axis, so the host shrinks the matching grid dim by H here (the
     # equivalent of what bishengir AutoBlockify used to do via hacc.coalesce_factor;
-    # bishengir no longer touches it). RowCoalescing can request ceil-div because
-    # its generated row mask handles tail rows.
+    # bishengir no longer touches it). The division is unconditional and mirrors the
+    # old integer division -- the kernel rewrite assumes grid[axis] % H == 0.
     coalesce_factor = int(getattr(metadata, "coalesce_factor", 1) or 1)
     coalesce_axis = int(getattr(metadata, "coalesce_axis", -1))
-    coalesce_grid_ceil_div = bool(getattr(metadata, "coalesce_grid_ceil_div", False))
     if coalesce_factor > 1 and coalesce_axis in (0, 1, 2):
         _coalesce_grid_var = {0: "gridX", 1: "gridY", 2: "gridZ"}[coalesce_axis]
-        _coalesce_grid_expr = (f"({_coalesce_grid_var} + {coalesce_factor} - 1) / {coalesce_factor}"
-                               if coalesce_grid_ceil_div else f"{_coalesce_grid_var} / {coalesce_factor}")
-        coalesce_grid_div = (
-            f"// coalescing: each program covers {coalesce_factor} tiles along "
-            f"axis {coalesce_axis}; shrink that grid dim.\n" +
-            ("" if coalesce_grid_ceil_div else f"  assert({_coalesce_grid_var} % {coalesce_factor} == 0 && "
-             f"\"ChunkCoalescing: grid[{coalesce_axis}] not divisible by coalesce_factor {coalesce_factor}\");\n") +
-            f"  {_coalesce_grid_var} = {_coalesce_grid_expr};")
+        coalesce_grid_div = (f"// coalescing: each program covers {coalesce_factor} tiles along "
+                             f"axis {coalesce_axis}; shrink that grid dim.\n"
+                             f"  {_coalesce_grid_var} = {_coalesce_grid_var} / {coalesce_factor};")
     else:
         coalesce_grid_div = ""
 
@@ -779,7 +797,6 @@ extern "C" {
   extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);
   static unsigned int __MsprofFlagL0  = 0;
   static unsigned int __MsprofFlagL1  = 0;
-  static const char* kernelName = nullptr ;
   static std::vector<int> tensorKinds;
 
   int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {
@@ -1005,14 +1022,16 @@ void triton_launch_kernel(const char* kernelName, aclrtFuncHandle func, aclrtStr
   // only 1D parallelization is supported for NPU
   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
   // base_ptr offset shape and stride are not used, arbitrarily set for now
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
+  void *workspace_handle = NULL;
   {coalesce_grid_div}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
   {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  std::shared_ptr<void> workspace_handle_guard(workspace_handle, release_npu_tensor_handle);
   if (!workspace_addr_ptr) {{
     {workspace_fail_code}
   }}
@@ -1048,12 +1067,7 @@ void triton_launch_kernel(const char* kernelName, aclrtFuncHandle func, aclrtStr
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
-    std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});
-    ret = aclrtMemcpy(
-        syncBlockLock_ptr, syncBlockLockSize,
-        reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,
-        ACL_MEMCPY_HOST_TO_DEVICE
-    );
+    {lock_init_stmt}
     if (ret != ACL_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
@@ -1116,14 +1130,16 @@ static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream st
     printf("WARNING: Skipping launch for kernel '%s' due to empty grid (gridX=%d, gridY=%d, gridZ=%d).\\n", kernelName, gridX, gridY, gridZ);
     return;
   }}
-  static std::string name(kernelName);
+  std::string name(kernelName);
   void *workspace_addr_ptr = NULL;
+  void *workspace_handle = NULL;
   {coalesce_grid_div}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
   {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
+  std::shared_ptr<void> workspace_handle_guard(workspace_handle, release_npu_tensor_handle);
   if (!workspace_addr_ptr) {{
     {workspace_fail_code}
   }}
@@ -1157,12 +1173,7 @@ static void _launch(const char* kernelName, aclrtFuncHandle func, aclrtStream st
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
-    std::vector<int64_t> lockInitData({lock_num}, {lock_init_value});
-    ret = aclrtMemcpy(
-        syncBlockLock_ptr, syncBlockLockSize,
-        reinterpret_cast<void *>(lockInitData.data()), syncBlockLockSize,
-        ACL_MEMCPY_HOST_TO_DEVICE
-    );
+    {lock_init_stmt}
     if (ret != ACL_SUCCESS) {{
       return {'ret' if enable_taskqueue else ''};
     }}
@@ -1267,10 +1278,8 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
 
   // get kernel_name
-  if (!kernelName) {{
-      PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
-      kernelName = PyUnicode_AsUTF8(kernelNameObj);
-  }}
+  PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, "kernel_name");
+  const char* kernelName = PyUnicode_AsUTF8(kernelNameObj);
   // get tensor_kinds
   if( tensorKinds.empty() ) {{
      PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, "tensor_kinds");

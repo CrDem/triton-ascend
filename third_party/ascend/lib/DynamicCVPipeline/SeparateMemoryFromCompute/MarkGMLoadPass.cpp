@@ -52,7 +52,7 @@ static constexpr const char *DEBUG_TYPE = "MarkGMLoad";
 
 namespace {
 
-static constexpr int kDefaultVBufferCount = 1;
+static constexpr int kDefaultVBufferCount = 2;
 static constexpr int kDefaultCBufferCount = 1;
 
 struct MarkCandidate {
@@ -60,6 +60,7 @@ struct MarkCandidate {
   memref::AllocOp destAlloc; // dest backing alloc after view-like piercing
   scope::ScopeOp scopeOp;    // nearest enclosing scope, should not be null
   int bufferCount;           // filled in Phase 2
+  bool fromHint = false;     // true if bufferCount came from gm_load hint
 };
 
 // Resolve whether a BlockArgument of func::FuncOp traces to a GM pointer.
@@ -127,6 +128,8 @@ static bool traceSourceToFuncArg(Value v) {
       return false;
     }
     if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
+      if (blockArg.getArgNumber() == 0)
+        return false; // induction variable, cannot be a GM load source
       // iter_arg: trace its init value (skip induction var at index 0).
       v = forOp.getInitArgs()[blockArg.getArgNumber() - 1];
       continue;
@@ -209,6 +212,7 @@ static int resolveHintBufferCount(memref::AllocOp destAlloc) {
     if (!attr)
       return false;
     int val = static_cast<int>(attr.getInt());
+    markOp->removeAttr(CVPipeline::kGMLoadMultiBufferHintAttr);
     if (foundHint && *foundHint != val) {
       LOG_DEBUG("conflicting gm_load hints: " << *foundHint << " vs " << val);
       return true; // signal conflict
@@ -267,12 +271,17 @@ static bool markGMLoadCandidate(MarkCandidate &c) {
   if (existingMarkOp) {
     existingMarkOp->setAttr(hivm::MultiBufferAttr::name,
                             builder.getI32IntegerAttr(c.bufferCount));
+    if (c.fromHint)
+      existingMarkOp->setAttr(CVPipeline::kGMLoadHintAttr,
+                              builder.getUnitAttr());
   } else {
     builder.setInsertionPointAfter(c.destAlloc);
     auto markOp = builder.create<annotation::MarkOp>(c.destAlloc->getLoc(),
                                                      c.destAlloc.getResult());
     markOp->setAttr(hivm::MultiBufferAttr::name,
                     builder.getI32IntegerAttr(c.bufferCount));
+    if (c.fromHint)
+      markOp->setAttr(CVPipeline::kGMLoadHintAttr, builder.getUnitAttr());
   }
   LOG_DEBUG("marked multi_buffer = " << c.bufferCount << " on " << c.destAlloc);
   return true;
@@ -291,6 +300,21 @@ void MarkGMLoadPass::runOnOperation() {
   ModuleOp module = getOperation();
 
   if (CVPipeline::hasFallbackAttr(module)) {
+    return;
+  }
+
+  // Skip marking for the sdpa infer kernel.
+  bool isSdpaInferKernel = false;
+  module.walk([&](func::FuncOp funcOp) -> WalkResult {
+    if (funcOp.getSymName() == "_sdpa_infer_kernel" ||
+        funcOp.getSymName() == "kernel_sdpa_fwd") {
+      isSdpaInferKernel = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (isSdpaInferKernel) {
+    LOG_DEBUG("kernel _sdpa_infer_kernel: skip GM load marking");
     return;
   }
 
@@ -321,6 +345,7 @@ void MarkGMLoadPass::runOnOperation() {
         continue;
       }
       c.bufferCount = hintVal;
+      c.fromHint = true;
       LOG_DEBUG("hint force-on, bufferCount = " << hintVal);
     } else {
       // No hint: automatic resolution.

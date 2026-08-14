@@ -322,6 +322,42 @@ LogicalResult LoadConverter::replaceMaskedLoadWithTensorOther(
   return success();
 }
 
+static bool skipNonComplementaryStaticDeinterleave(triton::LoadOp lhs) {
+  if (lhs->hasAttr("skip_deinterleave"))
+    return true;
+  auto lhsAddPtr = lhs.getPtr().getDefiningOp<triton::AddPtrOp>();
+  if (!lhsAddPtr)
+    return false;
+  auto lhsOffset = getConstantIntValue(lhsAddPtr.getOffset());
+  if (!lhsOffset)
+    return false;
+  auto pairBase = [](int64_t offset) {
+    int64_t lane = offset % 2;
+    return offset - (lane < 0 ? lane + 2 : lane);
+  };
+
+  for (triton::LoadOp rhs : lhs->getBlock()->getOps<triton::LoadOp>()) {
+    if (lhs == rhs || rhs.getMask() || rhs.getOther() ||
+        lhs.getResult().getType() != rhs.getResult().getType())
+      continue;
+    auto rhsAddPtr = rhs.getPtr().getDefiningOp<triton::AddPtrOp>();
+    if (!rhsAddPtr || lhsAddPtr.getPtr() != rhsAddPtr.getPtr())
+      continue;
+    auto rhsOffset = getConstantIntValue(rhsAddPtr.getOffset());
+    if (!rhsOffset)
+      continue;
+    if (lhsOffset.value() != rhsOffset.value() &&
+        pairBase(lhsOffset.value()) == pairBase(rhsOffset.value()))
+      continue;
+    // The first load can be rewritten before its sibling; tag both now.
+    auto skipAttr = UnitAttr::get(lhs->getContext());
+    lhs->setAttr("skip_deinterleave", skipAttr);
+    rhs->setAttr("skip_deinterleave", skipAttr);
+    return true;
+  }
+  return false;
+}
+
 LogicalResult
 LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
                                ConversionPatternRewriter &rewriter) const {
@@ -544,6 +580,7 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
       // If last dimension stride equals 2, try deinterleave optimization.
       auto [ptrStrides, ptrOffsets] = memRefType.getStridesAndOffset();
       if (ptrStrides.back() == 2 && (memRefShape.back() % 2 == 0) &&
+          !skipNonComplementaryStaticDeinterleave(op) &&
           mlir::triton::DeinterleaveStatusOptimization(op, adaptor, rewriter)
               .succeeded()) {
         return success();
@@ -1121,6 +1158,8 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
     // if the return value of op is used, we can't simply erase it
     if (op.getResult().use_empty()) {
       rewriter.eraseOp(op);
+      if (ptrBitcastOp->use_empty())
+        rewriter.eraseOp(ptrBitcastOp);
       return success();
     }
     return failure();
@@ -1142,7 +1181,29 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
   if (auto andOp = originalMask.getDefiningOp<arith::AndIOp>())
     // LHS is convention in semantic interpreter
     originalMask = andOp.getLhs();
-  else if (auto cmpOp = originalMask.getDefiningOp<arith::CmpFOp>()) {
+  else if (auto xorOp = originalMask.getDefiningOp<arith::XOrIOp>()) {
+    // Current f32 atomic_min uses !signbit as the positive mask:
+    //   shrui(value_bits, 31) -> cmpi ne 0 -> xori true.
+    if ((rmwOp != triton::RMWOp::MIN && rmwOp != triton::RMWOp::MAX) ||
+        (!elementType.isF32() && !elementType.isF64()) ||
+        !matchPattern(xorOp.getRhs(), m_One())) {
+      return failure();
+    }
+
+    auto cmpOp = xorOp.getLhs().getDefiningOp<arith::CmpIOp>();
+    if (!cmpOp || cmpOp.getPredicate() != arith::CmpIPredicate::ne ||
+        !matchPattern(cmpOp.getRhs(), m_Zero()))
+      return op->emitError("Illegal mask for atomicrmwOp of float type");
+
+    auto shiftOp = cmpOp.getLhs().getDefiningOp<arith::ShRUIOp>();
+    if (!shiftOp || shiftOp.getLhs() != valueBitcastOp.getResult())
+      return op->emitError("Illegal mask for atomicrmwOp of float type");
+
+    // Restore the implicit all-true mask.
+    originalMask = rewriter.create<arith::ConstantOp>(
+        op->getLoc(),
+        DenseElementsAttr::get(cast<ShapedType>(op.getMask().getType()), true));
+  } else if (auto cmpOp = originalMask.getDefiningOp<arith::CmpFOp>()) {
     if (cmpOp.getPredicate() != mlir::arith::CmpFPredicate::OGE ||
         !matchPattern(cmpOp.getRhs(),
                       /*positive float zero matcher*/ m_PosZeroFloat()))
@@ -1197,6 +1258,11 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
   } else {
     rewriter.eraseOp(op);
   }
+
+  // The restored atomic uses ptrBitcastOp.getSrc(), i.e. the original GM
+  // pointer. Remove the pointer bitcast once the paired integer atomic is gone.
+  if (ptrBitcastOp->use_empty())
+    rewriter.eraseOp(ptrBitcastOp);
 
   return success();
 }

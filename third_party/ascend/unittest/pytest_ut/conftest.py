@@ -22,10 +22,7 @@ import pytest
 
 
 def pytest_configure(config):
-    config.addinivalue_line(
-        "markers",
-        "backend(name): select the device backend used by Ascend pytest fixtures",
-    )
+    config.addinivalue_line("markers", "backend(name): select the runtime backend for a test module")
 
 
 @pytest.fixture(scope="module", autouse=True)

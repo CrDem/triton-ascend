@@ -299,29 +299,34 @@ static PyObject *copyMemory(PyObject *self, PyObject *args) {
 
 #ifdef USE_TORCH_NPU
 struct RetainedTensorHandle {
-  explicit RetainedTensorHandle(at::Tensor tensor)
-      : tensor(std::move(tensor)),
+  RetainedTensorHandle(at::Tensor tensor, std::string kind, uint64_t size)
+      : tensor(std::move(tensor)), kind(std::move(kind)), size(size),
         data(const_cast<void *>(this->tensor.storage().data())) {}
 
   at::Tensor tensor;
+  std::string kind;
+  uint64_t size;
   void *data;
 };
 
-static void *retainTensor(at::Tensor tensor, void **handle) {
+static void *retainTensor(at::Tensor tensor, void **handle, const char *kind,
+                          uint64_t size) {
   if (handle == nullptr) {
     return nullptr;
   }
-  auto *retained = new RetainedTensorHandle(std::move(tensor));
+  auto *retained = new RetainedTensorHandle(std::move(tensor), kind, size);
   *handle = retained;
   return retained->data;
 }
 
-extern "C" void *triton_allocate_workspace_legacy(uint64_t size) {
-  return const_cast<void *>(
-      at::empty(size,
-                at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte))
-          .storage()
-          .data());
+extern "C" void *triton_allocate_workspace(uint64_t size, void **handle) {
+  if (handle == nullptr) {
+    return nullptr;
+  }
+  *handle = nullptr;
+  auto tensor = at::empty(
+      size, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte));
+  return retainTensor(std::move(tensor), handle, "workspace", size);
 }
 
 extern "C" void *triton_allocate_sync_block_lock(uint64_t size, void *stream,
@@ -332,7 +337,7 @@ extern "C" void *triton_allocate_sync_block_lock(uint64_t size, void *stream,
   *handle = nullptr;
   auto tensor = at_npu::native::allocate_workspace(
       size, reinterpret_cast<rtStream_t>(stream));
-  return retainTensor(std::move(tensor), handle);
+  return retainTensor(std::move(tensor), handle, "sync_block_lock", size);
 }
 
 extern "C" void triton_release_retained_tensor(void *handle) {
