@@ -29,6 +29,7 @@
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
@@ -96,6 +97,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   pm.addPass(createAllocMultiCachePass());
   pm.addPass(createAddControlFlowConditionPass());
   pm.addPass(createSeparateMemoryFromComputePass());
+  // Must precede createRemoveSsbufAttrPass(): the estimate is driven by the
+  // ssbuffer.* attributes that pass strips.
+  pm.addPass(createEstimateCVPipelineCostPass());
   pm.addPass(createRemoveSsbufAttrPass());
 
   if (failed(runPipeline(pm, moduleOp)) ||

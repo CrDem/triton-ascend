@@ -1,6 +1,13 @@
 // RUN: triton-opt --remove-ssbuf-attr %s | FileCheck %s
 
-module {
+// The block dependency graph recorded by DataDependencyAnalysis sits on the
+// module rather than on an operation inside it, so it needs a check of its
+// own. It has to go: hivmc rejects module attributes it does not recognise.
+// CHECK-NOT: ssbuffer.blockDeps
+
+module attributes {ssbuffer.blockDeps = [
+    {producer = 1 : i32, consumer = 2 : i32, kind = "v2c"},
+    {producer = 2 : i32, consumer = 3 : i32, kind = "mem"}]} {
   // CHECK-LABEL: func.func @test_remove_core_type_and_block_id
   func.func @test_remove_core_type_and_block_id(%arg0: memref<1024x1024xf32>) {
     // CHECK: memref.alloc() : memref<1024x1024xf32>

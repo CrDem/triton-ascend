@@ -1204,6 +1204,18 @@ int64_t HardwareConfig::estimateVectorCycles(int64_t numElements) const {
   return std::max<int64_t>(1, (numElements + width - 1) / width);
 }
 
+int64_t
+HardwareConfig::estimateVectorCyclesFromTable(int64_t numElements,
+                                              int elementBits,
+                                              llvm::StringRef intrinsic) const {
+  int elemBytes = (elementBits + 7) / 8;
+  // 256 B per repeat == 2048 bits / elementBits elements per repeat.
+  int64_t repeats = (numElements * elemBytes + 255) / 256;
+  VecCycleEntry entry = lookupVecCycle(intrinsic, elementBits);
+  int64_t compute = static_cast<int64_t>(entry.compute) * repeats;
+  return compute + getVectorStartupLatency();
+}
+
 int64_t HardwareConfig::estimateMemoryCycles(llvm::StringRef moverName,
                                              int64_t bytes) const {
   const DataMover *mover = getDataMover(moverName);
