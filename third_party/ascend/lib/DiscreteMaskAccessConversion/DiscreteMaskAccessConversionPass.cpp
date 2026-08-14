@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-#include "TritonToUnstructure/IndirectAtomicUtils.h"
 #include "Utils/Utils.h"
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 
+#include "ascend/include/TritonToLinalg/LoadStoreConverter.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToStructured/MemOpConverter.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -54,9 +54,14 @@ using namespace hivm;
 // them.
 static bool compileOn91095Flag = false;
 static bool forceSimtTemplateFlag = false;
-static bool enableSyncBlockLockFlag = true;
+static bool useSyncBlockLockFlag = true;
 static constexpr const char *routeDiscreteMaskToSimtAttrName =
     "route_discrete_mask_to_simt";
+
+static void markSyncBlockLockUnordered(Operation *op) {
+  op->setAttr(hivm::SyncBlockLockUnorderedAttr::name,
+              UnitAttr::get(op->getContext()));
+}
 
 static bool traceUserToTargetOp(Value val) {
   llvm::SmallVector<Value, 32> worklist;
@@ -291,10 +296,15 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
     // unguarded full-load from reading past the tail-block boundary.
     auto [contMask, discMask] = decomposeAndMask(op, mask, loc, rewriter);
     if (contMask && discMask) {
-      // insert sync_block_lock
+      // insert sync_block_lock (unordered: see markSyncBlockLockUnordered)
       auto lockVar = MemOpConverter::createSyncBlockLockVar(rewriter, loc);
-      if (enableSyncBlockLockFlag) {
-        rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+      markSyncBlockLockUnordered(lockVar.getOperation());
+      if (useSyncBlockLockFlag) {
+        rewriter.create<hivm::PipeBarrierOp>(
+            loc,
+            hivm::PipeAttr::get(rewriter.getContext(), hivm::PIPE::PIPE_ALL));
+        auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+        markSyncBlockLockUnordered(lockOp.getOperation());
       }
       auto safeLoad = rewriter.create<triton::LoadOp>(
           loc, dst, contMask, op.getCache(), op.getEvict(), false);
@@ -304,8 +314,9 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
           loc, dst, selOp, contMask, op.getCache(), op.getEvict());
       newStore->setAttr(ConverterUtils::discreteMaskAttrName,
                         UnitAttr::get(rewriter.getContext()));
-      if (enableSyncBlockLockFlag) {
-        rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+      if (useSyncBlockLockFlag) {
+        auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+        markSyncBlockLockUnordered(unlockOp.getOperation());
       }
       rewriter.replaceOp(op, newStore);
       return success();
@@ -315,8 +326,13 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
     // discrete). Has DDR OOB risk but no better option in pure simd mode.
     // insert sync_block_lock to serialize the read-modify-write window.
     auto lockVar = MemOpConverter::createSyncBlockLockVar(rewriter, loc);
-    if (enableSyncBlockLockFlag) {
-      rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    markSyncBlockLockUnordered(lockVar.getOperation());
+    if (useSyncBlockLockFlag) {
+      rewriter.create<hivm::PipeBarrierOp>(
+          loc,
+          hivm::PipeAttr::get(rewriter.getContext(), hivm::PIPE::PIPE_ALL));
+      auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+      markSyncBlockLockUnordered(lockOp.getOperation());
     }
     auto loadFromDstOp = rewriter.create<triton::LoadOp>(
         loc, dst, op.getCache(), op.getEvict(), false);
@@ -326,8 +342,9 @@ struct DiscreteMaskStoreConversion : OpRewritePattern<triton::StoreOp> {
         loc, dst, selOp, op.getCache(), op.getEvict());
     newStore->setAttr(ConverterUtils::discreteMaskAttrName,
                       UnitAttr::get(rewriter.getContext()));
-    if (enableSyncBlockLockFlag) {
-      rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    if (useSyncBlockLockFlag) {
+      auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+      markSyncBlockLockUnordered(unlockOp.getOperation());
     }
     rewriter.replaceOp(op, newStore);
     return success();
@@ -381,6 +398,7 @@ struct DiscreteMaskLoadConversion : OpRewritePattern<triton::LoadOp> {
       return success();
     }
 
+    // Fallback: original full load + select (contMask absent, pure discrete).
     if (!other) {
       FailureOr<Value> constant = specializeTypelessValueToConstant(
           TypelessValue::Zero, ptr.getType(), loc, rewriter);
@@ -434,6 +452,16 @@ struct DiscreteMaskAtomicConversion
       return failure();
     }
 
+    auto [contMask, discMask] = decomposeAndMask(op, mask, loc, rewriter);
+    if (!contMask && discMask && compileOn91095Flag && forceSimtTemplateFlag) {
+      // A pure discrete mask cannot safely be removed because masked-off
+      // elements may carry out-of-bounds pointers. Keep the original mask so
+      // Unstructure can use either the masked indirect atomic template or its
+      // masked fallback.
+      op->setAttr(routeDiscreteMaskToSimtAttrName, rewriter.getUnitAttr());
+      return failure();
+    }
+
     FailureOr<mlir::Value> fill = specializeTypelessValueToConstant(
         typelessVal, src.getType(), loc, rewriter);
     if (failed(fill)) {
@@ -445,9 +473,21 @@ struct DiscreteMaskAtomicConversion
       return failure();
     }
 
-    auto maskedValue = rewriter.create<arith::SelectOp>(loc, mask, src, *fill);
+    // For mask = contMask & discMask, retain contMask as the memory-access
+    // guard and replace only the discrete part with the RMW identity value.
+    // The continuous mask can then be lowered to a bounded subview without
+    // accessing the masked-off tail.
+    Value valueMask = mask;
+    Value accessMask = nullptr;
+    if (contMask && discMask) {
+      valueMask = discMask;
+      accessMask = contMask;
+    }
+
+    auto maskedValue =
+        rewriter.create<arith::SelectOp>(loc, valueMask, src, *fill);
     auto newAtomicOp = rewriter.create<mlir::triton::AtomicRMWOp>(
-        loc, src.getType(), rmwOp, ptr, maskedValue, mlir::Value(), op.getSem(),
+        loc, src.getType(), rmwOp, ptr, maskedValue, accessMask, op.getSem(),
         op.getScope());
     rewriter.replaceOp(op, newAtomicOp);
     return success();
@@ -461,9 +501,23 @@ DiscreteMaskAccessConversionPass::DiscreteMaskAccessConversionPass(
 void DiscreteMaskAccessConversionPass::runOnOperation() {
   compileOn91095Flag = this->compileOn91095;
   forceSimtTemplateFlag = this->forceSimtTemplate;
-  bool tileNonOverlap = checkAllProgramIdNonOverlap(getOperation());
-  enableSyncBlockLockFlag = !tileNonOverlap;
   auto moduleOp = getOperation();
+  bool tileNonOverlap = checkAllProgramIdNonOverlap(moduleOp);
+  useSyncBlockLockFlag = !tileNonOverlap;
+
+  // Restore floating-point atomic max/min expanded by semantic.py before
+  // discrete-mask rewriting changes the atomic value into arith.select.
+  // Run this in a separate greedy-rewrite phase so that
+  // DiscreteMaskAtomicConversion cannot consume the expanded form first.
+  RewritePatternSet atomicMaxMinPatterns(&getContext());
+  atomicMaxMinPatterns.add<LoadStoreConverter::AtomicMaxMinCanonicalizer>(
+      atomicMaxMinPatterns.getContext());
+  if (failed(
+          applyPatternsGreedily(moduleOp, std::move(atomicMaxMinPatterns)))) {
+    moduleOp->emitError("failed to canonicalize floating-point atomic max/min");
+    signalPassFailure();
+    return;
+  }
 
   RewritePatternSet patterns(&getContext());
   patterns.add<DiscreteMaskLoadConversion, DiscreteMaskStoreConversion,

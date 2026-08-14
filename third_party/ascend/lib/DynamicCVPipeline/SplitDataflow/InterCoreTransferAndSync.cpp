@@ -697,7 +697,7 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
       srcValue,                  // src
       cubeAllocOp->getResult(0), // dst
       mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
-      mlir::ArrayAttr{}, nullptr);
+      nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
   attachTransferTags(fixpipeOp, cubeBlockId, "CUBE", transferIndex);
   attachCrossCoreDeps(fixpipeOp, transferIndex, CVPipeline::crossCoreProducerId,
                       builder);
@@ -1338,13 +1338,6 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(
   LOG_DEBUG("[newConsStart]" << *consStart << "\n");
   LOG_DEBUG("[newConsEnd]" << *consEnd << "\n");
 
-  if (dep.consumerBlockId == dep.iniConsumerBlockId) {
-    auto consumerPoint =
-        analyzeConsumerReadInsertPoint(srcValue, dep.iniConsumerBlockId);
-    if (consumerPoint) {
-      consStart = consumerPoint;
-    }
-  }
   Operation *consumedDataOp = nullptr;
   Operation *transferOp =
       insertCubeToVectorTransfer(builder, srcValue, prodEnd, consStart, loc,
@@ -1358,12 +1351,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(
 
   bool isStoreDirectly =
       isStoreDirectlyInUserChain(consumedDataOp->getResult(0));
-  if (dep.consumerBlockId == dep.iniConsumerBlockId) {
-    auto newconsumerPoint = getConsumerWaitPoint(transferIndex);
-    if (newconsumerPoint) {
-      newConsStart = newconsumerPoint;
-    }
-  }
+
   insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId,
                       loc, transferIndex, flagIdReuseManager, consumedDataOp,
                       isStoreDirectly);

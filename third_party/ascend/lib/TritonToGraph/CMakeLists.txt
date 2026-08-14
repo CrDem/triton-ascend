@@ -4,6 +4,7 @@ add_triton_library(TritonToGraph
   ControlFlowGraphBuilder.cpp
   DataflowGraph.cpp
   MemorySsaBuilder.cpp
+  MergeConcatLoadBuffer.cpp
   Passes.cpp
 
   DEPENDS
@@ -11,13 +12,17 @@ add_triton_library(TritonToGraph
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRBufferizationDialect
   MLIRControlFlowDialect
   MLIRDialectUtils
   MLIRIR
   MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRMemRefDialect
   MLIRPass
   MLIRSCFDialect
   MLIRSupport
+  MLIRTensorDialect
   MLIRTransforms
   TritonIR
   TritonTransforms

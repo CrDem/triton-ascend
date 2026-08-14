@@ -22,6 +22,7 @@ import ctypes
 import functools
 import hashlib
 import glob
+import json
 import os
 import re
 import shlex
@@ -35,7 +36,10 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 from triton._C.libtriton import ir, passes, ascend, buffer_ir
 from triton._C.libtriton.ascend import ir as ascend_ir
-
+try:
+    from triton._C.libtriton import distributed
+except ImportError:
+    distributed = None
 from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
@@ -67,7 +71,7 @@ from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
 )
-from triton.runtime.cache import _base32, get_dump_manager
+from triton.runtime.cache import get_dump_manager
 
 
 # TODO: materialize the concrete min shape
@@ -121,15 +125,8 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
 
 
 def _get_dump_paths(hash_key: str, src_path: str, dst_path: str) -> Tuple[str, str]:
-    """
-    If TRITON_DUMP_DIR is set, return paths under that directory.
-    Otherwise, return the original src_path and dst_path.
-    """
-    dump_dir_env = os.getenv("TRITON_DUMP_DIR")
-    if dump_dir_env:
-        dump_dir = os.path.join(dump_dir_env, _base32(hash_key))
-        return (os.path.join(dump_dir, os.path.basename(src_path)), os.path.join(dump_dir, os.path.basename(dst_path)))
-    return (src_path, dst_path)
+    dump_manager = get_dump_manager(hash_key)
+    return (dump_manager._make_path(os.path.basename(src_path)), dump_manager._make_path(os.path.basename(dst_path)))
 
 
 def make_ttir(mod, metadata, opt):
@@ -139,6 +136,8 @@ def make_ttir(mod, metadata, opt):
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     passes.common.add_inliner(pm)
+    # passes.ttir.add_rewrite_tensor_pointer(pm)
+    passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
     passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
@@ -181,7 +180,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         enable_select_analysis = metadata["enable_select_analysis"]
         compile_on_910_95 = metadata["compile_on_910_95"]
         force_simt_template = metadata["force_simt_template"]
-        enable_sync_block_lock = metadata["enable_sync_block_lock"]
         enable_mask_fallback_conversion = metadata["enable_mask_fallback_conversion"]
         optimize_dynamic_offset = metadata["optimize_dynamic_offset"]
         auto_blockify_size = metadata["auto_blockify_size"]
@@ -192,6 +190,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             auto_blockify_size = 1
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        if distributed is not None:
+            distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
         # ascend.passes.ttir.add_auto_blockify(pm, auto_blockify_size)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
@@ -204,8 +204,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             passes.common.add_cse(pm)
             passes.common.add_canonicalizer(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
-        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template,
-                                                               enable_sync_block_lock)
+        ascend.passes.ttir.add_discrete_mask_access_conversion(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_hivm(pm)
@@ -215,6 +214,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, enable_nd2nz_on_vector, enable_select_analysis,
                                                 compile_on_910_95)
+        # Restricted to 910_95/950. The merged buffer is written by two disjoint
+        # memref.copy ops, and on 910_9362 the generated code only makes the
+        # copy next to the surviving to_tensor visible, so the other half of the
+        # tile reads back the padding value. The IR is unchanged through
+        # bishengir-opt, so the loss happens in code generation.
+        if compile_on_910_95:
+            ascend.passes.ttir.add_merge_concat_load_buffer(pm)
         if metadata["enable_dynamic_cv_pipeline"]:
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
@@ -227,6 +233,9 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # `ssbuffer.insertionOptimization` attribute (set here) at run time.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod, metadata["enable_buffer_insert_optimization"])
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+
+        if _enable_msdebug():
+            ascend.passes.ttir.add_normalize_debug_line_locations(pm)
 
         # Buffer counts for the dynamic CV pipeline. An explicit option wins;
         # otherwise the environment may override, which is how a run can be
@@ -391,11 +400,21 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     metadata["shared"] = 1
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
-    # Turn off auto-blockify when sync_block_lock/unlock was inserted: the lock
-    # protects a cross-block read-modify-write and is incompatible with packing
-    # logical blocks into a sequential auto-blockify loop.
-    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg):
+    # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
+    if re.search(SYNC_BLOCK_LOCK_REGEX, linalg) and not re.search(r"sync_block_lock_unordered", linalg):
         metadata["has_auto_blockify_blacklist_op"] = True
+    # The unordered (Bakery) discrete-mask lock cannot coexist with CV sub-tiling
+    # (auto-bind-sub-block)
+    has_unordered_sync_block_lock = re.search(r"sync_block_lock_unordered", linalg) is not None
+    metadata["has_unordered_sync_block_lock"] = has_unordered_sync_block_lock
+    if has_unordered_sync_block_lock:
+        metadata["auto_tile_and_bind_subblock"] = False
+        # One metadata cache line for runtime participant_num, plus one
+        # choosing and one ticket cache line per participant. Each cache line is
+        # 8 i64. This fallback is for one lock; the bishengir callback supplies
+        # the exact total after lowering.
+        metadata["lock_num"] = (1 + 2 * 1024) * 8
+        metadata["lock_init_val"] = 0
     # the mix mode is also encoded into metadata['name'] for runtime to distinguish
     metadata["mix_mode"] = re.search(MIX_MODE_REGEX, linalg).group(1)
     metadata["parallel_mode"] = re.search(PARALLEL_MODE_REGEX, linalg).group(1)
@@ -727,7 +746,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             cmd_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-            print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
+            print_cmd_list = cmd_list.copy()
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -944,12 +965,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
-        if opt.debug:
+
+        if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
             print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
-        elif os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
-            print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
         try:
             ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -1081,7 +1101,6 @@ class NPUOptions:
     parallel_mode: str = "simd"
     force_simt_only: bool = False
     force_simt_template: bool = False
-    enable_sync_block_lock: bool = False
     # only take effect on the simt-only & simd-simt-mix scenarios
     shared_mem_dynamic_size: int = None
     # enable_bishengir_simt_optimization is passed as
@@ -1108,7 +1127,7 @@ class NPUOptions:
     disable_fma: bool = False
 
     # superblocking factor
-    superblock_factor: int = 0
+    superblock_factor: int = 1
 
     def __post_init__(self):
         from triton.backends.ascend import _apply_ascend_patch
@@ -1159,8 +1178,7 @@ def ttir_to_npubin(mod, metadata, opt):
                 _compile_option_list += [
                     f"--enable-bishengir-simt-optimization={opt.enable_bishengir_simt_optimization}"
                 ]
-            if opt.simt_stack_limit:
-                _compile_option_list += [f"--simt-stack-limit={opt.simt_stack_limit}"]
+            _compile_option_list += [f"--simt-stack-limit={get_simt_stack_limit()}"]
             if opt.shared_mem_dynamic_size is not None:
                 _compile_option_list += [f"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}"]
             if opt.enable_simt_reorder_instruction:
@@ -1188,7 +1206,7 @@ def ttir_to_npubin(mod, metadata, opt):
             # cap keys off the same env switch, so the two stay in sync.
             if _is_auto_map_parallel_blocks_enabled():
                 _compile_option_list += ["--enable-auto-blockify-loop"]
-                if opt.superblock_factor > 0:
+                if opt.superblock_factor > 1:
                     _compile_option_list += [f"--super-block-factor={opt.superblock_factor}"]
 
         npu_compiler_path, env = _get_npucompiler_path()
@@ -1202,11 +1220,36 @@ def ttir_to_npubin(mod, metadata, opt):
         return Path(bin_path).read_bytes()
 
 
+def get_simt_stack_limit():
+    # simt_stack_limit resolution precedence:
+    #  1.torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}
+    #    takes precedence and the user-specified value is ignored.
+    #  2.if that config key is absent ,fail back to the kernel-time
+    #    default simt_stack_limit=1152
+    _simt_stack_limit = 1152
+    try:
+        import torch_npu
+        torch_npu_basic_path = os.path.dirname(torch_npu.__file__)
+        _acl_cfg_path = os.path.join(torch_npu_basic_path, "acl_default.json")
+        with open(_acl_cfg_path, "r") as f:
+            _acl_cfg = json.load(f)
+        _cfg_stack = _acl_cfg.get("StackSize", {}).get("simt_stack_size", None)
+        if _cfg_stack is not None and _cfg_stack > 0:
+            _simt_stack_limit = _cfg_stack
+    except Exception as e:
+        print(f"[DEBUG] read acl_default.json failed: {e}")
+    return _simt_stack_limit
+
+
 class AscendBackend(BaseBackend):
 
     @staticmethod
     def supports_target(target: GPUTarget):
         return target.backend == "npu"
+
+    @staticmethod
+    def use_alignment_specialization(options: dict) -> bool:
+        return options.get("compile_mode") == "simt_only" or bool(options.get("force_simt_only", False))
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
@@ -1265,6 +1308,8 @@ class AscendBackend(BaseBackend):
     def load_dialects(self, ctx):
         from triton._C.libtriton import buffer_ir
         from triton._C.libtriton.ascend import ir as ascend_ir
+        if distributed is not None:
+            distributed.ir.load_dialects(ctx)
         buffer_ir.load_dialects(ctx)
         ascend_ir.load_dialects(ctx)
         ascend.load_dialects(ctx)

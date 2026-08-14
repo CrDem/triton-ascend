@@ -14,6 +14,7 @@
 #include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
+#include "ascend/include/TritonToGraph/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
 #include "ascend/include/TritonToHIVM/Passes.h"
 #include "ascend/include/TritonToLLVM/Passes.h"
@@ -83,6 +84,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
               compileOn91095));
         });
 
+  m.def("add_merge_concat_load_buffer", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cfg::createMergeConcatLoadBufferPass());
+  });
+
   m.def("add_triton_to_unstructure",
         [](mlir::PassManager &pm, bool compileOn91095, bool forceSimtTemplate) {
           TritonToUnstructureOptions opts;
@@ -96,16 +101,14 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
           pm.addPass(mlir::triton::createTritonToHFusionPass(compileOn91095));
         });
 
-  m.def("add_discrete_mask_access_conversion", [](mlir::PassManager &pm,
-                                                  bool compileOn91095,
-                                                  bool forceSimtTemplate,
-                                                  bool enableSyncBlockLock) {
-    DiscreteMaskAccessConversionOptions opts;
-    opts.compileOn91095 = compileOn91095;
-    opts.forceSimtTemplate = forceSimtTemplate;
-    opts.enableSyncBlockLock = enableSyncBlockLock;
-    pm.addPass(mlir::triton::createDiscreteMaskAccessConversionPass(opts));
-  });
+  m.def("add_discrete_mask_access_conversion",
+        [](mlir::PassManager &pm, bool compileOn91095, bool forceSimtTemplate) {
+          DiscreteMaskAccessConversionOptions opts;
+          opts.compileOn91095 = compileOn91095;
+          opts.forceSimtTemplate = forceSimtTemplate;
+          pm.addPass(
+              mlir::triton::createDiscreteMaskAccessConversionPass(opts));
+        });
 
   m.def("add_triton_to_hivm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToHIVMPass());
@@ -113,6 +116,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
 
   m.def("add_triton_to_llvm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToLLVMPass());
+  });
+
+  m.def("add_normalize_debug_line_locations", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createNormalizeDebugLineLocationsPass());
   });
 
   m.def("add_bubble_up_operation", [](mlir::PassManager &pm) {

@@ -295,7 +295,8 @@ MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
   }
 
   if (auto allocTensorOp = dyn_cast<bufferization::AllocTensorOp>(op)) {
-    return {};
+    MemoryEffects::EffectInstance scopedAlloc(MemoryEffects::Allocate::get());
+    return {remapEffectValue(scopedAlloc, allocTensorOp.getResult())};
   }
 
   std::optional<SmallVector<MemoryEffects::EffectInstance>> raw;

@@ -33,6 +33,10 @@ namespace cfg {
 // 创建 BuildCFG pass 的工厂函数
 std::unique_ptr<OperationPass<mlir::ModuleOp>> createBuildCFGPass();
 
+// Merge disjoint masked-load UB buffers concatenated by insert_slice.
+std::unique_ptr<OperationPass<mlir::ModuleOp>>
+createMergeConcatLoadBufferPass();
+
 // 注册所有 CFG 相关的 passes
 #define GEN_PASS_REGISTRATION
 #include "ascend/include/TritonToGraph/Passes.h.inc"
