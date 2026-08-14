@@ -30,6 +30,7 @@
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
+#include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
@@ -92,6 +93,17 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   pm.addPass(createStandardizeOpPass());
   pm.addPass(createPlanComputeBlockPass());
   pm.addPass(createComputeBlockOptPass());
+  // Unroll the main loop once the compute blocks are planned but before the
+  // dataflow is split, so that the inter core transfers, their sync flags and
+  // the multi buffers below are planned for each unrolled copy separately.
+  // The pass is a no-op unless a factor > 1 was requested.
+  if (this-> mainLoopUnrollFactor > 1)
+  { 
+    MainLoopUnrollOptions unrollOptions;
+    unrollOptions.unrollFactor = this->mainLoopUnrollFactor;
+    pm.addPass(createMainLoopUnrollPass(unrollOptions));
+  }
+
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
   pm.addPass(createAllocMultiCachePass());

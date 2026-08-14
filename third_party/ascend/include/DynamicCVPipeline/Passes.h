@@ -25,6 +25,7 @@
 
 #include "AddDynamicCVPipeline.h"
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
+#include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
 #include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"

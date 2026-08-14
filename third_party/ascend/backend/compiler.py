@@ -232,7 +232,11 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # AddMultiBufferInnerScope pass reads the module-level
             # `ssbuffer.insertionOptimization` attribute (set here) at run time.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod, metadata["enable_buffer_insert_optimization"])
-            ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+            # The main loop unroll runs inside the CV pipeline: the loop to
+            # unroll is the one carrying the cube <-> vector communication,
+            # which only the pipeline itself can point at.
+            main_loop_unroll_factor = metadata.get("main_loop_unroll_factor") or 1
+            ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95, main_loop_unroll_factor)
 
         if _enable_msdebug():
             ascend.passes.ttir.add_normalize_debug_line_locations(pm)
@@ -1081,6 +1085,10 @@ class NPUOptions:
     enable_mixed_cv: bool = None
     enable_vf_fusion: bool = None
     enable_dynamic_cv_pipeline: bool = None
+    # Unroll factor of the main loop (the loop carrying the cube <-> vector
+    # communication), applied inside the dynamic CV pipeline. Only takes effect
+    # with enable_dynamic_cv_pipeline; 1 (default) leaves the loop untouched.
+    main_loop_unroll_factor: int = 1
     # Gates the cube-loader penetration + cube-for block merge feature. Off by
     # default so existing scenarios are unaffected; opt in per kernel to fuse a
     # matmul's loader for-loop into the matmul's cube compute block.

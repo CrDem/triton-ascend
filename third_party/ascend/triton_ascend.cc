@@ -126,12 +126,16 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     pm.addPass(mlir::triton::createBubbleUpOperationPass());
   });
 
-  m.def("add_dynamic_cv_pipeline",
-        [](mlir::PassManager &pm, bool compileOn91095) {
-          AddDynamicCVPipelineOptions opts;
-          opts.compileOn91095 = compileOn91095;
-          pm.addPass(mlir::triton::createAddDynamicCVPipelinePass(opts));
-        });
+  m.def(
+      "add_dynamic_cv_pipeline",
+      [](mlir::PassManager &pm, bool compileOn91095, int mainLoopUnrollFactor) {
+        AddDynamicCVPipelineOptions opts;
+        opts.compileOn91095 = compileOn91095;
+        opts.mainLoopUnrollFactor = mainLoopUnrollFactor;
+        pm.addPass(mlir::triton::createAddDynamicCVPipelinePass(opts));
+      },
+      py::arg("pm"), py::arg("compile_on_910_95"),
+      py::arg("main_loop_unroll_factor") = 1);
 
   m.def("set_buffer_count", [](mlir::ModuleOp &module, const std::string &type,
                                int count) {
