@@ -1142,6 +1142,95 @@ computeBranchDivisors(ModuleOp module, const HardwareConfig &config) {
 /// bounds in the IR, then the caller's argument bindings, then the assumed
 /// default. Only a loop that reaches the third step is reported, since only
 /// then is the number a guess.
+/// Where a loop's trip count came from, worst case last.
+enum class TripCountSource { Static, Bindings, Assumed };
+
+llvm::StringRef stringifyTripCountSource(TripCountSource source) {
+  switch (source) {
+  case TripCountSource::Static:
+    return "static";
+  case TripCountSource::Bindings:
+    return "bindings";
+  case TripCountSource::Assumed:
+    return "assumed";
+  }
+  return "?";
+}
+
+struct ResolvedTripCount {
+  int64_t count = 1;
+  TripCountSource source = TripCountSource::Assumed;
+  /// What the loop bound in the IR says, when that differs from `count`
+  /// because the bound was extended for pipelining. Zero when it does not.
+  int64_t rewrittenCount = 0;
+};
+
+/// Undo the loop extension AddControlFlowCondition applied for pipelining.
+///
+/// It rewrites a pipelined loop's bound to
+///     ceildiv(originalIterations * requiredBuffers, x) + ifCount
+/// and fills the extra iterations with prologue and epilogue in which most
+/// stages are switched off by their predicates. The bound is therefore not the
+/// number of times the body's work runs, and taking it at face value charges
+/// the whole body for iterations where nearly all of it is disabled.
+///
+/// On a loop that is not unrolled the inflation is a couple of percent and
+/// invisible. With the main loop unrolled it was observed at 3x, which is
+/// enough to make the model rank an unrolled variant far worse than it is.
+///
+/// The three factors are read from ssbuffer.iter_extension rather than
+/// pattern-matched out of the bound expression: the pass that applied them
+/// knows them exactly, and a formula change there would silently defeat any
+/// matching done here.
+///
+/// The inversion is exact whenever the ceildiv divided evenly, and off by at
+/// most one iteration otherwise -- against a trip count in the hundreds that
+/// is noise, and it is always closer than not inverting at all.
+std::optional<int64_t> removeLoopExtension(scf::ForOp forOp,
+                                           int64_t rewrittenCount) {
+  auto attr = forOp->getAttrOfType<ArrayAttr>(CVPipeline::kIterExtension);
+  if (!attr || attr.size() != 3) {
+    return std::nullopt;
+  }
+  auto requiredBuffers = dyn_cast<IntegerAttr>(attr[0]);
+  auto divisor = dyn_cast<IntegerAttr>(attr[1]);
+  auto ifCount = dyn_cast<IntegerAttr>(attr[2]);
+  if (!requiredBuffers || !divisor || !ifCount ||
+      requiredBuffers.getInt() <= 0) {
+    return std::nullopt;
+  }
+
+  const int64_t scaled = rewrittenCount - ifCount.getInt();
+  if (scaled <= 0) {
+    return std::nullopt; // nothing but prologue; leave the bound alone
+  }
+  const int64_t original = scaled * divisor.getInt() / requiredBuffers.getInt();
+  return original > 0 ? std::optional<int64_t>(original) : std::nullopt;
+}
+
+/// The three-step resolution, in one place so the number the estimate uses and
+/// the number the report prints can never disagree.
+ResolvedTripCount resolveLoopTripCount(scf::ForOp forOp,
+                                       const TripCountOptions &options) {
+  ResolvedTripCount resolved;
+  auto tripCount = mlir::ascend::utils::analyzeScfForTripCount(forOp);
+  if (tripCount.isStatic) {
+    resolved = {tripCount.staticTripCount, TripCountSource::Static, 0};
+  } else if (auto bound = resolveTripCount(forOp, options)) {
+    resolved = {*bound, TripCountSource::Bindings, 0};
+  } else {
+    // Nothing resolved the bound, so there is no extension to undo either.
+    return {options.defaultTripCount, TripCountSource::Assumed, 0};
+  }
+
+  // What was read is the rewritten bound; the body runs fewer times than that.
+  if (auto original = removeLoopExtension(forOp, resolved.count)) {
+    resolved.rewrittenCount = resolved.count;
+    resolved.count = *original;
+  }
+  return resolved;
+}
+
 LoopWeight
 getLoopWeight(Operation *op, const TripCountOptions &options,
               const llvm::DenseMap<Operation *, int64_t> &branchDivisors) {
@@ -1162,23 +1251,69 @@ getLoopWeight(Operation *op, const TripCountOptions &options,
       continue;
     }
 
-    auto tripCount = mlir::ascend::utils::analyzeScfForTripCount(forOp);
-    if (tripCount.isStatic) {
-      weight.multiplier *= tripCount.staticTripCount;
-      continue;
-    }
-    if (auto bound = resolveTripCount(forOp, options)) {
-      weight.multiplier *= *bound;
-      continue;
-    }
-
-    weight.multiplier *= options.defaultTripCount;
-    if (!weight.dynamicLoop) {
+    const ResolvedTripCount resolved = resolveLoopTripCount(forOp, options);
+    weight.multiplier *= resolved.count;
+    if (resolved.source == TripCountSource::Assumed && !weight.dynamicLoop) {
       weight.dynamicLoop = forOp;
-      weight.assumedTripCount = options.defaultTripCount;
+      weight.assumedTripCount = resolved.count;
     }
   }
   return weight;
+}
+
+/// One loop, as the estimate sees it.
+struct LoopReport {
+  Operation *loop = nullptr;
+  int64_t depth = 0;
+  int64_t tripCount = 1;
+  TripCountSource source = TripCountSource::Static;
+  /// The bound as written in the IR, when pipelining extended it past the
+  /// number of iterations that actually do the body's work. Zero otherwise.
+  int64_t rewrittenTripCount = 0;
+  /// What an operation directly in this loop's body gets multiplied by: this
+  /// loop's trip count times every enclosing loop's.
+  int64_t bodyMultiplier = 1;
+  /// Exclusive branches the loop itself sits in, which divide that again.
+  int64_t branchDivisor = 1;
+};
+
+/// Every loop and what the estimate multiplies its body by.
+///
+/// Worth reporting even when nothing is wrong, because a loop multiplier is the
+/// single largest lever on the result and it is invisible in the totals: an
+/// unrolled loop whose bound resolves to the wrong number looks exactly like a
+/// kernel that genuinely does more work. Without this the only way to notice is
+/// to divide per-operation cycles between two runs by hand.
+llvm::SmallVector<LoopReport>
+collectLoopReports(ModuleOp module, const TripCountOptions &options,
+                   const llvm::DenseMap<Operation *, int64_t> &branchDivisors) {
+  llvm::SmallVector<LoopReport> reports;
+  module.walk([&](scf::ForOp forOp) {
+    LoopReport report;
+    report.loop = forOp.getOperation();
+
+    const ResolvedTripCount resolved = resolveLoopTripCount(forOp, options);
+    report.tripCount = resolved.count;
+    report.source = resolved.source;
+    report.rewrittenTripCount = resolved.rewrittenCount;
+
+    // The loop's own position: enclosing loops multiply, enclosing branches
+    // divide. getLoopWeight looks at parents only, which is what is wanted
+    // here -- this loop's own trip count is applied on top.
+    const LoopWeight enclosing =
+        getLoopWeight(forOp.getOperation(), options, branchDivisors);
+    report.bodyMultiplier = enclosing.multiplier * resolved.count;
+    report.branchDivisor = enclosing.branchDivisor;
+
+    for (Operation *parent = forOp->getParentOp(); parent;
+         parent = parent->getParentOp()) {
+      if (isa<scf::ForOp>(parent)) {
+        ++report.depth;
+      }
+    }
+    reports.push_back(report);
+  });
+  return reports;
 }
 
 /// Canonical name for a launch-grid binding. Accepts the spellings the
@@ -1655,10 +1790,11 @@ struct CostBreakdown {
 // block B's compute whenever they need different pipes.
 //
 // An earlier version instead gave each core a single availability slot, so a
-// block occupied its whole core for its whole duration. That charged ordinary
-// pipe overlap as serial time and came out about 30% above measurement, with
-// the error growing as buffering shrank -- the pessimism landed hardest on the
-// configuration that had the least overlap to give away.
+// block occupied its whole core for its whole duration. That charges ordinary
+// pipe overlap as serial time, and the error is not a constant factor: it grows
+// as buffering shrinks, because the pessimism lands hardest on the
+// configuration with the least overlap to give away. A model whose error
+// depends on the configuration cannot rank configurations.
 //
 // Note what this means for the two terms of the estimate. The resource bound is
 // now partition-invariant: per-pipe busy time does not care how operations were
@@ -1862,8 +1998,7 @@ topologicalBlockOrder(const CostBreakdown &breakdown) {
 /// before starting the next: the issue queue moves on while a pipe drains, so
 /// block B+1's loads run underneath block B's compute whenever they need
 /// different pipes. Treating a block as occupying its whole core -- which is
-/// what an earlier version did -- charged that overlap as serial time and
-/// inflated the estimate by about 30% against measurement.
+/// what an earlier version did -- charges that overlap as serial time.
 ///
 /// So each pipe carries its own availability. A block's segments are still
 /// serial with respect to each other, because a barrier inside a block really
@@ -2043,9 +2178,19 @@ bool edgeCrossesCores(const BlockStats &producer, const BlockStats &consumer) {
 /// buffer, not for the far end of the chain. Treating the chain as one buffer
 /// would charge the alternation several times over.
 ///
-/// Occupancy is read off the loop-weighted schedule, so it already includes
-/// any unrelated work the two cores do in between -- the buffer really is held
-/// across that too -- and it is already scaled by the iteration count.
+/// Occupancy is read off the schedule of a **single iteration**, and the result
+/// is therefore a lower bound on the initiation interval, not a whole-module
+/// figure: the caller scales it.
+///
+/// Measuring it on the loop-weighted schedule instead, as an earlier version
+/// did, is wrong in a way that is easy to miss. There each block occupies its
+/// entire N-iteration duration before the next one starts, so the span from a
+/// producer's start to its consumer's finish covers most of the kernel. That is
+/// not a buffer's lifetime -- a buffer is held for one iteration's worth of
+/// producer-to-consumer span and then reused. Measuring it that way makes the
+/// bound grow with the trip count, so it eventually beats the resource bound on
+/// any long enough loop and the model starts crediting extra buffers with gains
+/// the hardware cannot deliver.
 ///
 /// Every kind of dependency counts: Cube to Vector, Cube to Cube, Vector to
 /// Vector. Only the depth differs, since crossing cores goes through an
@@ -2053,9 +2198,9 @@ bool edgeCrossesCores(const BlockStats &producer, const BlockStats &consumer) {
 struct BufferRecurrence {
   int64_t producer = kNoBlockId;
   int64_t consumer = kNoBlockId;
-  int64_t occupancy = 0; ///< how long the buffer is held, loop-weighted
+  int64_t occupancy = 0; ///< how long the buffer is held, for one iteration
   int64_t depth = 1;
-  int64_t bound = 0; ///< occupancy / depth
+  int64_t bound = 0; ///< occupancy / depth: the recurrence-constrained II
   bool crossesCores = false;
 };
 
@@ -2175,9 +2320,18 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
       estimate.iterationSchedule, estimate.iterationBusy);
   estimate.initiationInterval = combineRoofline(estimate.iterationBusy, config);
 
+  // Measured on one iteration, so the result is a lower bound on the
+  // initiation interval. Scaling it by throughputBound/II puts it in the same
+  // units as the resource bound without needing a single global iteration
+  // count -- that ratio *is* the iteration count, expressed through the two
+  // numbers already computed.
   estimate.recurrence = tightestBufferRecurrence(
-      breakdown, estimate.weightedSchedule, buffers);
-  estimate.recurrenceBound = estimate.recurrence.bound;
+      breakdown, estimate.iterationSchedule, buffers);
+  estimate.recurrenceBound =
+      estimate.initiationInterval > 0
+          ? estimate.throughputBound * estimate.recurrence.bound /
+                estimate.initiationInterval
+          : 0;
   estimate.total =
       std::max(estimate.throughputBound, estimate.recurrenceBound);
   return estimate;
@@ -2413,13 +2567,17 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
     os << "[" << DEBUG_TYPE << "]         tightest buffer: block "
        << describeBlockId(tight.producer) << " -> "
        << describeBlockId(tight.consumer) << ", held " << tight.occupancy
-       << " cycles, " << (tight.crossesCores ? "inter-core" : "intra-core")
-       << " depth " << tight.depth;
-    if (tight.depth == 1) {
-      os << " -- a single buffer, so the next iteration cannot start writing"
-            " it until this one is done reading";
-    }
-    os << "\n";
+       << " cycles per iteration, "
+       << (tight.crossesCores ? "inter-core" : "intra-core") << " depth "
+       << tight.depth << " -> " << tight.bound << " cycles per iteration\n";
+    // The comparison that decides everything: a buffer that turns over faster
+    // than the busiest pipe is not what limits the kernel, however few copies
+    // of it there are.
+    os << "[" << DEBUG_TYPE << "]         against an initiation interval of "
+       << estimate.initiationInterval << " cycles, so the buffer is "
+       << (tight.bound > estimate.initiationInterval ? "the constraint"
+                                                     : "not the constraint")
+       << "\n";
   }
   line("  every dependency serialised, no overlap", estimate.serialisedBound);
   line("TOTAL", estimate.total);
@@ -2479,6 +2637,49 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
        << " to enable)";
   }
   os << "\n";
+}
+
+/// Every loop, its trip count, and where that number came from.
+///
+/// The multiplier column is the one to read when two runs of the same kernel
+/// disagree by a suspiciously round factor: it is what every operation in that
+/// loop's body is scaled by, so an error here moves the whole estimate without
+/// showing up anywhere else in the report.
+void printLoops(llvm::raw_ostream &os,
+                llvm::ArrayRef<LoopReport> loops) {
+  if (loops.empty()) {
+    return;
+  }
+
+  os << "[" << DEBUG_TYPE
+     << "] loops, and what each multiplies its body by. 'trip' is how many"
+        " times this loop's body does its work, 'body x' includes the loops"
+        " around it; 'source' is how the count was obtained -- static means the"
+        " IR said so, bindings means an argument value supplied by the caller"
+        " resolved it, assumed means nothing did and the default was used."
+        " 'ir bound' appears when pipelining extended the loop past that, the"
+        " extra iterations being prologue and epilogue with most stages"
+        " switched off:\n";
+  os << "[" << DEBUG_TYPE
+     << "]    depth        trip    ir bound  source       body x  location\n";
+
+  for (const LoopReport &loop : loops) {
+    os << "[" << DEBUG_TYPE << "] "
+       << llvm::format("%8lld", static_cast<long long>(loop.depth))
+       << llvm::format("%12lld", static_cast<long long>(loop.tripCount));
+    if (loop.rewrittenTripCount > 0) {
+      os << llvm::format("%12lld",
+                         static_cast<long long>(loop.rewrittenTripCount));
+    } else {
+      os << llvm::right_justify("-", 12);
+    }
+    os << "  " << llvm::left_justify(stringifyTripCountSource(loop.source), 11)
+       << llvm::format("%11lld", static_cast<long long>(loop.bodyMultiplier));
+    if (loop.branchDivisor > 1) {
+      os << " /" << loop.branchDivisor;
+    }
+    os << "  " << loop.loop->getLoc() << "\n";
+  }
 }
 
 void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
@@ -2603,6 +2804,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // single operation.
   const llvm::DenseMap<Operation *, int64_t> branchDivisors =
       computeBranchDivisors(module, *config);
+  const llvm::SmallVector<LoopReport> loopReports =
+      collectLoopReports(module, tripCountOptions, branchDivisors);
 
   llvm::DenseMap<HWUnit, int64_t> unitCycles;
   CostBreakdown breakdown;
@@ -2749,6 +2952,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
   auto reportDetail = [&](llvm::raw_ostream &os) {
     printEstimate(os, estimate, fusion, *config, breakdown.branchedOps);
+    printLoops(os, loopReports);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);
   };

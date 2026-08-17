@@ -71,6 +71,15 @@ inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
 /// downstream read this instead of re-deriving the graph from SSA.
 inline constexpr llvm::StringLiteral kBlockDeps = "ssbuffer.blockDeps";
 inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
+/// How UpdateLoopIterTimes extended a pipelined loop, as [requiredBuffers, x,
+/// ifCount]. The rewritten bound counts
+///     ceildiv(originalIterations * requiredBuffers, x) + ifCount
+/// iterations, the extra ones being prologue and epilogue in which most stages
+/// are predicated off. Anything downstream that wants to know how many times a
+/// stage really runs has to undo that, and cannot without these three numbers:
+/// the rewritten bound alone looks like an ordinary trip count.
+inline constexpr llvm::StringLiteral kIterExtension =
+    "ssbuffer.iter_extension";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
