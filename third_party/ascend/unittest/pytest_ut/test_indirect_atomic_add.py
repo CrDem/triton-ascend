@@ -29,6 +29,7 @@
 #  | partial structured: high-dim disc + low-dim cont|  -   | (B2) | (B3) | (B4) | (B5) |
 #  | fully unstructured indirect offsets             | (C1) | (C2) | (C3) | (C4) | (C5) |
 #  | loaded mask + masked-off out-of-bounds offsets   | (D1) |  -   |  -   |  -   |  -   |
+#  | scalar-splat mask shared by load and atomic      | (E1) |  -   |  -   |  -   |  -   |
 #
 # Notes:
 # 1. Case A exercises the structured-pointer discrete-mask atomic_add path.
@@ -36,7 +37,9 @@
 #    remaining lower dimensions kept contiguous.
 # 3. Case C exercises fully unstructured indirect offsets.
 # 4. Case D verifies that a loaded discrete mask guards loaded invalid offsets.
-# 5. All cases validate both the final destination tensor and the atomic_add
+# 5. Case E verifies that a scalar-splat mask shared by an indirect load and
+#    atomic_add still guards inactive programs.
+# 6. Cases A-D validate both the final destination tensor and the atomic_add
 #    return value, which must be the old value observed at each access.
 # =============================================================================
 
@@ -110,6 +113,20 @@ def loaded_mask_oob_offset_atomic_add_1d(
     value = tl.load(val_ptr + linear)
     old = tl.atomic_add(out_ptr + offset, value, mask=mask)
     tl.store(old_ptr + linear, old, mask=mask)
+
+
+@triton.jit(do_not_specialize=["numel"])
+def scalar_splat_mask_atomic_add_1d(
+    topk_ids_ptr,
+    tokens_cnts_ptr,
+    numel,
+    TOKENS_PER_THREAD: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * TOKENS_PER_THREAD + tl.arange(0, TOKENS_PER_THREAD)
+    mask = offsets < numel
+    expert_id = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
+    tl.atomic_add(tokens_cnts_ptr + expert_id, 1, mask=mask)
 
 
 @triton.jit
@@ -589,3 +606,29 @@ def test_atomic_add_loaded_mask_skips_oob_offsets():
     )
     _assert_equal(output, expected_output, "int32", 1, "loaded-mask-oob-offset/output")
     _assert_equal(old, expected_old, "int32", 1, "loaded-mask-oob-offset/old")
+
+
+def test_atomic_add_scalar_splat_mask_skips_inactive_programs():
+    numel = 3
+    grid_size = 8
+    tokens_per_thread = 1
+    sentinel_expert = 3
+
+    # The inactive programs point to a valid sentinel bucket so the regression
+    # is detected deterministically without deliberately triggering an MTE OOB.
+    topk_ids = torch.tensor(
+        [0, 1, 2] + [sentinel_expert] * (grid_size - numel),
+        dtype=torch.int64,
+    ).npu()
+    tokens_cnts = torch.zeros(sentinel_expert + 1, dtype=torch.int32).npu()
+
+    scalar_splat_mask_atomic_add_1d[(grid_size, )](
+        topk_ids,
+        tokens_cnts,
+        numel,
+        TOKENS_PER_THREAD=tokens_per_thread,
+    )
+    torch.npu.synchronize()
+
+    expected = torch.tensor([1, 1, 1, 0], dtype=torch.int32)
+    assert torch.equal(tokens_cnts.cpu(), expected)

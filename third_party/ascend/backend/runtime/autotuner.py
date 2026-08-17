@@ -222,6 +222,7 @@ class AutoTilingTuner(Autotuner):
         rep=None,
         use_cuda_graph=False,
         do_bench=None,
+        cache_results=False,
         auto_profile_dir=None,
         hints=None,
     ):
@@ -251,6 +252,7 @@ class AutoTilingTuner(Autotuner):
             rep,
             use_cuda_graph,
             do_bench,
+            cache_results=cache_results,
         )
         self.user_defined_do_bench = do_bench is not None
         self.hints = reserved_hints
@@ -2020,7 +2022,27 @@ class AutoTilingTuner(Autotuner):
                 self.configs = self.gen_configs + expanded_user_configs
         return key
 
+    @staticmethod
+    def _inject_grid_num_tiles(kwargs):
+        # ChunkCoalescing hint: when the launch grid is a static tuple, the
+        # outermost grid dim is the tile count along the chunk axis. Exposing it
+        # as grid_num_tiles lets the compiler safely coalesce small chunks for
+        # unmasked kernels (compile-time known bound). Skipped for callable grids
+        # (dynamic, unknown at compile time) so the pass safely bails.
+        if "grid_num_tiles" in kwargs:
+            return
+        grid = kwargs.get("grid", None)
+        if callable(grid) or not isinstance(grid, (tuple, list)):
+            return
+        glen = min(len(grid), 3)
+        if glen <= 0:
+            return
+        outermost = grid[glen - 1]
+        if isinstance(outermost, int) and outermost > 1:
+            kwargs["grid_num_tiles"] = outermost
+
     def run(self, *args, **kwargs):
+        self._inject_grid_num_tiles(kwargs)
         key = self.generate_key_and_configs(*args, **kwargs)
         cache_miss = key not in self.cache
         if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
@@ -2030,15 +2052,35 @@ class AutoTilingTuner(Autotuner):
             # prune configs
             pruned_configs = self.prune_configs(kwargs)
             if self.enable_ubtuner or len(pruned_configs) > 1:
-                used_cached_result = False
-                bench_start = time.time()
-                timings = self._batch_bench(*args, configs=pruned_configs, **kwargs)
-                bench_end = time.time()
-                self.bench_time = bench_end - bench_start
-                self.cache[key] = builtins.min(timings, key=timings.get)
-                full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
-                self.pre_hook(full_nargs, reset_only=True)
-                self.configs_timings = timings
+
+                def benchmark():
+                    nonlocal used_cached_result
+                    used_cached_result = False
+                    bench_start = time.time()
+                    timings = self._batch_bench(*args, configs=pruned_configs, **kwargs)
+                    bench_end = time.time()
+                    self.bench_time = bench_end - bench_start
+                    self.cache[key] = builtins.min(timings, key=timings.get)
+                    full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
+                    self.pre_hook(full_nargs, reset_only=True)
+                    self.configs_timings = timings
+
+                if self.cache_results:
+                    if self.enable_ubtuner:
+                        warnings.warn(
+                            "Autotune disk cache is disabled because UB-tuner is enabled "
+                            "(TRITON_ENABLE_UBTUNER is set). UB-tuner may dynamically add "
+                            "compile-time fixes to configs that cannot be safely cached to disk. "
+                            "To enable disk caching, unset TRITON_ENABLE_UBTUNER.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        benchmark()
+                    else:
+                        used_cached_result = self.check_disk_cache(key, pruned_configs, benchmark)
+                else:
+                    benchmark()
+
                 config = self.cache[key]
             else:
                 config = pruned_configs[0]
@@ -2489,7 +2531,8 @@ class AutoTilingTuner(Autotuner):
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_value=None, pre_hook=None, post_hook=None,
-             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, *, auto_prof_dir=None, hints=None):
+             warmup=None, rep=None, use_cuda_graph=False, do_bench=None, cache_results=False, *, auto_prof_dir=None,
+             hints=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
 
@@ -2543,6 +2586,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     :type rep: int
     :param do_bench: a benchmark function to measure the time of each run.
     :type do_bench: lambda fn, quantiles
+    :param cache_results: whether to cache autotune timings to disk.  Defaults to False.
+    :type cache_results: bool
     :param auto_prof_dir: the specified directory to store the profiling results of the best config.
         If this parameter is None or the best config is retrieved from cache, the profiling process will be ignored.
     :type auto_prof_dir: str
@@ -2552,8 +2597,8 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, restore_va
     def decorator(fn):
         return AutoTilingTuner(fn, fn.arg_names, configs, key, reset_to_zero, restore_value, pre_hook=pre_hook,
                                post_hook=post_hook, prune_configs_by=prune_configs_by, warmup=warmup, rep=rep,
-                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, auto_profile_dir=auto_prof_dir,
-                               hints=hints)
+                               use_cuda_graph=use_cuda_graph, do_bench=do_bench, cache_results=cache_results,
+                               auto_profile_dir=auto_prof_dir, hints=hints)
 
     return decorator
 

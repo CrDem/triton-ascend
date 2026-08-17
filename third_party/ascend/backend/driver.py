@@ -416,6 +416,7 @@ def generate_npu_header_src():
 #define TRITON_NPU_HEADERS
 #include <assert.h>
 #include <stdbool.h>
+#include <cstdlib>
 #include <string>
 #include <memory>
 #include <sys/syscall.h>
@@ -686,6 +687,13 @@ def make_launcher(constants, signature, metadata):
     npu_utils_inst = NPUUtils()
     npu_utils_mod = getattr(npu_utils_inst, "npu_utils_mod", None)
     npu_utils_so_path = getattr(npu_utils_mod, "__file__", "")
+    # The generated launcher source is part of its cache key. Preserve only the
+    # deterministic cache-key directory so the launcher can be reused after the
+    # cache root changes.
+    npu_utils_cache_relative = os.path.join(
+        os.path.basename(os.path.dirname(npu_utils_so_path)),
+        os.path.basename(npu_utils_so_path),
+    )
     cpp_npu_utils_dlopen = f"""
 typedef void* (*triton_allocate_workspace_t)(uint64_t, void**);
 typedef void* (*triton_allocate_sync_block_lock_t)(uint64_t, void*, void**);
@@ -706,10 +714,23 @@ static bool npu_utils_ready() {{
 
 static void init_npu_utils() {{
     if (npu_utils_ready()) return;
-    const char* so_path = "{npu_utils_so_path}";
-    void* handle = dlopen(so_path, RTLD_LAZY);
+    const char* cache_root = std::getenv("TRITON_CACHE_DIR");
+    std::string npu_utils_path;
+    if (cache_root && cache_root[0] != '\\0') {{
+        npu_utils_path = std::string(cache_root) + "/{npu_utils_cache_relative}";
+    }} else {{
+        const char* triton_home = std::getenv("TRITON_HOME");
+        const char* home = std::getenv("HOME");
+        const char* base = triton_home && triton_home[0] != '\\0' ? triton_home : home;
+        if (!base || base[0] == '\\0') {{
+            fprintf(stderr, "Error: neither TRITON_CACHE_DIR nor TRITON_HOME/HOME is set\\n");
+            return;
+        }}
+        npu_utils_path = std::string(base) + "/.triton/cache/{npu_utils_cache_relative}";
+    }}
+    void* handle = dlopen(npu_utils_path.c_str(), RTLD_LAZY);
     if (!handle) {{
-        fprintf(stderr, "Error: dlopen %s failed: %s\\n", so_path, dlerror());
+        fprintf(stderr, "Error: dlopen %s failed: %s\\n", npu_utils_path.c_str(), dlerror());
         return;
     }}
     g_allocate_workspace = (triton_allocate_workspace_t)dlsym(handle, "triton_allocate_workspace");
@@ -732,15 +753,21 @@ static void release_npu_tensor_handle(void* handle) {{
     # and the program-id/grid axis it applies to. Each program now covers H tiles
     # along that axis, so the host shrinks the matching grid dim by H here (the
     # equivalent of what bishengir AutoBlockify used to do via hacc.coalesce_factor;
-    # bishengir no longer touches it). The division is unconditional and mirrors the
-    # old integer division -- the kernel rewrite assumes grid[axis] % H == 0.
+    # bishengir no longer touches it). RowCoalescing can request ceil-div because
+    # its generated row mask handles tail rows.
     coalesce_factor = int(getattr(metadata, "coalesce_factor", 1) or 1)
     coalesce_axis = int(getattr(metadata, "coalesce_axis", -1))
+    coalesce_grid_ceil_div = bool(getattr(metadata, "coalesce_grid_ceil_div", False))
     if coalesce_factor > 1 and coalesce_axis in (0, 1, 2):
         _coalesce_grid_var = {0: "gridX", 1: "gridY", 2: "gridZ"}[coalesce_axis]
-        coalesce_grid_div = (f"// coalescing: each program covers {coalesce_factor} tiles along "
-                             f"axis {coalesce_axis}; shrink that grid dim.\n"
-                             f"  {_coalesce_grid_var} = {_coalesce_grid_var} / {coalesce_factor};")
+        _coalesce_grid_expr = (f"({_coalesce_grid_var} + {coalesce_factor} - 1) / {coalesce_factor}"
+                               if coalesce_grid_ceil_div else f"{_coalesce_grid_var} / {coalesce_factor}")
+        coalesce_grid_div = (
+            f"// coalescing: each program covers {coalesce_factor} tiles along "
+            f"axis {coalesce_axis}; shrink that grid dim.\n" +
+            ("" if coalesce_grid_ceil_div else f"  assert({_coalesce_grid_var} % {coalesce_factor} == 0 && "
+             f"\"ChunkCoalescing: grid[{coalesce_axis}] not divisible by coalesce_factor {coalesce_factor}\");\n") +
+            f"  {_coalesce_grid_var} = {_coalesce_grid_expr};")
     else:
         coalesce_grid_div = ""
 
@@ -900,9 +927,11 @@ extern "C" {
       int dataTypes[MSPROF_GE_TENSOR_DATA_NUM];
       if (tensorShapes.size() > 0) {{
         {LINE_CHANGE_CHAR.join(
-          f'dataTypes[{i}] = {convert_sigtype_to_int(ty[1:])};'
-          for i, ty in signature.items()
-          if ty.startswith("*") and i < 5
+          f'dataTypes[{idx}] = {convert_sigtype_to_int(ty[1:])};'
+          for idx, (_, ty) in enumerate(
+            (k, v) for k, v in signature.items() if v.startswith("*")
+          )
+          if idx < 5
         )}
       }}
       for (int i = 0; i < tensorShapes.size() && tensorCount < MSPROF_GE_TENSOR_DATA_NUM; i++) {{

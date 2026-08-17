@@ -232,3 +232,51 @@ tt.func @atomic_add_cont_disc_i32(%arg0: !tt.ptr<i32>, %arg1: i32) {
   %16 = tt.atomic_rmw add, acq_rel, gpu, %15, %cst_3, %9 : (tensor<8x8x!tt.ptr<i32>>, tensor<8x8xi32>, tensor<8x8xi1>) -> tensor<8x8xi32>
   tt.return
 }
+
+// -----
+
+// CHECK-LABEL: tt.func @atomic_min_f32_splat_bitcast
+// CHECK: %[[VALUE_PTR:.*]] = tt.addptr %arg0, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: %[[VALUE_PTRS:.*]] = tt.splat %[[VALUE_PTR]] : !tt.ptr<f32> -> tensor<1x1x1x1x!tt.ptr<f32>>
+// CHECK: %[[VALUE:.*]] = tt.load %[[VALUE_PTRS]] : tensor<1x1x1x1x!tt.ptr<f32>>
+// CHECK: %[[OUTPUT_PTR:.*]] = tt.addptr %arg1, %{{.*}} : !tt.ptr<f32>, i32
+// CHECK: %[[OUTPUT_PTRS:.*]] = tt.splat %[[OUTPUT_PTR]] : !tt.ptr<f32> -> tensor<1x1x1x1x!tt.ptr<f32>>
+// CHECK: tt.atomic_rmw min, acq_rel, gpu, %[[OUTPUT_PTRS]], %[[VALUE]], %{{.*}} : (tensor<1x1x1x1x!tt.ptr<f32>>, tensor<1x1x1x1xf32>, tensor<1x1x1x1xi1>) -> tensor<1x1x1x1xf32>
+// CHECK-NOT: tt.atomic_rmw umax
+tt.func @atomic_min_f32_splat_bitcast(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+  %c0_i32 = arith.constant 0 : i32
+  %cst = arith.constant dense<0> : tensor<1x1x1x1xi32>
+  %cst_0 = arith.constant dense<31> : tensor<1x1x1x1xi32>
+  %cst_1 = arith.constant dense<true> : tensor<1x1x1x1xi1>
+  %0 = tt.addptr %arg0, %c0_i32 : !tt.ptr<f32>, i32
+  %1 = tt.splat %0 : !tt.ptr<f32> -> tensor<1x1x1x1x!tt.ptr<f32>>
+  %2 = tt.load %1 : tensor<1x1x1x1x!tt.ptr<f32>>
+  %3 = tt.addptr %arg1, %c0_i32 : !tt.ptr<f32>, i32
+  %4 = tt.bitcast %2 : tensor<1x1x1x1xf32> -> tensor<1x1x1x1xi32>
+  %5 = tt.bitcast %3 : !tt.ptr<f32> -> !tt.ptr<i32>
+  %6 = tt.splat %5 : !tt.ptr<i32> -> tensor<1x1x1x1x!tt.ptr<i32>>
+  %7 = arith.shrui %4, %cst_0 : tensor<1x1x1x1xi32>
+  %8 = arith.cmpi ne, %7, %cst : tensor<1x1x1x1xi32>
+  %9 = arith.xori %8, %cst_1 : tensor<1x1x1x1xi1>
+  %10 = tt.atomic_rmw min, acq_rel, gpu, %6, %4, %9 : (tensor<1x1x1x1x!tt.ptr<i32>>, tensor<1x1x1x1xi32>, tensor<1x1x1x1xi1>) -> tensor<1x1x1x1xi32>
+  %11 = tt.atomic_rmw umax, acq_rel, gpu, %6, %4, %8 : (tensor<1x1x1x1x!tt.ptr<i32>>, tensor<1x1x1x1xi32>, tensor<1x1x1x1xi1>) -> tensor<1x1x1x1xi32>
+  tt.return
+}
+
+// -----
+
+// CHECK-LABEL: tt.func @atomic_max_f32_scalar
+// CHECK: tt.atomic_rmw max, acq_rel, gpu, %arg1, %arg0, %{{.*}} : (!tt.ptr<f32>, f32, i1) -> f32
+// CHECK-NOT: tt.atomic_rmw umin
+tt.func @atomic_max_f32_scalar(%arg0: f32, %arg1: !tt.ptr<f32>) {
+  %c31_i32 = arith.constant 31 : i32
+  %c0_i32 = arith.constant 0 : i32
+  %0 = tt.bitcast %arg0 : f32 -> i32
+  %1 = tt.bitcast %arg1 : !tt.ptr<f32> -> !tt.ptr<i32>
+  %2 = arith.shrui %0, %c31_i32 : i32
+  %3 = arith.cmpi eq, %2, %c0_i32 : i32
+  %4 = arith.cmpi ne, %2, %c0_i32 : i32
+  %5 = tt.atomic_rmw max, acq_rel, gpu, %1, %0, %3 : (!tt.ptr<i32>, i32, i1) -> i32
+  %6 = tt.atomic_rmw umin, acq_rel, gpu, %1, %0, %4 : (!tt.ptr<i32>, i32, i1) -> i32
+  tt.return
+}

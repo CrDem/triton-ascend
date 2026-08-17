@@ -222,7 +222,7 @@ void UBUsageOptPass::buildUBUsageGraph(
   };
 
   Operation *terminator = block->getTerminator();
-  if (terminator) {
+  if (terminator && isa<scf::YieldOp>(terminator)) {
     unsigned maxArgIdx = std::min<unsigned>(block->getNumArguments(),
                                             terminator->getNumOperands());
     for (unsigned argIdx = 0; argIdx < maxArgIdx; ++argIdx) {
@@ -254,7 +254,8 @@ void UBUsageOptPass::buildUBUsageGraph(
             continue;
           }
         } else if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
-          if (blockArg.getOwner() == block && terminator) {
+          if (blockArg.getOwner() == block && terminator &&
+              isa<scf::YieldOp>(terminator)) {
             unsigned numArgs = block->getNumArguments();
             unsigned numYieldOperands = terminator->getNumOperands();
             // for op offset=1, while op offset=0
@@ -740,7 +741,8 @@ bool applyRecordChange(DenseMap<int, int> &recordChange,
 llvm::LogicalResult UBUsageOptPass::UBUsageOptimization(
     Block *block, const CVPipeline::MemoryDependenceGraph &memGraph,
     CVPipeline::ComputeBlockIdManager &bm) {
-  if (!isa<scf::ForOp>(block->getParentOp())) {
+  if (!(isa<scf::ForOp>(block->getParentOp()) ||
+        isa<scf::WhileOp>(block->getParentOp()))) {
     return llvm::success();
   }
   DenseMap<Operation *, int> op2nodeId;

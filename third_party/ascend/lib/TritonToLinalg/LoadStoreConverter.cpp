@@ -1138,14 +1138,32 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
                                            PatternRewriter &rewriter) const {
   // Revert the op to its original form
   auto ptrBitcastOp = op.getPtr().getDefiningOp<triton::BitcastOp>();
+  triton::SplatOp ptrSplatOp;
+  if (!ptrBitcastOp) {
+    // For tensor atomics on a scalar base pointer, semantic.py emits
+    //   splat(bitcast(ptr<f32> -> ptr<i32>))
+    // instead of
+    //   bitcast(tensor<ptr<f32>> -> tensor<ptr<i32>>).
+    // Accept both forms so the expanded integer atomics can be fused before
+    // discrete-mask conversion.
+    ptrSplatOp = op.getPtr().getDefiningOp<triton::SplatOp>();
+    if (ptrSplatOp)
+      ptrBitcastOp = ptrSplatOp.getSrc().getDefiningOp<triton::BitcastOp>();
+  }
   auto valueBitcastOp = op.getVal().getDefiningOp<triton::BitcastOp>();
   if (!ptrBitcastOp || !valueBitcastOp) {
     return failure();
   }
 
+  auto eraseDeadPointerCasts = [&]() {
+    if (ptrSplatOp && ptrSplatOp->use_empty())
+      rewriter.eraseOp(ptrSplatOp);
+    if (ptrBitcastOp->use_empty())
+      rewriter.eraseOp(ptrBitcastOp);
+  };
+
   // We only need to handle the op when the element type is float
-  auto elementType =
-      dyn_cast<TensorType>(valueBitcastOp.getSrc().getType()).getElementType();
+  auto elementType = getElementTypeOrSelf(valueBitcastOp.getSrc().getType());
   if (!isa<FloatType>(elementType)) {
     return failure();
   }
@@ -1158,8 +1176,7 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
     // if the return value of op is used, we can't simply erase it
     if (op.getResult().use_empty()) {
       rewriter.eraseOp(op);
-      if (ptrBitcastOp->use_empty())
-        rewriter.eraseOp(ptrBitcastOp);
+      eraseDeadPointerCasts();
       return success();
     }
     return failure();
@@ -1178,6 +1195,19 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
   //
   // Here wanna extract original mask
   Value originalMask = op.getMask();
+  auto createAllTrueMask = [&]() -> Value {
+    Type maskType = op.getMask().getType();
+    if (auto shapedMaskType = dyn_cast<ShapedType>(maskType)) {
+      return rewriter.create<arith::ConstantOp>(
+          op->getLoc(), DenseElementsAttr::get(shapedMaskType, true));
+    }
+    if (maskType.isInteger(1)) {
+      return rewriter.create<arith::ConstantOp>(op->getLoc(),
+                                                rewriter.getBoolAttr(true));
+    }
+    return {};
+  };
+
   if (auto andOp = originalMask.getDefiningOp<arith::AndIOp>())
     // LHS is convention in semantic interpreter
     originalMask = andOp.getLhs();
@@ -1200,9 +1230,23 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
       return op->emitError("Illegal mask for atomicrmwOp of float type");
 
     // Restore the implicit all-true mask.
-    originalMask = rewriter.create<arith::ConstantOp>(
-        op->getLoc(),
-        DenseElementsAttr::get(cast<ShapedType>(op.getMask().getType()), true));
+    originalMask = createAllTrueMask();
+    if (!originalMask)
+      return failure();
+  } else if (auto cmpOp = originalMask.getDefiningOp<arith::CmpIOp>()) {
+    // Scalar floating-point atomic max/min represents !signbit as:
+    //   shrui(value_bits, 31/63) -> cmpi eq 0.
+    if (cmpOp.getPredicate() != arith::CmpIPredicate::eq ||
+        !matchPattern(cmpOp.getRhs(), m_Zero()))
+      return failure();
+
+    auto shiftOp = cmpOp.getLhs().getDefiningOp<arith::ShRUIOp>();
+    if (!shiftOp || shiftOp.getLhs() != valueBitcastOp.getResult())
+      return failure();
+
+    originalMask = createAllTrueMask();
+    if (!originalMask)
+      return failure();
   } else if (auto cmpOp = originalMask.getDefiningOp<arith::CmpFOp>()) {
     if (cmpOp.getPredicate() != mlir::arith::CmpFPredicate::OGE ||
         !matchPattern(cmpOp.getRhs(),
@@ -1210,16 +1254,27 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
       // Here recheck frontend interpreter generation in no manual mask state
       return op->emitError("Illegal mask for atomicrmwOp of float type");
     // Restore original true mask
-    originalMask = rewriter.create<arith::ConstantOp>(
-        op->getLoc(),
-        /*typed attr*/ DenseElementsAttr::get(
-            cast<ShapedType>(originalMask.getType()), true));
+    originalMask = createAllTrueMask();
+    if (!originalMask)
+      return failure();
   } else
     return op->emitError("Illegal mask for atomicrmwOp of float type");
 
+  Value originalPtr = ptrBitcastOp.getSrc();
+  if (ptrSplatOp) {
+    auto ptrTensorType = dyn_cast<RankedTensorType>(op.getPtr().getType());
+    if (!ptrTensorType)
+      return failure();
+    auto originalPtrType = RankedTensorType::get(
+        ptrTensorType.getShape(), ptrBitcastOp.getSrc().getType(),
+        ptrTensorType.getEncoding());
+    originalPtr = rewriter.create<triton::SplatOp>(op.getLoc(), originalPtrType,
+                                                   ptrBitcastOp.getSrc());
+  }
+
   auto originAtomicOp = rewriter.create<triton::AtomicRMWOp>(
       op.getLoc(), valueBitcastOp.getSrc().getType(), op.getAtomicRmwOp(),
-      ptrBitcastOp.getSrc(), valueBitcastOp.getSrc(), originalMask, op.getSem(),
+      originalPtr, valueBitcastOp.getSrc(), originalMask, op.getSem(),
       op.getScope());
 
   // if the return value of op is used
@@ -1259,10 +1314,9 @@ AtomicMaxMinCanonicalizer::matchAndRewrite(triton::AtomicRMWOp op,
     rewriter.eraseOp(op);
   }
 
-  // The restored atomic uses ptrBitcastOp.getSrc(), i.e. the original GM
-  // pointer. Remove the pointer bitcast once the paired integer atomic is gone.
-  if (ptrBitcastOp->use_empty())
-    rewriter.eraseOp(ptrBitcastOp);
+  // The restored atomic uses the original floating-point GM pointer. Remove
+  // the expanded pointer splat/bitcast once the paired integer atomic is gone.
+  eraseDeadPointerCasts();
 
   return success();
 }
