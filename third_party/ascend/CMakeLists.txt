@@ -119,7 +119,6 @@ if(TRITON_BUILD_DISTRIBUTED)
   endif()
 endif()
 
-
 add_triton_plugin(TritonAscend
   ${CMAKE_CURRENT_SOURCE_DIR}/triton_ascend.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/ascend_ir.cc

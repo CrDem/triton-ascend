@@ -373,19 +373,26 @@ through the graph.
 
 ### The schedule itself
 
-ASAP with two resources, the Cube core and the Vector core. A block starts at
-the later of: its own core becoming free, and the finish of every dependency
-already scheduled.
+ASAP at the granularity of a single hardware pipe. Each pipe has its own
+availability; pipes that share physical hardware share one slot, decided by the
+profile's mutex cliques (`getPipeResource`). A block's segments remain serial
+with respect to each other, because a barrier inside a block really does stop
+the core, but a block does **not** occupy its whole core: block B+1's loads run
+underneath block B's compute whenever they need different pipes, which is how
+the issue queue actually behaves.
 
-**Assumption worth revisiting first:** consecutive blocks on the same core do
-not pipeline into each other. Within a block the units overlap as before, but
-block B+1's loads are not allowed to start under block B's compute even when no
-barrier separates them. Real hardware does overlap them — the issue queue moves
-on while a pipe drains — so this is pessimistic, and it is why the estimate
-exceeds the plain roofline, which is still reported next to it. It is modelled
-this way because the block is the unit the pipeline reasons about, and because a
-model that lets everything overlap is exactly the one that cannot tell two block
-partitions apart.
+An earlier version gave each core a single availability slot, so a block held
+its entire core for its entire duration. That charges ordinary pipe overlap as
+serial time. The damaging part for a ranking model is not the size of the error
+but its shape: it grows as buffering shrinks, because the pessimism lands
+hardest on the configuration with the least overlap to give away, so the model
+mis-orders the very configurations it exists to compare.
+
+One consequence is worth stating plainly: the resource bound is now
+**partition-invariant**. Per-pipe busy time does not depend on how operations
+were grouped into blocks, which is physically right. Sensitivity to the
+partition lives in the schedule, and through it in the recurrence bound — also
+right, since grouping changes where the barriers fall, not how much work exists.
 
 ### Synchronisation operations are charged zero cycles — on purpose
 
@@ -421,14 +428,27 @@ validation kernel `resource` was the Cube number while `II` was the Vector one.
 
 Each transfer has **its own** buffers. Iteration i+1 of a producer waits for
 *its* consumer to release *its* buffer, not for the far end of the chain.
-Charging the whole chain against a single buffer over-counts the alternation
-several times over: on the validation kernel the chain reading came out at
-1.5 G cycles, essentially the fully serialised bound, because it summed four
-blocks that are gated by three independent buffers.
+Charging a whole chain against a single buffer counts the same alternation once
+per link, so a chain of k transfers is over-counted roughly k-fold — it
+degenerates to the fully serialised bound as chains get longer.
 
-Occupancy is measured on the loop-weighted schedule, so it already includes any
-unrelated work the two cores do in between — the buffer really is held across
-that too — and it is already scaled by the iteration count.
+### Why occupancy is measured on one iteration
+
+Occupancy is `finish(consumer) − start(producer)` in the schedule of a **single
+iteration**, so the result is a lower bound on the initiation interval. It is
+scaled into whole-module units by `throughputBound / II`, which *is* the
+iteration count expressed through two numbers already computed — no global N is
+needed.
+
+Measuring it on the loop-weighted schedule instead is wrong in a way that is
+easy to miss, and an earlier version did exactly that. There each block occupies
+its entire N-iteration duration before the next starts, so the span from a
+producer's start to its consumer's finish covers most of the kernel. That is not
+a buffer's lifetime: a buffer is held for one iteration's worth of
+producer-to-consumer span and then reused. Measured that way the bound grows
+with the trip count, so on a long enough loop it always overtakes the resource
+bound, and the model starts crediting extra buffers with gains the hardware
+cannot deliver.
 
 Every kind of dependency counts: Cube→Vector, Cube→Cube, Vector→Vector. Only the
 depth differs.
@@ -673,12 +693,11 @@ sign is not.
 
 ### Over-estimates
 
-* **Adjacent blocks on one core do not pipeline.** The largest single
-  pessimism; see §7.
 * **No operator fusion by default.** Each elementwise operation is a full pass
   with its own startup latency. The factors exist but are off and unmeasured.
 * **Compounding.** Buffer occupancy is measured on a schedule that already
-  contains both of the above, then divided by the buffer depth.
+  contains the above, then divided by the buffer depth, so any pessimism in the
+  schedule is carried into the recurrence bound as well.
 
 ### Under-estimates
 
