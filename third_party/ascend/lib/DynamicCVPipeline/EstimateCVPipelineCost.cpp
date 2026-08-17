@@ -273,7 +273,7 @@ bool runsOnCubeCore(Operation *op) {
   if (auto scopeOp = op->getParentOfType<scope::ScopeOp>()) {
     bool isCube = false;
     bool isVector = false;
-    if (succeeded(triton::getScopeType(scopeOp, isCube, isVector)) && isCube &&
+    if (succeeded(getScopeType(scopeOp, isCube, isVector)) && isCube &&
         !isVector) {
       return true;
     }

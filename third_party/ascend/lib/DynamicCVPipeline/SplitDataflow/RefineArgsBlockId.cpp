@@ -152,7 +152,7 @@ static int findFirstUser(Value iterArg, Block *loopBlock,
   return firstUserBlockId;
 }
 
-SmallVector<std::pair<Operation*, int>> findAllUser(BlockArgument iterArg, Block *forBlock, CVPipeline::ComputeBlockIdManager &bm)
+SmallVector<std::pair<Operation*, int>> findAllUser(Value& iterArg, Block *forBlock, CVPipeline::ComputeBlockIdManager &bm)
 {
     SmallVector<std::pair<Operation*,int>> ret;
     for (OpOperand &use : iterArg.getUses()) {
@@ -236,12 +236,12 @@ static void processOneLoop(Operation *loopOp,
     LOG_DEBUG("yieldDefOp: " << *yieldDefOp << "\n"
                              << "idx: " << i << "\n");
 
-        int firstUserBlockId = findFirstUser(argsi, forBlock, bm);
+        int firstUserBlockId = findFirstUser(argsi, loopBlock, bm);
         LOG_DEBUG("First user block id: " << firstUserBlockId << "\n");
 
         if (llvm::isa<TensorType>(argsi.getType()))
         {
-            auto allUsersInBlock = findAllUser(argsi, forBlock, bm);
+            auto allUsersInBlock = findAllUser(argsi, loopBlock, bm);
             //Analysis of BlockIds
             for(auto user: allUsersInBlock)
             {
