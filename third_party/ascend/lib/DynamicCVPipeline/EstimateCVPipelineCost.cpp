@@ -1160,20 +1160,75 @@ llvm::StringRef stringifyTripCountSource(TripCountSource source) {
 struct ResolvedTripCount {
   int64_t count = 1;
   TripCountSource source = TripCountSource::Assumed;
+  /// What the loop bound in the IR says, when that differs from `count`
+  /// because the bound was extended for pipelining. Zero when it does not.
+  int64_t rewrittenCount = 0;
 };
+
+/// Undo the loop extension AddControlFlowCondition applied for pipelining.
+///
+/// It rewrites a pipelined loop's bound to
+///     ceildiv(originalIterations * requiredBuffers, x) + ifCount
+/// and fills the extra iterations with prologue and epilogue in which most
+/// stages are switched off by their predicates. The bound is therefore not the
+/// number of times the body's work runs, and taking it at face value charges
+/// the whole body for iterations where nearly all of it is disabled.
+///
+/// On a loop that is not unrolled the inflation is a couple of percent and
+/// invisible. With the main loop unrolled it was observed at 3x, which is
+/// enough to make the model rank an unrolled variant far worse than it is.
+///
+/// The three factors are read from ssbuffer.iter_extension rather than
+/// pattern-matched out of the bound expression: the pass that applied them
+/// knows them exactly, and a formula change there would silently defeat any
+/// matching done here.
+///
+/// The inversion is exact whenever the ceildiv divided evenly, and off by at
+/// most one iteration otherwise -- against a trip count in the hundreds that
+/// is noise, and it is always closer than not inverting at all.
+std::optional<int64_t> removeLoopExtension(scf::ForOp forOp,
+                                           int64_t rewrittenCount) {
+  auto attr = forOp->getAttrOfType<ArrayAttr>(CVPipeline::kIterExtension);
+  if (!attr || attr.size() != 3) {
+    return std::nullopt;
+  }
+  auto requiredBuffers = dyn_cast<IntegerAttr>(attr[0]);
+  auto divisor = dyn_cast<IntegerAttr>(attr[1]);
+  auto ifCount = dyn_cast<IntegerAttr>(attr[2]);
+  if (!requiredBuffers || !divisor || !ifCount ||
+      requiredBuffers.getInt() <= 0) {
+    return std::nullopt;
+  }
+
+  const int64_t scaled = rewrittenCount - ifCount.getInt();
+  if (scaled <= 0) {
+    return std::nullopt; // nothing but prologue; leave the bound alone
+  }
+  const int64_t original = scaled * divisor.getInt() / requiredBuffers.getInt();
+  return original > 0 ? std::optional<int64_t>(original) : std::nullopt;
+}
 
 /// The three-step resolution, in one place so the number the estimate uses and
 /// the number the report prints can never disagree.
 ResolvedTripCount resolveLoopTripCount(scf::ForOp forOp,
                                        const TripCountOptions &options) {
+  ResolvedTripCount resolved;
   auto tripCount = mlir::ascend::utils::analyzeScfForTripCount(forOp);
   if (tripCount.isStatic) {
-    return {tripCount.staticTripCount, TripCountSource::Static};
+    resolved = {tripCount.staticTripCount, TripCountSource::Static, 0};
+  } else if (auto bound = resolveTripCount(forOp, options)) {
+    resolved = {*bound, TripCountSource::Bindings, 0};
+  } else {
+    // Nothing resolved the bound, so there is no extension to undo either.
+    return {options.defaultTripCount, TripCountSource::Assumed, 0};
   }
-  if (auto bound = resolveTripCount(forOp, options)) {
-    return {*bound, TripCountSource::Bindings};
+
+  // What was read is the rewritten bound; the body runs fewer times than that.
+  if (auto original = removeLoopExtension(forOp, resolved.count)) {
+    resolved.rewrittenCount = resolved.count;
+    resolved.count = *original;
   }
-  return {options.defaultTripCount, TripCountSource::Assumed};
+  return resolved;
 }
 
 LoopWeight
@@ -1212,6 +1267,9 @@ struct LoopReport {
   int64_t depth = 0;
   int64_t tripCount = 1;
   TripCountSource source = TripCountSource::Static;
+  /// The bound as written in the IR, when pipelining extended it past the
+  /// number of iterations that actually do the body's work. Zero otherwise.
+  int64_t rewrittenTripCount = 0;
   /// What an operation directly in this loop's body gets multiplied by: this
   /// loop's trip count times every enclosing loop's.
   int64_t bodyMultiplier = 1;
@@ -1237,6 +1295,7 @@ collectLoopReports(ModuleOp module, const TripCountOptions &options,
     const ResolvedTripCount resolved = resolveLoopTripCount(forOp, options);
     report.tripCount = resolved.count;
     report.source = resolved.source;
+    report.rewrittenTripCount = resolved.rewrittenCount;
 
     // The loop's own position: enclosing loops multiply, enclosing branches
     // divide. getLoopWeight looks at parents only, which is what is wanted
@@ -2593,19 +2652,28 @@ void printLoops(llvm::raw_ostream &os,
   }
 
   os << "[" << DEBUG_TYPE
-     << "] loops, and what each multiplies its body by. 'trip' is this loop"
-        " alone, 'body x' includes the loops around it; 'source' is how the"
-        " trip count was obtained -- static means the IR said so, bindings"
-        " means an argument value supplied by the caller resolved it, assumed"
-        " means nothing did and the default was used:\n";
+     << "] loops, and what each multiplies its body by. 'trip' is how many"
+        " times this loop's body does its work, 'body x' includes the loops"
+        " around it; 'source' is how the count was obtained -- static means the"
+        " IR said so, bindings means an argument value supplied by the caller"
+        " resolved it, assumed means nothing did and the default was used."
+        " 'ir bound' appears when pipelining extended the loop past that, the"
+        " extra iterations being prologue and epilogue with most stages"
+        " switched off:\n";
   os << "[" << DEBUG_TYPE
-     << "]    depth        trip  source       body x  location\n";
+     << "]    depth        trip    ir bound  source       body x  location\n";
 
   for (const LoopReport &loop : loops) {
     os << "[" << DEBUG_TYPE << "] "
        << llvm::format("%8lld", static_cast<long long>(loop.depth))
-       << llvm::format("%12lld", static_cast<long long>(loop.tripCount))
-       << "  " << llvm::left_justify(stringifyTripCountSource(loop.source), 11)
+       << llvm::format("%12lld", static_cast<long long>(loop.tripCount));
+    if (loop.rewrittenTripCount > 0) {
+      os << llvm::format("%12lld",
+                         static_cast<long long>(loop.rewrittenTripCount));
+    } else {
+      os << llvm::right_justify("-", 12);
+    }
+    os << "  " << llvm::left_justify(stringifyTripCountSource(loop.source), 11)
        << llvm::format("%11lld", static_cast<long long>(loop.bodyMultiplier));
     if (loop.branchDivisor > 1) {
       os << " /" << loop.branchDivisor;

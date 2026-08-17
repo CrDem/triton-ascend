@@ -66,4 +66,16 @@ module attributes {ssbuffer.blockDeps = [
     }
     return
   }
+
+  // The loop extension factors recorded by AddControlFlowCondition, which the
+  // cost model reads to undo the extension. They must not survive either.
+  // CHECK-LABEL: func.func @test_remove_iter_extension
+  func.func @test_remove_iter_extension(%lb: index, %ub: index, %st: index) {
+    // CHECK: scf.for
+    // CHECK-NOT: ssbuffer.iter_extension
+    scf.for %i = %lb to %ub step %st {
+      scf.yield
+    } {ssbuffer.iter_extension = [3 : i32, 1 : i32, 4 : i32]}
+    return
+  }
 }
