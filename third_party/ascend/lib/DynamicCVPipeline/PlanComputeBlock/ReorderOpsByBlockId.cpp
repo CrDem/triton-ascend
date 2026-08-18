@@ -20,19 +20,26 @@
  * THE SOFTWARE.
  */
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -431,16 +438,289 @@ GroupAdjacencyGraph::computeTopologicalOrder() {
   return llvm::failure();
 }
 
+//===----------------------------------------------------------------------===//
+// Diagnostics
+//===----------------------------------------------------------------------===//
+// How much freedom the topological sort actually has is invisible once the IR
+// has been linearised: a graph with exactly one legal order and a graph with
+// thousands produce output that looks the same. This reports it, because
+// whether generating IR variants along this axis is worth anything depends
+// entirely on that number -- and so does the question of whether the freedom
+// was lost when operations were grouped into blocks rather than when the blocks
+// were ordered.
+//
+// Driven by an environment variable rather than LLVM_DEBUG because a debug
+// build plus -debug-only is impractical when compilation is driven from Python.
+
+namespace {
+
+constexpr llvm::StringLiteral kReorderVerboseEnvVar =
+    "TRITON_ASCEND_REORDER_VERBOSE";
+
+int getReorderVerbosity() {
+  static const int verbosity = [] {
+    const char *env = std::getenv(kReorderVerboseEnvVar.data());
+    if (!env) {
+      return 0;
+    }
+    int value = 0;
+    return llvm::StringRef(env).getAsInteger(10, value) ? 0 : value;
+  }();
+  return verbosity;
+}
+
+llvm::StringRef describeGroupCore(unsigned core) {
+  switch (core) {
+  case CoreType::CUBE_ONLY:
+    return "CUBE";
+  case CoreType::VECTOR_ONLY:
+    return "VECTOR";
+  case CoreType::CUBE_AND_VECTOR:
+    return "MIXED";
+  default:
+    return "-";
+  }
+}
+
+/// Above this many groups the exact count below is not attempted: the DP is
+/// exponential in the node count, and 2^20 states is already 8 MB.
+constexpr unsigned kMaxGroupsForExactCount = 20;
+
+/// Number of distinct legal orders of the group graph, i.e. its linear
+/// extensions. Counted by dynamic programming over the set of groups already
+/// emitted: from a given set, any group whose predecessors are all in that set
+/// may come next. That is exactly the choice the topological sort makes, so the
+/// result is the size of the variant space this pass could explore.
+uint64_t countLinearExtensions(const SmallVector<SmallVector<unsigned>> &succs,
+                               unsigned n) {
+  SmallVector<uint32_t> predMask(n, 0);
+  for (unsigned i = 0; i < n; ++i) {
+    for (unsigned succ : succs[i]) {
+      predMask[succ] |= (1u << i);
+    }
+  }
+
+  const uint32_t full = (1u << n) - 1u;
+  std::vector<uint64_t> ways(static_cast<size_t>(full) + 1, 0);
+  ways[0] = 1;
+  for (uint32_t done = 0; done < full; ++done) {
+    if (ways[done] == 0) {
+      continue;
+    }
+    for (unsigned i = 0; i < n; ++i) {
+      if (done & (1u << i)) {
+        continue; // already emitted
+      }
+      if ((predMask[i] & done) != predMask[i]) {
+        continue; // a predecessor has not run yet
+      }
+      ways[done | (1u << i)] += ways[done];
+    }
+  }
+  return ways[full];
+}
+
+/// Name of the nearest enclosing symbol, so the two mainloop bodies that
+/// SeparateCVScope leaves behind can be told apart in the log.
+std::string describeScope(Block *block) {
+  for (Operation *op = block->getParentOp(); op; op = op->getParentOp()) {
+    if (auto sym = op->getAttrOfType<mlir::StringAttr>("sym_name")) {
+      return sym.getValue().str();
+    }
+  }
+  return "<anonymous>";
+}
+
+/// How wide the *operation* graph is, before grouping collapsed it. Reported
+/// alongside the group graph to answer the question the group graph alone
+/// cannot: if the operations were free to move and the groups are not, then it
+/// is the block partition that removed the freedom, not the dependencies.
+void reportOpGraphWidth(llvm::raw_ostream &os, const BlockOpGraph &graph) {
+  DenseMap<Operation *, unsigned> inDeg;
+  for (Operation *op : graph.ops) {
+    inDeg[op] = graph.preds.at(op).size();
+  }
+  SmallVector<Operation *> ready;
+  for (Operation *op : graph.ops) {
+    if (inDeg[op] == 0) {
+      ready.push_back(op);
+    }
+  }
+
+  unsigned widest = 0;
+  unsigned steps = 0;
+  unsigned forced = 0;
+  uint64_t total = 0;
+  while (!ready.empty()) {
+    widest = std::max<unsigned>(widest, ready.size());
+    total += ready.size();
+    if (ready.size() == 1) {
+      ++forced;
+    }
+    ++steps;
+    Operation *cur = ready.pop_back_val();
+    for (Operation *succ : graph.succs.at(cur)) {
+      if (--inDeg[succ] == 0) {
+        ready.push_back(succ);
+      }
+    }
+  }
+
+  os << "  op-level graph: " << graph.ops.size() << " op(s), widest "
+     << widest << " ready at once, mean "
+     << llvm::format("%.2f", steps ? static_cast<double>(total) /
+                                         static_cast<double>(steps)
+                                   : 0.0)
+     << ", " << forced << " of " << steps << " step(s) forced\n";
+}
+
+/// Everything about one block's group graph: who depends on whom, how many
+/// legal orders that leaves, and which one was taken.
+void reportGroupGraph(const GroupAdjacencyGraph &adjacency,
+                      const BlockOpGraph &graph,
+                      const DenseMap<Operation *, int> &opBlockId,
+                      ArrayRef<unsigned> inDegSnapshot,
+                      ArrayRef<int> chosenOrder) {
+  const unsigned n = adjacency.groupIds.size();
+  llvm::raw_ostream &os = llvm::errs();
+
+  // Per group: how many operations, which core(s), and the heaviest op kinds.
+  // CoreType is a bit mask by construction, so a group whose operations
+  // disagree ORs to CUBE_AND_VECTOR on its own.
+  SmallVector<unsigned> opCount(n, 0);
+  SmallVector<unsigned> core(n, CoreType::UNDETERMINED);
+  SmallVector<SmallVector<std::pair<llvm::StringRef, unsigned>>> kinds(n);
+  DenseMap<int, unsigned> groupPos;
+  for (unsigned i = 0; i < n; ++i) {
+    groupPos[adjacency.groupIds[i]] = i;
+  }
+  for (Operation *op : graph.ops) {
+    const unsigned idx = groupPos[opBlockId.at(op)];
+    ++opCount[idx];
+    core[idx] |= static_cast<unsigned>(CVPipeline::getOpCoreType(op));
+    const llvm::StringRef name = op->getName().getStringRef();
+    bool found = false;
+    for (auto &entry : kinds[idx]) {
+      if (entry.first == name) {
+        ++entry.second;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      kinds[idx].push_back({name, 1});
+    }
+  }
+
+  os << "[reorder-blocks] === " << describeScope(adjacency.block) << " / "
+     << adjacency.block->getParentOp()->getName().getStringRef() << ": "
+     << graph.ops.size() << " op(s) in " << n << " group(s)\n";
+  os << "[reorder-blocks]   group  core     ops  indeg  succs -> | contents\n";
+
+  for (unsigned i = 0; i < n; ++i) {
+    os << "[reorder-blocks] "
+       << llvm::format("%7d", adjacency.groupIds[i]) << "  "
+       << llvm::left_justify(describeGroupCore(core[i]), 7)
+       << llvm::format("%4u", opCount[i])
+       << llvm::format("%7u", inDegSnapshot[i]) << "  ";
+    if (adjacency.succs[i].empty()) {
+      os << "-";
+    } else {
+      for (size_t s = 0; s < adjacency.succs[i].size(); ++s) {
+        if (s != 0) {
+          os << ", ";
+        }
+        os << adjacency.groupIds[adjacency.succs[i][s]];
+      }
+    }
+    os << " | ";
+    llvm::sort(kinds[i], [](const auto &lhs, const auto &rhs) {
+      return lhs.second > rhs.second;
+    });
+    for (size_t k = 0; k < kinds[i].size() && k < 3; ++k) {
+      if (k != 0) {
+        os << ", ";
+      }
+      os << kinds[i][k].first;
+      if (kinds[i][k].second > 1) {
+        os << " x" << kinds[i][k].second;
+      }
+    }
+    if (kinds[i].size() > 3) {
+      os << ", +" << (kinds[i].size() - 3) << " more";
+    }
+    os << "\n";
+  }
+
+  // Replay the sort with the rule the pass actually uses, recording only how
+  // many groups were ready at each step. A step with one ready group is forced;
+  // a step with several is a point where a different variant could be produced.
+  SmallVector<unsigned> inDeg(inDegSnapshot.begin(), inDegSnapshot.end());
+  SmallVector<unsigned> ready;
+  for (unsigned i = 0; i < n; ++i) {
+    if (inDeg[i] == 0) {
+      ready.push_back(i);
+    }
+  }
+  SmallVector<unsigned> choices;
+  while (!ready.empty()) {
+    choices.push_back(ready.size());
+    const unsigned cur = ready.pop_back_val();
+    for (unsigned succ : adjacency.succs[cur]) {
+      if (--inDeg[succ] == 0) {
+        ready.push_back(succ);
+      }
+    }
+  }
+
+  os << "[reorder-blocks]   ready groups per step:";
+  for (unsigned c : choices) {
+    os << " " << c;
+  }
+  os << "\n";
+
+  os << "[reorder-blocks]   distinct legal orders: ";
+  if (n == 0) {
+    os << "0\n";
+  } else if (n > kMaxGroupsForExactCount) {
+    os << "not counted (" << n << " groups, cap is " << kMaxGroupsForExactCount
+       << ")\n";
+  } else {
+    os << static_cast<unsigned long long>(
+              countLinearExtensions(adjacency.succs, n))
+       << "\n";
+  }
+
+  os << "[reorder-blocks] ";
+  reportOpGraphWidth(os, graph);
+
+  os << "[reorder-blocks]   chosen order:";
+  for (int id : chosenOrder) {
+    os << " " << id;
+  }
+  os << "\n";
+}
+
+} // namespace
+
 // Stable sort ops based on their group orders
 static llvm::FailureOr<SmallVector<Operation *>>
 buildReorderedOps(const BlockOpGraph &graph,
                   const DenseMap<Operation *, int> &opBlockId) {
   SmallVector<Operation *> reordered;
   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId};
-  
+
+  // computeTopologicalOrder() consumes inDeg, so keep a copy for the report.
+  const SmallVector<unsigned> inDegSnapshot = adjacencyGraph.inDeg;
+
   auto groupOrderResult = adjacencyGraph.computeTopologicalOrder();
   if (llvm::failed(groupOrderResult)) {
     return llvm::failure();
+  }
+
+  if (getReorderVerbosity() >= 1) {
+    reportGroupGraph(adjacencyGraph, graph, opBlockId, inDegSnapshot,
+                     groupOrderResult.value());
   }
 
   for (int const blockId : groupOrderResult.value()) {
@@ -496,8 +776,6 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   return llvm::success();
 }
 
-static int call_count = 0;
-
 void ReorderOpsByBlockIdPass::runOnOperation() {
   LOG_DEBUG("\n=== Pass: TuningOpSeq ===\n");
   OpBuilder const builder(&getContext());
@@ -528,17 +806,6 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
     }
     return WalkResult::advance();
   });
-
-  // 1. Create a vector to hold the pointers
-  llvm::SmallVector<mlir::Operation *> allOps2;
-
-  // 2. Walk the entire module and collect every operation
-  moduleOp.walk([&](mlir::Operation *op) {
-      allOps2.push_back(op);
-  });
-
-  dumpMemoryDependenceGraphToDot(memGraph, allOps2, std::string("./mem_dep_graph_") + std::to_string(call_count) + std::string("_after_reorderopsbiblockid.dot"));
-  call_count++;
 
   if (result.wasInterrupted()) {
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);
