@@ -273,6 +273,77 @@ collectBlockIds(ArrayRef<Operation *> allOps, ComputeBlockIdManager &bm) {
 
 namespace {
 
+//===----------------------------------------------------------------------===//
+// Which ready block to emit next
+//===----------------------------------------------------------------------===//
+// Every point at which more than one block is ready is a point where a
+// different -- and equally legal -- linearisation of the same dependency graph
+// could be produced. The rule below is the whole of the pass's freedom, so it
+// is made switchable: two variants of the IR differing only in it can be
+// compiled and compared without touching anything else.
+//
+// Lifo is what the pass has always done (`pop_back_val()` on a vector is the
+// cheapest way to take an element, which is most likely why it was chosen
+// rather than for a reason). It follows a producer into its consumer, so a
+// chain stays together, but among blocks that became ready at the same moment
+// it takes the one that appeared *last* in the IR.
+//
+// Fifo takes the one that became ready first, which for blocks that start out
+// ready means the earliest in the IR. On a graph where a compute block and a
+// staging block become ready together, the two rules put them on opposite
+// sides of everything that follows.
+//
+// Driven by an environment variable rather than a pass option: this pass is
+// created inside PlanComputeBlock's own nested pipeline, so an option would
+// have to be threaded through two pass managers, and the point is to be able
+// to flip it between runs without rebuilding.
+
+constexpr llvm::StringLiteral kReorderPolicyEnvVar =
+    "TRITON_ASCEND_REORDER_POLICY";
+
+enum class ReadyPolicy { Lifo, Fifo };
+
+llvm::StringRef describeReadyPolicy(ReadyPolicy policy) {
+  return policy == ReadyPolicy::Fifo ? "fifo" : "lifo";
+}
+
+/// Read once. A non-default choice announces itself unconditionally: a run
+/// that silently ignored the variable would be indistinguishable from one that
+/// honoured it, and the two are supposed to produce different IR.
+ReadyPolicy getReadyPolicy() {
+  static const ReadyPolicy policy = [] {
+    const char *env = std::getenv(kReorderPolicyEnvVar.data());
+    if (!env) {
+      return ReadyPolicy::Lifo;
+    }
+    const std::string value = llvm::StringRef(env).lower();
+    if (value == "fifo") {
+      llvm::errs() << "[reorder-blocks] " << kReorderPolicyEnvVar
+                   << "=fifo: emitting the block that became ready first"
+                      " instead of last\n";
+      return ReadyPolicy::Fifo;
+    }
+    if (value != "lifo") {
+      llvm::errs() << "[reorder-blocks] unknown " << kReorderPolicyEnvVar
+                   << "='" << value << "', expected lifo or fifo;"
+                      " using lifo\n";
+    }
+    return ReadyPolicy::Lifo;
+  }();
+  return policy;
+}
+
+/// Take one block out of the ready set, per the policy. Both rules yield a
+/// legal topological order; only the order differs.
+unsigned takeReady(SmallVector<unsigned> &ready, ReadyPolicy policy) {
+  if (policy == ReadyPolicy::Fifo) {
+    const unsigned first = ready.front();
+    ready.erase(ready.begin());
+    return first;
+  }
+  return ready.pop_back_val();
+}
+
 // Helper structure to hold the group-level graph data.
 struct GroupAdjacencyGraph {
   Block *block;
@@ -396,8 +467,9 @@ GroupAdjacencyGraph::computeTopologicalOrder() {
     }
   }
 
+  const ReadyPolicy policy = getReadyPolicy();
   while (!ready.empty()) {
-    auto cur = ready.pop_back_val();
+    auto cur = takeReady(ready, policy);
 
     result.push_back(groupIds[cur]);
 
@@ -558,6 +630,9 @@ void reportOpGraphWidth(llvm::raw_ostream &os, const BlockOpGraph &graph) {
       ++forced;
     }
     ++steps;
+    // Deliberately not the configurable policy: the operation graph is the
+    // same whichever way blocks are ordered, so keeping this traversal fixed
+    // makes the width comparable between runs that used different policies.
     Operation *cur = ready.pop_back_val();
     for (Operation *succ : graph.succs.at(cur)) {
       if (--inDeg[succ] == 0) {
@@ -663,9 +738,10 @@ void reportGroupGraph(const GroupAdjacencyGraph &adjacency,
     }
   }
   SmallVector<unsigned> choices;
+  const ReadyPolicy policy = getReadyPolicy();
   while (!ready.empty()) {
     choices.push_back(ready.size());
-    const unsigned cur = ready.pop_back_val();
+    const unsigned cur = takeReady(ready, policy);
     for (unsigned succ : adjacency.succs[cur]) {
       if (--inDeg[succ] == 0) {
         ready.push_back(succ);
@@ -694,7 +770,8 @@ void reportGroupGraph(const GroupAdjacencyGraph &adjacency,
   os << "[reorder-blocks] ";
   reportOpGraphWidth(os, graph);
 
-  os << "[reorder-blocks]   chosen order:";
+  os << "[reorder-blocks]   chosen order ("
+     << describeReadyPolicy(getReadyPolicy()) << "):";
   for (int id : chosenOrder) {
     os << " " << id;
   }
