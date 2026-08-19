@@ -1008,14 +1008,23 @@ void rederiveBlockIds(ArrayRef<Operation *> order, ComputeBlockIdManager &bm,
 
     // Operations nested inside this one carry ids of their own, stamped by
     // PlanCubeBlock and PlanVectorBlock. Leaving those on the old id would
-    // make the module disagree with itself: every later pass that walks all
-    // operations rather than just the block-level ones would see two
-    // groupings at once, and pick whichever it happened to reach first.
-    op->walk([&](Operation *nested) {
-      if (nested != op && CVPipeline::getOpBlockId(nested).has_value()) {
-        bm.updateBlockId(nested, currentId);
-      }
-    });
+    // make the module disagree with itself: a later pass that walks every
+    // operation rather than just the block-level ones would see two groupings
+    // at once and take whichever it reached first.
+    //
+    // But this must not reach into an scf region. Those regions hold blocks of
+    // their own, which this pass reorders and regroups separately, and the
+    // walk over them runs innermost first -- so descending here would flatten
+    // a loop body that was already grouped into a single id and take its core
+    // assignment with it. Only regions nobody else regroups, such as a linalg
+    // body, follow their parent.
+    if (!CVPipeline::isScfOp(op)) {
+      op->walk([&](Operation *nested) {
+        if (nested != op && CVPipeline::getOpBlockId(nested).has_value()) {
+          bm.updateBlockId(nested, currentId);
+        }
+      });
+    }
   }
 }
 
