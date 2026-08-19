@@ -893,9 +893,13 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
                                        uint64_t seed) {
   const DenseMap<Operation *, unsigned> height = computeOpHeights(graph);
 
+  // Looked up once: the comparator below runs O(n log n) times per step, and
+  // reading an attribute that often is both slow and pointless.
+  DenseMap<Operation *, CoreType> core;
   DenseMap<Operation *, unsigned> inDeg;
   SmallVector<Operation *> ready;
   for (Operation *op : graph.ops) {
+    core[op] = CVPipeline::getOpCoreType(op);
     const unsigned degree = graph.preds.at(op).size();
     inDeg[op] = degree;
     if (degree == 0) {
@@ -903,13 +907,39 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     }
   }
 
+  // Whether emitting this operation would keep the current run going. An
+  // operation that names no core -- a constant, an scf container -- never ends
+  // a run, and at the very start nothing has been chosen yet so everything
+  // qualifies.
+  auto continuesRun = [&](Operation *op, CoreType current) {
+    const CoreType opCore = core.lookup(op);
+    return current == CoreType::UNDETERMINED ||
+           opCore == CoreType::UNDETERMINED || opCore == current;
+  };
+
   SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
   SmallVector<Operation *> order;
   order.reserve(graph.ops.size());
+  CoreType currentCore = CoreType::UNDETERMINED;
   while (!ready.empty()) {
-    // Best first, program order breaking ties so the baseline is reproducible
-    // and stays close to what the input already said.
+    // Staying on the core that just ran comes before everything else. Without
+    // it a height-ordered schedule interleaves Cube and Vector work operation
+    // by operation -- they are independent, so nothing stops it -- and since a
+    // block cannot span two cores, the grouping rebuilt afterwards ends up
+    // with a couple of operations per block. That is not a variant of the
+    // input, it is a different and much worse shape, and the pipeline rejects
+    // it. Runs of one core keep the result recognisable: the blocks stay about
+    // as large as the ones that arrived, and what varies is which operations
+    // land in each run and in what order.
+    //
+    // Below that: longest remaining chain first, then program order, so seed 0
+    // is reproducible and starts from what the input already said.
     llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
+      const bool lhsRuns = continuesRun(lhs, currentCore);
+      const bool rhsRuns = continuesRun(rhs, currentCore);
+      if (lhsRuns != rhsRuns) {
+        return lhsRuns;
+      }
       const unsigned lhsHeight = height.lookup(lhs);
       const unsigned rhsHeight = height.lookup(rhs);
       if (lhsHeight != rhsHeight) {
@@ -918,10 +948,22 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
       return graph.opIndex.lookup(lhs) < graph.opIndex.lookup(rhs);
     });
 
-    const size_t pick = seed == 0 ? 0 : pickReadyIndex(rng, ready.size());
+    // Perturb only among the operations that continue the run, so a seed
+    // varies the order within a block rather than chopping the blocks up.
+    size_t runLength = 0;
+    while (runLength < ready.size() &&
+           continuesRun(ready[runLength], currentCore)) {
+      ++runLength;
+    }
+    const size_t pick =
+        seed == 0 ? 0 : pickReadyIndex(rng, runLength > 0 ? runLength : 1);
+
     Operation *chosen = ready[pick];
     ready.erase(ready.begin() + pick);
     order.push_back(chosen);
+    if (core.lookup(chosen) != CoreType::UNDETERMINED) {
+      currentCore = core.lookup(chosen);
+    }
 
     for (Operation *succ : graph.succs.at(chosen)) {
       if (--inDeg[succ] == 0) {
@@ -975,6 +1017,26 @@ void rederiveBlockIds(ArrayRef<Operation *> order, ComputeBlockIdManager &bm,
       }
     });
   }
+}
+
+/// How many blocks the run-based regrouping above would produce, worked out
+/// without touching the IR so that an order which shreds the module can be
+/// rejected before it is applied rather than after.
+///
+/// Must mirror rederiveBlockIds exactly; the two are read together.
+size_t countRunsByCore(ArrayRef<Operation *> order) {
+  size_t runs = 0;
+  bool started = false;
+  CoreType currentCore = CoreType::UNDETERMINED;
+  for (Operation *op : order) {
+    const CoreType core = CVPipeline::getOpCoreType(op);
+    if (!started || (core != CoreType::UNDETERMINED && core != currentCore)) {
+      ++runs;
+      started = true;
+      currentCore = core;
+    }
+  }
+  return runs;
 }
 
 /// How many blocks a rederived order ended up with, for the one-line report.
@@ -1061,18 +1123,35 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   // not consulted -- it is the thing being varied.
   if (variantSeed) {
     SmallVector<Operation *> order = sampleOpOrder(graph, *variantSeed);
+    // A block cannot span two cores, so the regrouping can only cut where the
+    // core changes. An order that changes core far more often than the input
+    // did produces blocks of a couple of operations each -- a shape the
+    // pipeline rejects downstream, after a full run has been spent on it.
+    // Cheaper to notice here and leave this block alone.
+    const size_t before = countDistinctBlockIds(allOps, opBlockId);
+    const size_t after = countRunsByCore(order);
+    const size_t limit = 2 * before + 2;
     if (order.size() != allOps.size()) {
       // A cycle in the dependency graph; the block-level path reports this
       // properly, so fall through to it rather than emitting a partial order.
       LOG_DEBUG("op-level order incomplete, falling back to block order\n");
+    } else if (after > limit) {
+      LOG_DEBUG("variant would split " << before << " block(s) into " << after
+                                       << ", over the limit of " << limit
+                                       << "; keeping the block order\n");
+      if (getReorderVerbosity() >= 1) {
+        llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
+                     << " rejected in " << describeScope(&block) << ": "
+                     << before << " block(s) would become " << after << "\n";
+      }
     } else {
       rederiveBlockIds(order, bm, opBlockId);
       applyReorder(block, order);
       if (getReorderVerbosity() >= 1) {
         llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
-                     << ": " << order.size() << " op(s) reordered into "
-                     << countDistinctBlockIds(order, opBlockId)
-                     << " block(s) in " << describeScope(&block) << "\n";
+                     << ": " << order.size() << " op(s) reordered, " << before
+                     << " block(s) became " << after << " in "
+                     << describeScope(&block) << "\n";
       }
       return llvm::success();
     }
