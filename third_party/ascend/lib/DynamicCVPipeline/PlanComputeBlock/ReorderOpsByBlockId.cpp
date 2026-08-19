@@ -344,6 +344,15 @@ ReadyPolicy getReadyPolicy() {
 /// a single variant can be reproduced by hand.
 std::optional<uint64_t> getVariantSeed(ModuleOp module) {
   if (auto attr = module->getAttrOfType<IntegerAttr>(CVPipeline::kReorderSeed)) {
+    // A negative value marks a seed that has already been applied. This pass
+    // runs twice -- at the end of PlanComputeBlock and again at the end of
+    // SplitDataflow -- and only the first run may regroup: by the second one
+    // the blocks carry transfer groups and synchronisation flags built around
+    // their ids, so renumbering them there would leave those attributes
+    // pointing at blocks that no longer exist.
+    if (attr.getInt() < 0) {
+      return std::nullopt;
+    }
     return static_cast<uint64_t>(attr.getInt());
   }
   if (const char *env = std::getenv("TRITON_ASCEND_REORDER_SEED")) {
@@ -954,6 +963,17 @@ void rederiveBlockIds(ArrayRef<Operation *> order, ComputeBlockIdManager &bm,
     }
     bm.updateBlockId(op, currentId);
     opBlockId[op] = currentId;
+
+    // Operations nested inside this one carry ids of their own, stamped by
+    // PlanCubeBlock and PlanVectorBlock. Leaving those on the old id would
+    // make the module disagree with itself: every later pass that walks all
+    // operations rather than just the block-level ones would see two
+    // groupings at once, and pick whichever it happened to reach first.
+    op->walk([&](Operation *nested) {
+      if (nested != op && CVPipeline::getOpBlockId(nested).has_value()) {
+        bm.updateBlockId(nested, currentId);
+      }
+    });
   }
 }
 
@@ -1100,6 +1120,13 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
     }
     return WalkResult::advance();
   });
+
+  // Mark the seed as spent, so the second run of this pass -- at the end of
+  // SplitDataflow, once transfers and sync flags refer to block ids -- takes
+  // the ordinary block-level path instead of regrouping underneath them.
+  if (variantSeed) {
+    moduleOp->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(-1));
+  }
 
   if (result.wasInterrupted()) {
     CVPipeline::setFallbackAttr(moduleOp, CVPipeline::ERRCODE_FAILED);

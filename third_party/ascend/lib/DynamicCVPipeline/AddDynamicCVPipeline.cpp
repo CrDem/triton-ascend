@@ -20,6 +20,8 @@
  * THE SOFTWARE.
  */
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
@@ -41,8 +43,13 @@
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -89,6 +96,68 @@ int getVariantCount() {
   }
   return value;
 }
+
+/// Swallows everything written to stdout and stderr while it is alive.
+///
+/// A trial run drives the whole pipeline, and the pipeline is talkative: debug
+/// prints from several passes, MLIR diagnostics from the ones that decline a
+/// candidate, and the estimate's own report. Multiplied by the number of
+/// candidates that is thousands of lines describing IR that is about to be
+/// thrown away. Silencing at the file descriptor rather than by asking each
+/// pass to be quiet is the only thing that covers all of them, including
+/// prints this pass does not own.
+class OutputSilencer {
+public:
+  OutputSilencer() {
+#ifndef _WIN32
+    flushAll();
+    devNull = ::open("/dev/null", O_WRONLY);
+    if (devNull < 0) {
+      return; // cannot silence; noisy is better than broken
+    }
+    savedOut = ::dup(STDOUT_FILENO);
+    savedErr = ::dup(STDERR_FILENO);
+    ::dup2(devNull, STDOUT_FILENO);
+    ::dup2(devNull, STDERR_FILENO);
+#endif
+  }
+
+  ~OutputSilencer() {
+#ifndef _WIN32
+    flushAll();
+    if (savedOut >= 0) {
+      ::dup2(savedOut, STDOUT_FILENO);
+      ::close(savedOut);
+    }
+    if (savedErr >= 0) {
+      ::dup2(savedErr, STDERR_FILENO);
+      ::close(savedErr);
+    }
+    if (devNull >= 0) {
+      ::close(devNull);
+    }
+#endif
+  }
+
+  OutputSilencer(const OutputSilencer &) = delete;
+  OutputSilencer &operator=(const OutputSilencer &) = delete;
+
+private:
+  static void flushAll() {
+    // Buffered streams must be emptied on both sides of the swap, or their
+    // contents surface attributed to the wrong descriptor.
+    std::cout.flush();
+    std::cerr.flush();
+    llvm::outs().flush();
+    llvm::errs().flush();
+    std::fflush(stdout);
+    std::fflush(stderr);
+  }
+
+  int devNull = -1;
+  int savedOut = -1;
+  int savedErr = -1;
+};
 
 void restoreModuleFromBackup(ModuleOp moduleOp, ModuleOp moduleBackup) {
   Operation *moduleOperation = moduleOp.getOperation();
@@ -161,34 +230,69 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
-    for (int64_t seed = 0; seed < variantCount; ++seed) {
-      // Every attempt starts from the untouched input: the pipeline rewrites
-      // the module in place, so a candidate must not be built on the previous
-      // one's output.
-      ModuleOp attempt(moduleBackup->clone());
-      restoreModuleFromBackup(moduleOp, attempt);
-      attempt->destroy();
-
-      moduleOp->setAttr(CVPipeline::kReorderSeed,
-                        builder.getI64IntegerAttr(seed));
-      moduleOp->setAttr(mlir::triton::kCVPipelineCostQuiet,
-                        builder.getUnitAttr());
-
-      PassManager trial(&getContext(), moduleOp.getOperationName());
-      buildPipeline(trial);
-      if (failed(runPipeline(trial, moduleOp)) ||
-          CVPipeline::hasFallbackAttr(moduleOp)) {
-        continue; // this ordering broke something downstream; not a candidate
+    // Why the rejected candidates were rejected, counted by error code. A
+    // search that keeps nothing is otherwise indistinguishable from one that
+    // was never asked to do anything.
+    SmallVector<std::pair<int, int64_t>> failures;
+    auto countFailure = [&](int code) {
+      for (auto &entry : failures) {
+        if (entry.first == code) {
+          ++entry.second;
+          return;
+        }
       }
-      auto costAttr =
-          moduleOp->getAttrOfType<IntegerAttr>(
-              mlir::triton::kCVPipelineEstimatedCycles);
-      if (!costAttr) {
-        continue; // no estimate, so nothing to rank it by
+      failures.push_back({code, 1});
+    };
+
+    for (int64_t seed = 0; seed < variantCount; ++seed) {
+      bool accepted = false;
+      int64_t cost = 0;
+      int errCode = 0;
+
+      {
+        // Nothing the trial prints is worth reading: it describes IR that is
+        // about to be discarded. The estimate is asked to stay quiet, and the
+        // rest of the pipeline is silenced at the descriptor.
+        OutputSilencer hush;
+
+        // Every attempt starts from the untouched input: the pipeline rewrites
+        // the module in place, so a candidate must not be built on the
+        // previous one's output.
+        ModuleOp attempt(moduleBackup->clone());
+        restoreModuleFromBackup(moduleOp, attempt);
+        attempt->destroy();
+
+        moduleOp->setAttr(CVPipeline::kReorderSeed,
+                          builder.getI64IntegerAttr(seed));
+        moduleOp->setAttr(mlir::triton::kCVPipelineCostQuiet,
+                          builder.getUnitAttr());
+
+        PassManager trial(&getContext(), moduleOp.getOperationName());
+        buildPipeline(trial);
+        const bool ran = !failed(runPipeline(trial, moduleOp)) &&
+                         !CVPipeline::hasFallbackAttr(moduleOp);
+        auto costAttr = moduleOp->getAttrOfType<IntegerAttr>(
+            mlir::triton::kCVPipelineEstimatedCycles);
+        if (ran && costAttr) {
+          accepted = true;
+          cost = costAttr.getInt();
+        } else if (!ran) {
+          auto codeAttr =
+              moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
+          // -1: the pipeline declined without saying why.
+          errCode = codeAttr ? static_cast<int>(codeAttr.getInt()) : -1;
+        } else {
+          // -2: it compiled, but produced no estimate to rank it by.
+          errCode = -2;
+        }
+      }
+
+      if (!accepted) {
+        countFailure(errCode);
+        continue;
       }
 
       ++usable;
-      const int64_t cost = costAttr.getInt();
       if (bestSeed < 0 || cost < bestCost) {
         bestSeed = seed;
         bestCost = cost;
@@ -204,6 +308,23 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                    << " cycles\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
+    }
+    for (const auto &entry : failures) {
+      llvm::errs() << "[" << DEBUG_TYPE << "]   rejected " << entry.second
+                   << " with ";
+      if (entry.first == -1) {
+        llvm::errs() << "a pipeline failure and no error code\n";
+      } else if (entry.first == -2) {
+        llvm::errs() << "no estimate produced\n";
+      } else {
+        llvm::errs() << "error code " << entry.first << "\n";
+      }
+    }
+    if (bestSeed < 0) {
+      llvm::errs() << "[" << DEBUG_TYPE
+                   << "]   reproduce one of them with"
+                      " TRITON_ASCEND_REORDER_SEED=0 and no"
+                      " TRITON_ASCEND_CV_VARIANTS to see the failure itself\n";
     }
 
     // Reset to the input and compile the winner for real, with the estimate
