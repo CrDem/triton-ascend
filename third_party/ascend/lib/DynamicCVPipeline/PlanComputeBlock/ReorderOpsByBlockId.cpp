@@ -1090,7 +1090,8 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
 
 void ReorderOpsByBlockIdPass::runOnOperation() {
   LOG_DEBUG("\n=== Pass: TuningOpSeq ===\n");
-  OpBuilder const builder(&getContext());
+  // Not const: the attribute builders below are non-const members.
+  OpBuilder builder(&getContext());
 
   auto moduleOp = getOperation();
 
