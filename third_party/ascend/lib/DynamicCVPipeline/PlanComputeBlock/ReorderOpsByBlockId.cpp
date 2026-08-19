@@ -350,7 +350,12 @@ std::optional<uint64_t> getVariantSeed(ModuleOp module) {
     // the blocks carry transfer groups and synchronisation flags built around
     // their ids, so renumbering them there would leave those attributes
     // pointing at blocks that no longer exist.
-    if (attr.getInt() < 0) {
+    // Zero is the baseline: the pipeline's own grouping, untouched. The search
+    // spends its first attempt on it deliberately, so "no variant beat the
+    // best" and "no variant beat my own heuristic" cannot be confused -- the
+    // number every other seed is compared against is the one the compiler
+    // produces without any of this.
+    if (attr.getInt() <= 0) {
       return std::nullopt;
     }
     return static_cast<uint64_t>(attr.getInt());
@@ -917,10 +922,28 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
            opCore == CoreType::UNDETERMINED || opCore == current;
   };
 
+  // What the seed actually varies: how long a run of one core is allowed to
+  // get before the other core is given a turn.
+  //
+  // This is the only knob that changes the block partition, and the partition
+  // is the only thing the estimate can see -- reordering operations inside a
+  // block leaves it identical, because a block's cost is a roofline over a set
+  // of per-unit totals and a set has no order. A seed that only shuffled
+  // within blocks would produce a thousand candidates with one score.
+  //
+  // Short runs interleave the two cores finely, which costs more barriers but
+  // lets them overlap; long runs do the opposite, and taken to the extreme --
+  // drain one core, then the other -- serialise the kernel completely. Neither
+  // end is right for every kernel, which is why it is searched rather than
+  // chosen.
+  SplitMix64 seedRng(seed);
+  const size_t targetRun = 2 + static_cast<size_t>(seedRng.next() % 24);
+
   SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
   SmallVector<Operation *> order;
   order.reserve(graph.ops.size());
   CoreType currentCore = CoreType::UNDETERMINED;
+  size_t opsInRun = 0;
   while (!ready.empty()) {
     // Staying on the core that just ran comes before everything else. Without
     // it a height-ordered schedule interleaves Cube and Vector work operation
@@ -934,11 +957,16 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     //
     // Below that: longest remaining chain first, then program order, so seed 0
     // is reproducible and starts from what the input already said.
+    // Keep the run going until it has reached the length this seed asks for,
+    // then hand over to the other core if anything there is ready. When only
+    // one core has work the preference costs nothing: everything compares
+    // equal on it and the ordering falls through to the rules below.
+    const bool handOver = opsInRun >= targetRun;
     llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
       const bool lhsRuns = continuesRun(lhs, currentCore);
       const bool rhsRuns = continuesRun(rhs, currentCore);
       if (lhsRuns != rhsRuns) {
-        return lhsRuns;
+        return handOver ? rhsRuns : lhsRuns;
       }
       const unsigned lhsHeight = height.lookup(lhs);
       const unsigned rhsHeight = height.lookup(rhs);
@@ -948,21 +976,17 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
       return graph.opIndex.lookup(lhs) < graph.opIndex.lookup(rhs);
     });
 
-    // Perturb only among the operations that continue the run, so a seed
-    // varies the order within a block rather than chopping the blocks up.
-    size_t runLength = 0;
-    while (runLength < ready.size() &&
-           continuesRun(ready[runLength], currentCore)) {
-      ++runLength;
-    }
-    const size_t pick =
-        seed == 0 ? 0 : pickReadyIndex(rng, runLength > 0 ? runLength : 1);
-
+    const size_t pick = pickReadyIndex(rng, ready.size());
     Operation *chosen = ready[pick];
     ready.erase(ready.begin() + pick);
     order.push_back(chosen);
-    if (core.lookup(chosen) != CoreType::UNDETERMINED) {
-      currentCore = core.lookup(chosen);
+
+    const CoreType chosenCore = core.lookup(chosen);
+    if (chosenCore != CoreType::UNDETERMINED && chosenCore != currentCore) {
+      currentCore = chosenCore;
+      opsInRun = 1;
+    } else {
+      ++opsInRun;
     }
 
     for (Operation *succ : graph.succs.at(chosen)) {

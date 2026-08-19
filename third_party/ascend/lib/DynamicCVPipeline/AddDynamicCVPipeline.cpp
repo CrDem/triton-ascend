@@ -22,6 +22,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
@@ -226,7 +227,14 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   if (variantCount > 1) {
     int64_t bestSeed = -1;
     int64_t bestCost = 0;
+    int64_t worstCost = 0;
     int64_t usable = 0;
+    // How many different numbers the candidates scored. One means every
+    // ordering that compiled looked identical to the estimate, which says
+    // where to look next: either the generator is producing one shape under
+    // many names, or the estimate cannot see what separates them. Without this
+    // the two are indistinguishable from outside.
+    llvm::DenseSet<int64_t> distinctCosts;
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
@@ -293,6 +301,10 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       }
 
       ++usable;
+      distinctCosts.insert(cost);
+      if (worstCost < cost) {
+        worstCost = cost;
+      }
       if (bestSeed < 0 || cost < bestCost) {
         bestSeed = seed;
         bestCost = cost;
@@ -306,6 +318,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     if (bestSeed >= 0) {
       llvm::errs() << ", keeping seed " << bestSeed << " at " << bestCost
                    << " cycles\n";
+      llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctCosts.size()
+                   << " distinct estimate(s), worst " << worstCost
+                   << " cycles; seed 0 is the untouched pipeline\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }
