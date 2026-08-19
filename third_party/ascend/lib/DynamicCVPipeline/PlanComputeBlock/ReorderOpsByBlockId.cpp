@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -40,6 +41,7 @@
 
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -331,6 +333,28 @@ ReadyPolicy getReadyPolicy() {
     return ReadyPolicy::Lifo;
   }();
   return policy;
+}
+
+/// Seed selecting one operation-level variant, or nothing for the ordinary
+/// block-level path.
+///
+/// Read from the module rather than the environment because the variant search
+/// sets a different seed on every attempt within one process, which a
+/// process-wide variable cannot express. The environment is still honoured so
+/// a single variant can be reproduced by hand.
+std::optional<uint64_t> getVariantSeed(ModuleOp module) {
+  if (auto attr = module->getAttrOfType<IntegerAttr>(CVPipeline::kReorderSeed)) {
+    return static_cast<uint64_t>(attr.getInt());
+  }
+  if (const char *env = std::getenv("TRITON_ASCEND_REORDER_SEED")) {
+    uint64_t value = 0;
+    if (!llvm::StringRef(env).getAsInteger(10, value)) {
+      return value;
+    }
+    llvm::errs() << "[reorder-blocks] TRITON_ASCEND_REORDER_SEED='" << env
+                 << "' is not a number; ignored\n";
+  }
+  return std::nullopt;
 }
 
 /// Take one block out of the ready set, per the policy. Both rules yield a
@@ -780,6 +804,174 @@ void reportGroupGraph(const GroupAdjacencyGraph &adjacency,
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// Operation-level variant generation
+//===----------------------------------------------------------------------===//
+// Ordering whole blocks can only ever produce as many variants as the block
+// graph has linear extensions, and on a kernel whose blocks form a chain that
+// is exactly one. Ordering the *operations* instead ignores the block grouping
+// entirely and draws from a space that is larger by many orders of magnitude:
+// the operation graph of one loop body was measured with 22 operations ready at
+// once, and any of those 22! orders extends to a legal one.
+//
+// That also means exhaustive enumeration is out of the question, so orders are
+// sampled instead. Priority is the operation's height -- the longest chain of
+// operations that still has to run after it -- which is the classic list
+// scheduling rule: start the longest remaining chain first and let everything
+// else fill in around it. Seed 0 takes that rule exactly, giving a
+// deterministic baseline; every other seed perturbs it, so the sample stays
+// clustered around sensible schedules rather than wandering over random ones.
+
+namespace {
+
+/// Deterministic PRNG. Hand-rolled rather than <random> so that a seed means
+/// the same order on every machine and standard library.
+struct SplitMix64 {
+  uint64_t state;
+  explicit SplitMix64(uint64_t seed) : state(seed) {}
+  uint64_t next() {
+    state += 0x9e3779b97f4a7c15ULL;
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+  }
+};
+
+/// Which of the ready operations to take, given they are sorted best-first.
+///
+/// Index 0 is the list scheduling choice. A seeded run keeps taking it about
+/// half the time and slips to the next-best otherwise, so a variant differs
+/// from the baseline in a few decisions rather than in all of them -- the point
+/// is to explore around a good schedule, not to shuffle.
+size_t pickReadyIndex(SplitMix64 &rng, size_t count) {
+  size_t index = 0;
+  while (index + 1 < count && (rng.next() & 1U) == 0) {
+    ++index;
+  }
+  return index;
+}
+
+/// Longest chain of operations that must still run after each operation.
+/// Computed over the reverse graph, so it needs no separate traversal order.
+DenseMap<Operation *, unsigned> computeOpHeights(const BlockOpGraph &graph) {
+  DenseMap<Operation *, unsigned> height;
+  DenseMap<Operation *, unsigned> outDeg;
+  SmallVector<Operation *> queue;
+  for (Operation *op : graph.ops) {
+    const unsigned degree = graph.succs.at(op).size();
+    outDeg[op] = degree;
+    height[op] = 0;
+    if (degree == 0) {
+      queue.push_back(op);
+    }
+  }
+  while (!queue.empty()) {
+    Operation *op = queue.pop_back_val();
+    for (Operation *pred : graph.preds.at(op)) {
+      unsigned &predHeight = height[pred];
+      predHeight = std::max(predHeight, height[op] + 1);
+      if (--outDeg[pred] == 0) {
+        queue.push_back(pred);
+      }
+    }
+  }
+  return height;
+}
+
+/// One legal order of the operations, sampled by `seed`.
+SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
+                                       uint64_t seed) {
+  const DenseMap<Operation *, unsigned> height = computeOpHeights(graph);
+
+  DenseMap<Operation *, unsigned> inDeg;
+  SmallVector<Operation *> ready;
+  for (Operation *op : graph.ops) {
+    const unsigned degree = graph.preds.at(op).size();
+    inDeg[op] = degree;
+    if (degree == 0) {
+      ready.push_back(op);
+    }
+  }
+
+  SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
+  SmallVector<Operation *> order;
+  order.reserve(graph.ops.size());
+  while (!ready.empty()) {
+    // Best first, program order breaking ties so the baseline is reproducible
+    // and stays close to what the input already said.
+    llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
+      const unsigned lhsHeight = height.lookup(lhs);
+      const unsigned rhsHeight = height.lookup(rhs);
+      if (lhsHeight != rhsHeight) {
+        return lhsHeight > rhsHeight;
+      }
+      return graph.opIndex.lookup(lhs) < graph.opIndex.lookup(rhs);
+    });
+
+    const size_t pick = seed == 0 ? 0 : pickReadyIndex(rng, ready.size());
+    Operation *chosen = ready[pick];
+    ready.erase(ready.begin() + pick);
+    order.push_back(chosen);
+
+    for (Operation *succ : graph.succs.at(chosen)) {
+      if (--inDeg[succ] == 0) {
+        ready.push_back(succ);
+      }
+    }
+  }
+  return order;
+}
+
+/// Rebuild the block grouping to match a freshly permuted operation order.
+///
+/// This is not optional. InterCoreTransferAndSync locates a block by walking
+/// linearly from its first operation and stopping at the first foreign id
+/// (getBlockStartEnd, used at eight call sites there), so a block whose
+/// operations are no longer adjacent would have its synchronisation flags
+/// placed around the wrong range -- which on hardware is a kernel that waits
+/// on a flag nobody sets. After an operation-level permutation the original
+/// grouping no longer holds, so a new one is derived from the result: a block
+/// is a maximal run of operations belonging to the same core.
+///
+/// The core assignment itself is untouched. That is the decision OpClassifier
+/// made with alias analysis and it is not ours to revisit; only the boundaries
+/// between blocks move.
+void rederiveBlockIds(ArrayRef<Operation *> order, ComputeBlockIdManager &bm,
+                      DenseMap<Operation *, int> &opBlockId) {
+  int currentId = -1;
+  CoreType currentCore = CoreType::UNDETERMINED;
+  for (Operation *op : order) {
+    const CoreType core = CVPipeline::getOpCoreType(op);
+    // An operation that names no core -- a constant, an scf container -- joins
+    // whatever run it landed in rather than cutting it in two.
+    const bool startsNewBlock =
+        currentId < 0 ||
+        (core != CoreType::UNDETERMINED && core != currentCore);
+    if (startsNewBlock) {
+      currentId = bm.getNextId();
+      currentCore = core;
+    }
+    bm.updateBlockId(op, currentId);
+    opBlockId[op] = currentId;
+  }
+}
+
+/// How many blocks a rederived order ended up with, for the one-line report.
+size_t countDistinctBlockIds(ArrayRef<Operation *> order,
+                             const DenseMap<Operation *, int> &opBlockId) {
+  DenseSet<int> seen;
+  for (Operation *op : order) {
+    auto it = opBlockId.find(op);
+    if (it != opBlockId.end()) {
+      seen.insert(it->second);
+    }
+  }
+  return seen.size();
+}
+
+} // namespace
+
 // Stable sort ops based on their group orders
 static llvm::FailureOr<SmallVector<Operation *>>
 buildReorderedOps(const BlockOpGraph &graph,
@@ -826,7 +1018,8 @@ static void applyReorder(Block &block, ArrayRef<Operation *> reordered) {
 
 static llvm::LogicalResult
 reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
-                  ComputeBlockIdManager &bm) {
+                  ComputeBlockIdManager &bm,
+                  std::optional<uint64_t> variantSeed) {
   const auto allOps =
       llvm::to_vector(llvm::make_pointer_range(block.without_terminator()));
 
@@ -841,6 +1034,28 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   LOG_DEBUG("Initial opBlockIds:\n");
   for (Operation *op : allOps) {
     LOG_DEBUG("  Op: " << *op << ", opBlockId = " << opBlockId[op] << "\n");
+  }
+
+  // Variant mode: order the operations themselves and rebuild the blocks
+  // around the result. The block grouping that arrived here is deliberately
+  // not consulted -- it is the thing being varied.
+  if (variantSeed) {
+    SmallVector<Operation *> order = sampleOpOrder(graph, *variantSeed);
+    if (order.size() != allOps.size()) {
+      // A cycle in the dependency graph; the block-level path reports this
+      // properly, so fall through to it rather than emitting a partial order.
+      LOG_DEBUG("op-level order incomplete, falling back to block order\n");
+    } else {
+      rederiveBlockIds(order, bm, opBlockId);
+      applyReorder(block, order);
+      if (getReorderVerbosity() >= 1) {
+        llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
+                     << ": " << order.size() << " op(s) reordered into "
+                     << countDistinctBlockIds(order, opBlockId)
+                     << " block(s) in " << describeScope(&block) << "\n";
+      }
+      return llvm::success();
+    }
   }
 
   const auto reorderedRes = buildReorderedOps(graph, opBlockId);
@@ -869,6 +1084,8 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);
 
+  const std::optional<uint64_t> variantSeed = getVariantSeed(moduleOp);
+
   auto bm = ComputeBlockIdManager(moduleOp);
   auto result = moduleOp.walk([&](Block *block) {
     auto *parentOp = block->getParentOp();
@@ -878,7 +1095,7 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
           isa<scf::SCFDialect>(parentOp->getDialect()))) {
       return WalkResult::skip();
     }
-    if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm))) {
+    if (llvm::failed(reorderOpsInBlock(*block, memGraph, bm, variantSeed))) {
       return WalkResult::interrupt();
     }
     return WalkResult::advance();

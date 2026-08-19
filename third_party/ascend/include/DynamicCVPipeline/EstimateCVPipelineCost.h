@@ -89,6 +89,13 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
 inline constexpr llvm::StringLiteral kCVPipelineBlocks =
     "ascend.cv_pipeline_blocks";
 
+/// Unit attribute asking the estimate to record its results on the module but
+/// print nothing. Set by the variant search, which evaluates one candidate per
+/// attempt and would otherwise emit a full report for each of them; the search
+/// prints its own one-line summary instead. Not for ordinary compilation.
+inline constexpr llvm::StringLiteral kCVPipelineCostQuiet =
+    "ascend.cv_pipeline_cost_quiet";
+
 /// Number of loops whose trip count is only known at run time (i64), such as a
 /// loop bounded by a sequence length passed to the kernel. Their bodies are
 /// counted once, so each of them understates the estimate by however many

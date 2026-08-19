@@ -3145,6 +3145,15 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     printBreakdown(os, breakdown);
   };
 
+  // During a variant search the estimate runs once per candidate, and the full
+  // report for a few hundred of them is unreadable. The search silences every
+  // attempt and prints one line itself when a candidate improves on the best so
+  // far; the winner is then recompiled without the flag, so the report the user
+  // ends up reading describes exactly the IR that was kept.
+  if (module->hasAttr(kCVPipelineCostQuiet)) {
+    return;
+  }
+
   const int verbosity = getVerbosity();
   LLVM_DEBUG(reportTo(llvm::dbgs()); reportDetail(llvm::dbgs()));
   if (verbosity >= 1) {

@@ -78,6 +78,10 @@ inline constexpr llvm::StringLiteral kBlockDeps = "ssbuffer.blockDeps";
 /// the rewritten bound alone looks like an ordinary trip count.
 inline constexpr llvm::StringLiteral kIterExtension =
     "ssbuffer.iter_extension";
+/// Selects one operation-level ordering variant, set on the module by the
+/// variant search before each attempt. Absent means the ordinary block-level
+/// path, which is what an ordinary compilation takes.
+inline constexpr llvm::StringLiteral kReorderSeed = "ssbuffer.reorder_seed";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kClone = "ssbuffer.clone";
 inline constexpr llvm::StringLiteral kEnableUbRefineOpt =
