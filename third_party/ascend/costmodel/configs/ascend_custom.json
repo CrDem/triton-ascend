@@ -354,6 +354,10 @@
       ]
     }
   },
+  "synchronisation": {
+    "description": "Fixed cost of crossing one synchronisation barrier: the flag write, its propagation, and the wait that observes it. Charged as latency in the block schedule, not as pipe occupancy, because a barrier stops the core from issuing rather than keeping an engine busy -- so it can only ever show up through the recurrence bound, never through the resource bound. UNMEASURED on this target: 0 means the barrier is treated as free, which is what the model did before this field existed. Set it before comparing IR variants that differ in HOW MANY barriers they contain (a finer block partition adds barriers), because at 0 splitting a compute block in two is free and a search over partitions has a degenerate optimum at one operation per block.",
+    "barrier_cycles": 0
+  },
   "cube_model": {
     "description": "Cube (GEMM) L1-pipe roofline parameters (tilesim 910B1 cube_config).",
     "throughput": [

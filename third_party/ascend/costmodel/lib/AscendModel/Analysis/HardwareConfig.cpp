@@ -951,6 +951,13 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
     }
   }
 
+  // Cost of one synchronisation barrier. Optional and zero by default: a
+  // profile that does not mention it behaves exactly as before.
+  if (const auto *sync = root->getObject("synchronisation")) {
+    if (auto v = sync->getInteger("barrier_cycles"))
+      barrierCycles = *v >= 0 ? *v : 0;
+  }
+
   return true;
 }
 

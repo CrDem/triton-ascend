@@ -330,6 +330,19 @@ public:
   /// pipeline.
   bool areMutexUnits(llvm::StringRef a, llvm::StringRef b) const;
 
+  /// Fixed cost of crossing one synchronisation barrier, in cycles: the flag
+  /// write, its propagation, and the wait that observes it. This is latency,
+  /// not occupancy -- a barrier does not keep a pipe busy, it prevents the
+  /// core from issuing -- so a consumer of this number belongs in a schedule
+  /// and not in a roofline.
+  ///
+  /// Defaults to 0, i.e. off, because it has not been measured on this target
+  /// and an unmeasured constant should not silently move everyone's numbers.
+  /// It matters as soon as the number of barriers becomes something a search
+  /// varies: with it at zero, splitting a compute block in two is free.
+  int64_t getBarrierCycles() const { return barrierCycles; }
+  void setBarrierCycles(int64_t cycles) { barrierCycles = cycles; }
+
   // Cube (GEMM) micro-architecture: migrated from tilesim cube_config.
   void getCubeModelThroughput(int elementBits, int &basicM, int &basicK,
                               int &basicN) const;
@@ -386,6 +399,9 @@ private:
   // unit-name strings that share a pipeline and cannot run in parallel.
   // Default 910B: {"vec_mte2", "mte3"} (AIV MTE2<->MTE3).
   std::vector<std::vector<std::string>> mutexGroups;
+  // Cost of one synchronisation barrier in cycles. Zero means "not modelled",
+  // which is what every profile says until someone measures it.
+  int64_t barrierCycles = 0;
 };
 
 //===----------------------------------------------------------------------===//

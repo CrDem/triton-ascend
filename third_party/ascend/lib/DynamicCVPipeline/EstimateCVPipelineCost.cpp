@@ -572,6 +572,13 @@ struct OpCost {
   int64_t bytes = 0;
   int64_t flops = 0;
   CostConfidence confidence = CostConfidence::Modelled;
+  /// Address spaces a transfer moves between, empty for everything else.
+  /// Kept so the report can show which path each transfer took: the same
+  /// operation kind can land on several engines with very different
+  /// bandwidths, and the by-kind table collapses that away. Safe as
+  /// StringRefs -- getMemorySpaceName returns string literals.
+  llvm::StringRef srcSpace;
+  llvm::StringRef dstSpace;
 };
 
 /// Cost of a linalg.matmul on the Cube core.
@@ -613,6 +620,8 @@ OpCost estimateTransfer(Type shapedType, llvm::StringRef srcSpace,
                         const HardwareConfig &config) {
   OpCost cost;
   cost.unit = getTransferUnit(srcSpace, dstSpace);
+  cost.srcSpace = srcSpace;
+  cost.dstSpace = dstSpace;
 
   auto bytes = getShapedByteSize(shapedType);
   if (!bytes) {
@@ -1687,8 +1696,31 @@ constexpr int64_t kNoBlockId = -1;
 /// consumer block -> blocks it depends on.
 using BlockDepMap = llvm::MapVector<int64_t, llvm::SetVector<int64_t>>;
 
+/// One shape of data transfer: same operation kind, same engine, same pair of
+/// address spaces, same size, same loop weighting.
+///
+/// Grouped rather than listed per operation because the question this answers
+/// is whether a kind that got more expensive did so by running more often or
+/// by moving more bytes -- and the by-kind table cannot say, since it collapses
+/// every engine a kind touched into whichever one was seen last.
+struct TransferStats {
+  llvm::StringRef kind;
+  HWUnit unit = HWUnit::Scalar;
+  llvm::StringRef srcSpace;
+  llvm::StringRef dstSpace;
+  int64_t bytes = 0;
+  int64_t cyclesEach = 0;
+  int64_t multiplier = 1;
+  int64_t branchDivisor = 1;
+  int64_t count = 0;
+  int64_t weightedCycles = 0;
+};
+
 struct CostBreakdown {
   llvm::MapVector<llvm::StringRef, OpKindStats> byOpKind;
+  /// Every bulk transfer, grouped. Small enough to search linearly: a kernel
+  /// has a handful of distinct transfer shapes, not thousands.
+  llvm::SmallVector<TransferStats> transfers;
   llvm::SmallVector<Operation *> unknownSizeOps;
   llvm::MapVector<Operation *, DynamicLoopStats> dynamicLoops;
   llvm::MapVector<int64_t, BlockStats> blocks;
@@ -1742,9 +1774,43 @@ struct CostBreakdown {
     }
   }
 
+  /// Transfers only: an operation that never went through estimateTransfer
+  /// leaves both address spaces empty and is skipped.
+  void recordTransfer(Operation *op, const OpCost &cost,
+                      const LoopWeight &weight) {
+    if (cost.srcSpace.empty() && cost.dstSpace.empty()) {
+      return;
+    }
+    const llvm::StringRef kind = op->getName().getStringRef();
+    for (TransferStats &row : transfers) {
+      if (row.kind == kind && row.unit == cost.unit &&
+          row.srcSpace == cost.srcSpace && row.dstSpace == cost.dstSpace &&
+          row.bytes == cost.bytes && row.cyclesEach == cost.cycles &&
+          row.multiplier == weight.multiplier &&
+          row.branchDivisor == weight.branchDivisor) {
+        row.count += 1;
+        row.weightedCycles += weight.weighted(cost.cycles);
+        return;
+      }
+    }
+    TransferStats row;
+    row.kind = kind;
+    row.unit = cost.unit;
+    row.srcSpace = cost.srcSpace;
+    row.dstSpace = cost.dstSpace;
+    row.bytes = cost.bytes;
+    row.cyclesEach = cost.cycles;
+    row.multiplier = weight.multiplier;
+    row.branchDivisor = weight.branchDivisor;
+    row.count = 1;
+    row.weightedCycles = weight.weighted(cost.cycles);
+    transfers.push_back(row);
+  }
+
   void record(Operation *op, const OpCost &cost, const LoopWeight &weight,
               bool isCube) {
     recordBlock(op, cost, weight, isCube);
+    recordTransfer(op, cost, weight);
 
     OpKindStats &stats = byOpKind[op->getName().getStringRef()];
     stats.count += 1;
@@ -2009,14 +2075,26 @@ topologicalBlockOrder(const CostBreakdown &breakdown) {
 /// topological sort only because it closes a cycle, i.e. it is loop-carried;
 /// it is skipped, since this schedules one pass through the graph and the
 /// iteration count is applied separately.
+/// How much of a schedule was barrier overhead rather than work, so the report
+/// can say it instead of leaving the number to be inferred from a gap.
+struct BarrierTally {
+  int64_t count = 0;
+  int64_t cycles = 0;
+  void charge(int64_t barrierCycles) {
+    ++count;
+    cycles += barrierCycles;
+  }
+};
+
 int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
                            llvm::ArrayRef<int64_t> order,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration,
                            llvm::MapVector<int64_t, BlockSchedule> &schedule,
-                           UnitBusyCycles &busy) {
+                           UnitBusyCycles &busy, BarrierTally &barriers) {
   llvm::DenseMap<HWUnit, int64_t> pipeAvailable;
   int64_t makespan = 0;
+  const int64_t barrierCycles = config.getBarrierCycles();
 
   for (int64_t blockId : order) {
     auto blockEntry = breakdown.blocks.find(blockId);
@@ -2028,7 +2106,8 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
 
     int64_t earliest = 0;
     int64_t criticalPred = kNoBlockId;
-    auto considerDeps = [&](const BlockDepMap &deps) {
+    bool waitedOnFlag = false;
+    auto considerDeps = [&](const BlockDepMap &deps, bool isSync) {
       auto it = deps.find(id);
       if (it == deps.end()) {
         return;
@@ -2038,6 +2117,9 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
         if (scheduled == schedule.end()) {
           continue; // back edge: the producer runs in a later pass
         }
+        if (isSync) {
+          waitedOnFlag = true;
+        }
         if (scheduled->second.finish > earliest) {
           earliest = scheduled->second.finish;
           criticalPred = producer;
@@ -2045,8 +2127,17 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
       }
     };
     // Flags first: those are the barriers the hardware really enforces.
-    considerDeps(breakdown.syncDeps);
-    considerDeps(breakdown.dataDeps);
+    considerDeps(breakdown.syncDeps, /*isSync=*/true);
+    considerDeps(breakdown.dataDeps, /*isSync=*/false);
+
+    // A flag wait is not free even once the producer has finished: the flag
+    // has to be written, propagated and observed. Only synchronisation edges
+    // are charged -- a dataflow edge inside one core is ordered by the issue
+    // queue, with no flag involved.
+    if (waitedOnFlag && barrierCycles > 0) {
+      earliest += barrierCycles;
+      barriers.charge(barrierCycles);
+    }
 
     const double factor = getFusionFactor(stats, fusion);
 
@@ -2057,9 +2148,21 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
     bool sawWork = false;
     bool waitedOnPipe = false;
 
+    bool sawWorkingSegment = false;
     for (const BlockSegment &segment : stats.segments) {
       const llvm::DenseMap<HWUnit, int64_t> &units =
           perIteration ? segment.unitCyclesOneIter : segment.unitCycles;
+      // A barrier separates this segment from the previous one, so the core
+      // pays for it again here. Charged only between segments that both carry
+      // work: an empty segment is an artefact of two adjacent sync operations,
+      // not a second stop.
+      if (segment.costedOps > 0) {
+        if (sawWorkingSegment && barrierCycles > 0) {
+          cursor += barrierCycles;
+          barriers.charge(barrierCycles);
+        }
+        sawWorkingSegment = true;
+      }
       int64_t segmentFinish = cursor;
       for (const auto &entry : units) {
         const int64_t cycles = static_cast<int64_t>(entry.second * factor);
@@ -2281,6 +2384,10 @@ struct ModuleEstimate {
   llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
   UnitBusyCycles weightedBusy;
   UnitBusyCycles iterationBusy;
+  /// Barriers charged in the one-iteration schedule, which is the schedule the
+  /// recurrence bound is measured on. Zero whenever the profile leaves
+  /// barrier_cycles at its default.
+  BarrierTally iterationBarriers;
 };
 
 /// Combine the block schedule into one number, as the larger of two bounds.
@@ -2310,14 +2417,16 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
   estimate.buffers = buffers;
   estimate.order = topologicalBlockOrder(breakdown);
 
+  BarrierTally weightedBarriers;
   estimate.serialisedBound = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/false,
-      estimate.weightedSchedule, estimate.weightedBusy);
+      estimate.weightedSchedule, estimate.weightedBusy, weightedBarriers);
   estimate.throughputBound = combineRoofline(estimate.weightedBusy, config);
 
   estimate.iterationLatency = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/true,
-      estimate.iterationSchedule, estimate.iterationBusy);
+      estimate.iterationSchedule, estimate.iterationBusy,
+      estimate.iterationBarriers);
   estimate.initiationInterval = combineRoofline(estimate.iterationBusy, config);
 
   // Measured on one iteration, so the result is a lower bound on the
@@ -2607,6 +2716,29 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
      << " operation(s) in mutually exclusive branches, charged at a fraction"
         " of their cost because only one branch runs per iteration\n";
 
+  // What each barrier costs, and what that came to. A barrier is latency, not
+  // occupancy: it stops the core from issuing rather than keeping an engine
+  // busy, so it moves the schedule and through it the recurrence bound, and
+  // can never move the resource bound. Worth saying, because at zero a finer
+  // block partition is free and any search over partitions degenerates.
+  os << "[" << DEBUG_TYPE << "]     barrier cost: ";
+  if (config.getBarrierCycles() <= 0) {
+    os << "0 cycles (off; set synchronisation.barrier_cycles in the hardware"
+          " profile -- until then splitting a block costs nothing)\n";
+  } else {
+    os << config.getBarrierCycles() << " cycles each, "
+       << estimate.iterationBarriers.count << " crossed per iteration, "
+       << estimate.iterationBarriers.cycles << " cycles";
+    if (estimate.iterationLatency > 0) {
+      os << llvm::format(" (%.1f%% of the one-iteration schedule)",
+                         100.0 *
+                             static_cast<double>(
+                                 estimate.iterationBarriers.cycles) /
+                             static_cast<double>(estimate.iterationLatency));
+    }
+    os << "\n";
+  }
+
   os << "[" << DEBUG_TYPE << "]     per iteration, for reference: II "
      << estimate.initiationInterval << " cycles, barrier chain "
      << estimate.iterationLatency << " cycles";
@@ -2682,6 +2814,60 @@ void printLoops(llvm::raw_ostream &os,
   }
 }
 
+/// Every distinct transfer the kernel performs: which engine, which path,
+/// how many bytes, and how often.
+///
+/// This is the view the by-kind table cannot give. There, one row per
+/// operation kind hides both the engine (`record()` keeps only the last one
+/// seen, so a kind split across engines shows one of them) and the size (a
+/// kind whose total doubled may be moving twice the bytes or running twice as
+/// often, and those call for opposite fixes). Bandwidths differ by more than
+/// 4x between paths on this profile, so which path a transfer took decides
+/// most of its cost.
+void printTransfers(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
+  if (breakdown.transfers.empty()) {
+    return;
+  }
+
+  llvm::SmallVector<TransferStats> rows(breakdown.transfers.begin(),
+                                        breakdown.transfers.end());
+  llvm::sort(rows, [](const TransferStats &lhs, const TransferStats &rhs) {
+    return lhs.weightedCycles > rhs.weightedCycles;
+  });
+
+  os << "[" << DEBUG_TYPE
+     << "] data transfers, grouped by engine, path and size. 'each' is one"
+        " execution and 'x' how many times the loops run it, so 'cycles' is"
+        " each x count x, divided by the branch divisor where one applies."
+        " Two transfers of the same operation kind can sit on engines whose"
+        " bandwidths differ several-fold, which the table above cannot show:\n";
+  os << "[" << DEBUG_TYPE
+     << "]     count       bytes       each          x        cycles  unit    "
+        "     path       operation\n";
+
+  for (const TransferStats &row : rows) {
+    // Built into a local: left_justify keeps a StringRef, not a copy.
+    std::string path = row.srcSpace.str();
+    path += ":";
+    path += row.dstSpace.str();
+
+    os << "[" << DEBUG_TYPE << "] "
+       << llvm::format("%9lld", static_cast<long long>(row.count))
+       << llvm::format("%12lld", static_cast<long long>(row.bytes))
+       << llvm::format("%11lld", static_cast<long long>(row.cyclesEach))
+       << llvm::format("%11lld", static_cast<long long>(row.multiplier))
+       << llvm::format("%14lld", static_cast<long long>(row.weightedCycles))
+       << "  "
+       << llvm::left_justify(mlir::ascend::stringifyHWUnit(row.unit), 11)
+       << llvm::left_justify(path, 11) << row.kind;
+    if (row.branchDivisor > 1) {
+      os << "  (/" << row.branchDivisor << ", one branch of "
+         << row.branchDivisor << " runs)";
+    }
+    os << "\n";
+  }
+}
+
 void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
   // Heaviest first: that is the order in which teaching the model new
   // operations pays off.
@@ -2730,6 +2916,8 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
       os << "[" << DEBUG_TYPE << "]     " << name << "\n";
     }
   };
+
+  printTransfers(os, breakdown);
 
   listKinds(CostConfidence::Generic,
             "charged by element count only, i.e. with no dedicated cost model");
