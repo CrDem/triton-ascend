@@ -922,22 +922,57 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
            opCore == CoreType::UNDETERMINED || opCore == current;
   };
 
-  // What the seed actually varies: how long a run of one core is allowed to
-  // get before the other core is given a turn.
+  // The seed draws a whole recipe, not a single parameter. One hand-picked
+  // rule only ever explores the shapes its author already had in mind; a
+  // family sampled at random covers combinations nobody would think to write
+  // down, and the estimate is there to throw the bad ones away.
   //
-  // This is the only knob that changes the block partition, and the partition
-  // is the only thing the estimate can see -- reordering operations inside a
-  // block leaves it identical, because a block's cost is a roofline over a set
-  // of per-unit totals and a set has no order. A seed that only shuffled
-  // within blocks would produce a thousand candidates with one score.
-  //
-  // Short runs interleave the two cores finely, which costs more barriers but
-  // lets them overlap; long runs do the opposite, and taken to the extreme --
-  // drain one core, then the other -- serialise the kernel completely. Neither
-  // end is right for every kernel, which is why it is searched rather than
-  // chosen.
-  SplitMix64 seedRng(seed);
-  const size_t targetRun = 2 + static_cast<size_t>(seedRng.next() % 24);
+  // What every ingredient has in common is that it moves the *block
+  // partition*. Reordering operations inside a block leaves the estimate
+  // identical -- a block's cost is a roofline over a set of per-unit totals,
+  // and a set has no order -- so a knob that only shuffles within blocks
+  // produces a thousand candidates with one score.
+  SplitMix64 recipe(seed * 0x9e3779b97f4a7c15ULL + 0x243f6a8885a308d3ULL);
+
+  // What counts as urgent. Longest chain first is the textbook rule; shortest
+  // first clears small work early and delays the critical path, which is
+  // usually worse and occasionally exactly right; program order stays near the
+  // input; random ignores structure altogether.
+  const unsigned priorityMode = static_cast<unsigned>(recipe.next() % 4);
+  // How long one core may run before the other gets a turn. Short runs
+  // interleave the cores finely -- more barriers, more overlap; long runs do
+  // the opposite, and at the extreme serialise the kernel.
+  const size_t targetRun = 1 + static_cast<size_t>(recipe.next() % 32);
+  // Whether to respect runs at all. A quarter of the recipes ignore the core
+  // and let the two interleave freely; most of those end up rejected by the
+  // block-count guard, and the ones that survive are shapes the run-based
+  // rules cannot reach.
+  const bool stickyCore = (recipe.next() % 4) != 0;
+  // How readily a step passes over its best candidate.
+  const unsigned noise = static_cast<unsigned>(recipe.next() % 3);
+
+  // Fixed per operation so that a random priority is still a consistent
+  // ordering rather than a coin flip at every comparison.
+  DenseMap<Operation *, uint64_t> shuffleKey;
+  if (priorityMode == 3) {
+    for (Operation *op : graph.ops) {
+      SplitMix64 keyRng(seed ^ (graph.opIndex.lookup(op) * 0x100000001b3ULL));
+      shuffleKey[op] = keyRng.next();
+    }
+  }
+
+  auto priorityOf = [&](Operation *op) -> uint64_t {
+    switch (priorityMode) {
+    case 0:
+      return height.lookup(op);
+    case 1:
+      return ~static_cast<uint64_t>(height.lookup(op));
+    case 2:
+      return ~static_cast<uint64_t>(graph.opIndex.lookup(op));
+    default:
+      return shuffleKey.lookup(op);
+    }
+  };
 
   SplitMix64 rng(seed * 0x2545f4914f6cdd1dULL + 1);
   SmallVector<Operation *> order;
@@ -961,22 +996,28 @@ SmallVector<Operation *> sampleOpOrder(const BlockOpGraph &graph,
     // then hand over to the other core if anything there is ready. When only
     // one core has work the preference costs nothing: everything compares
     // equal on it and the ordering falls through to the rules below.
-    const bool handOver = opsInRun >= targetRun;
+    // +1 keep this core going, -1 hand over to the other, 0 do not care.
+    const int corePref = !stickyCore ? 0 : (opsInRun >= targetRun ? -1 : 1);
     llvm::sort(ready, [&](Operation *lhs, Operation *rhs) {
-      const bool lhsRuns = continuesRun(lhs, currentCore);
-      const bool rhsRuns = continuesRun(rhs, currentCore);
-      if (lhsRuns != rhsRuns) {
-        return handOver ? rhsRuns : lhsRuns;
+      if (corePref != 0) {
+        const bool lhsRuns = continuesRun(lhs, currentCore);
+        const bool rhsRuns = continuesRun(rhs, currentCore);
+        if (lhsRuns != rhsRuns) {
+          return corePref > 0 ? lhsRuns : rhsRuns;
+        }
       }
-      const unsigned lhsHeight = height.lookup(lhs);
-      const unsigned rhsHeight = height.lookup(rhs);
-      if (lhsHeight != rhsHeight) {
-        return lhsHeight > rhsHeight;
+      const uint64_t lhsPriority = priorityOf(lhs);
+      const uint64_t rhsPriority = priorityOf(rhs);
+      if (lhsPriority != rhsPriority) {
+        return lhsPriority > rhsPriority;
       }
       return graph.opIndex.lookup(lhs) < graph.opIndex.lookup(rhs);
     });
 
-    const size_t pick = pickReadyIndex(rng, ready.size());
+    size_t pick = pickReadyIndex(rng, ready.size());
+    for (unsigned extra = 0; extra < noise; ++extra) {
+      pick = std::max(pick, pickReadyIndex(rng, ready.size()));
+    }
     Operation *chosen = ready[pick];
     ready.erase(ready.begin() + pick);
     order.push_back(chosen);
