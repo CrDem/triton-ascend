@@ -521,8 +521,9 @@
     "hbm:l2_agg": {
       "bandwidth_gbps": 1638.4
     },
+    "_comment_l0c_ub": "DERIVED FROM PROFILING, not a placeholder any more. msprof on flash attention (128x128 tiles) reports aic_fixpipe_time = 87408 us where this model, at the inherited 70 GB/s, predicted 266282 us -- a factor of 3.05. 70 x 3.05 = 213. Still worth replacing with a direct microbenchmark of the L0C->UB path: this figure is inferred from one kernel's fixpipe occupancy and inherits whatever else that occupancy contains.",
     "l0c:ub": {
-      "bandwidth_gbps": 70
+      "bandwidth_gbps": 213
     },
     "ub:l1": {
       "bandwidth_gbps": 137

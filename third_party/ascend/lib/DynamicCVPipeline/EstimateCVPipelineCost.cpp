@@ -812,9 +812,28 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   if (isa<hivm::CopyOp>(op)) {
     // The CV pipeline emits these to stage data between the cores; on the newer
     // topology the destination is often L1, keeping the traffic on chip.
+    //
+    // The destination carries an address space, the source usually does not --
+    // it is still a tensor at this point -- so the source has to be inferred,
+    // and inferring it from the operation's core gets the important case
+    // backwards. A copy that lands in L1 is the Vector core handing its result
+    // up to the Cube: it reads UB and writes L1, which is the on-chip
+    // mte3_ub_l1 mover. Falling back to "hbm" instead makes it a Cube load from
+    // off-chip memory -- wrong core, wrong engine, wrong bandwidth.
+    //
+    // Profiling caught this directly: the cycles showed up under the Cube's
+    // MTE2 while the hardware was spending them on the Vector core's MTE3,
+    // which the model had at almost zero.
     auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
+    llvm::StringRef fallbackSrc = guessed.first;
+    if (auto ends = getHivmTransferEnds(op)) {
+      const llvm::StringRef knownDst = getMemorySpaceName(ends->dest.getType());
+      if (knownDst == "l1" || knownDst == "l0a" || knownDst == "l0b") {
+        fallbackSrc = "ub";
+      }
+    }
     auto [srcSpace, dstSpace] =
-        resolveHivmTransferSpaces(op, guessed.first, guessed.second);
+        resolveHivmTransferSpaces(op, fallbackSrc, guessed.second);
     Type shapedType = getTransferSizingType(op);
     if (!shapedType) {
       OpCost cost;
@@ -2628,6 +2647,55 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
             "reads a value the other block produced");
 }
 
+/// The per-pipe busy times again, grouped and named the way the hardware
+/// profiler names them.
+///
+/// Comparing an estimate against msprof is otherwise a manual exercise every
+/// time: the model counts cycles per HWUnit, the profiler reports microseconds
+/// per column, and the two vocabularies do not line up. Printing the prediction
+/// in the profiler's own terms makes calibration a subtraction -- which is how
+/// the fixpipe bandwidth turned out to be three times too slow and how a
+/// UB->L1 copy was found charged to the Cube's load engine.
+///
+/// Two columns are listed with nothing in them on purpose. A blank there is a
+/// statement: the model has no term for that hardware at all, so whatever the
+/// profiler reports in it is unaccounted for rather than mispredicted.
+void printPipeComparison(llvm::raw_ostream &os,
+                         const llvm::DenseMap<HWUnit, int64_t> &busy,
+                         const HardwareConfig &config) {
+  auto cyclesOf = [&](HWUnit unit) { return cyclesOfUnit(busy, unit); };
+
+  struct Row {
+    const char *column;
+    int64_t cycles;
+    const char *from;
+  };
+  const Row rows[] = {
+      {"aic_mac_time", cyclesOf(HWUnit::Cube), "cube"},
+      {"aic_mte2_time", cyclesOf(HWUnit::CubeMTE2), "cube_mte2"},
+      {"aic_fixpipe_time",
+       cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB),
+       "fixpipe + fixpipe_ub"},
+      {"aic_mte1_time", 0, "no term: nothing models L1 -> L0A/L0B"},
+      {"aiv_vec_time", cyclesOf(HWUnit::Vector), "vector"},
+      {"aiv_mte2_time", cyclesOf(HWUnit::VecMTE2) + cyclesOf(HWUnit::MTE1ToUB),
+       "vec_mte2 + mte1_l1_ub"},
+      {"aiv_mte3_time", cyclesOf(HWUnit::MTE3) + cyclesOf(HWUnit::MTE3ToL1),
+       "mte3 + mte3_ub_l1"},
+      {"aic/aiv_scalar_time", 0, "no term: scalar work is charged zero"},
+  };
+
+  os << "[" << DEBUG_TYPE
+     << "]     predicted busy time per pipe, named as msprof names it, so a"
+        " profiler row can be subtracted from this one without translating:\n";
+  for (const Row &row : rows) {
+    os << "[" << DEBUG_TYPE << "]       "
+       << llvm::left_justify(row.column, 21)
+       << llvm::format("%12.1f us", config.cyclesToMicroseconds(row.cycles))
+       << "   " << row.from << "\n";
+  }
+}
+
 /// How the module number was assembled. Printed as a derivation rather than a
 /// result so that a surprising total can be attributed to a term.
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
@@ -2668,6 +2736,7 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
        << " " << pipes[i].second;
   }
   os << "\n";
+  printPipeComparison(os, estimate.weightedBusy, config);
   line(resourceBound ? "  recurrence bound: buffer reuse"
                      : "> recurrence bound: buffer reuse",
        estimate.recurrenceBound);
