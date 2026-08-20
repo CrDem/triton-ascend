@@ -363,6 +363,12 @@ std::optional<uint64_t> getVariantSeed(ModuleOp module) {
   if (const char *env = std::getenv("TRITON_ASCEND_REORDER_SEED")) {
     uint64_t value = 0;
     if (!llvm::StringRef(env).getAsInteger(10, value)) {
+      // Zero means the same here as it does in the attribute: the untouched
+      // pipeline. Reproducing "the baseline the search compared against" by
+      // hand has to name the same thing the search named.
+      if (value == 0) {
+        return std::nullopt;
+      }
       return value;
     }
     llvm::errs() << "[reorder-blocks] TRITON_ASCEND_REORDER_SEED='" << env

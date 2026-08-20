@@ -3,9 +3,10 @@
   "name": "Ascend custom (PLACEHOLDER: values inherited from 910B)",
   "vendor": "Huawei",
   "version": "0.1-draft",
+  "_comment_clock": "MEASURED. msprof reports Current Freq: 1650 and Rated Freq: 1650 on this part. The 1.85 inherited from 910B made every microsecond figure 12% optimistic while leaving cycle counts untouched, so it hid rather than showed. cycles_per_us is not parsed -- the loader derives it from frequency_ghz -- and is kept only so the two do not disagree on paper.",
   "clock": {
-    "frequency_ghz": 1.85,
-    "cycles_per_us": 1850
+    "frequency_ghz": 1.65,
+    "cycles_per_us": 1650
   },
   "memory_spaces": {
     "hbm": {
@@ -358,6 +359,10 @@
     "description": "Fixed cost of crossing one synchronisation barrier: the flag write, its propagation, and the wait that observes it. Charged as latency in the block schedule, not as pipe occupancy, because a barrier stops the core from issuing rather than keeping an engine busy -- so it can only ever show up through the recurrence bound, never through the resource bound. UNMEASURED on this target: 0 means the barrier is treated as free, which is what the model did before this field existed. Set it before comparing IR variants that differ in HOW MANY barriers they contain (a finer block partition adds barriers), because at 0 splitting a compute block in two is free and a search over partitions has a degenerate optimum at one operation per block.",
     "barrier_cycles": 0
   },
+  "core_pairing": {
+    "description": "MEASURED. How many vector cores execute one compute block's vector work. The runtime reports 28 cube cores and 56 vector cores, msprof prints two vector sub-block rows against every cube row, and the two rows carry the SAME instruction count -- 152 166 MTE3 instructions each on flash attention, against the 152 165 this model derives for a single core -- while the block's tile is only moved once. That is a split of the data, not of the instruction stream, so a repeat count is halved and a startup latency is not. Only the vector arithmetic uses this: the transfer engines are charged from bandwidths that were themselves read off a running sub-core, so they already contain the split and must not be divided again.",
+    "vector_cores_per_block": 2
+  },
   "cube_model": {
     "description": "Cube (GEMM) L1-pipe roofline parameters (tilesim 910B1 cube_config).",
     "throughput": [
@@ -521,9 +526,9 @@
     "hbm:l2_agg": {
       "bandwidth_gbps": 1638.4
     },
-    "_comment_l0c_ub": "DERIVED FROM PROFILING, not a placeholder any more. msprof on flash attention (128x128 tiles) reports aic_fixpipe_time = 87408 us where this model, at the inherited 70 GB/s, predicted 266282 us -- a factor of 3.05. 70 x 3.05 = 213. Still worth replacing with a direct microbenchmark of the L0C->UB path: this figure is inferred from one kernel's fixpipe occupancy and inherits whatever else that occupancy contains.",
+    "_comment_l0c_ub": "MEASURED, not a placeholder any more. msprof reports aic_fixpipe_active_bw = 244.9 GB/s on flash attention, read straight off the engine rather than inferred from its occupancy. The inherited 70 GB/s made the Cube drain look three to four times slower than the matmul that fed it, which is backwards for a path that exists to keep the result on chip.",
     "l0c:ub": {
-      "bandwidth_gbps": 213
+      "bandwidth_gbps": 245
     },
     "ub:l1": {
       "bandwidth_gbps": 137

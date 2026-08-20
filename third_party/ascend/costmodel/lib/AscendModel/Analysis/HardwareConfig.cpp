@@ -958,6 +958,13 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
       barrierCycles = *v >= 0 ? *v : 0;
   }
 
+  // How many vector cores share one compute block's vector work. Optional and
+  // one by default: a profile that does not mention it behaves as before.
+  if (const auto *pairing = root->getObject("core_pairing")) {
+    if (auto v = pairing->getInteger("vector_cores_per_block"))
+      vectorCoresPerBlock = *v >= 1 ? static_cast<int>(*v) : 1;
+  }
+
   return true;
 }
 

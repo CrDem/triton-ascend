@@ -605,11 +605,17 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
   int64_t k = lhsType.getShape()[1];
   int64_t n = rhsType.getShape()[1];
 
+  // No startup latency. The fractal count alone matches the hardware: msprof
+  // reports 299648 cube instructions costing 153.4M cycles on a kernel whose
+  // tiles are 128x128x128, which is 511.9 cycles each against ceil(128/16)^3 =
+  // 512. Adding the 20-cycle pipeline fill on top made it 532 and was the whole
+  // of the error -- back-to-back matmuls fill the cube pipe once, not once per
+  // operation, and this kernel never issues an isolated one.
+  //
   // TODO: switch to the tilesim-migrated L1-pipe model used by
   // ascend::MatmulOp::estimateCycles; that formula is currently tied to the
   // costmodel's own dialect op and needs extracting before it can be reused.
-  cost.cycles =
-      config.estimateCubeCycles(m, n, k) + config.getCubeStartupLatency();
+  cost.cycles = config.estimateCubeCycles(m, n, k);
   cost.flops = 2 * m * n * k;
   return cost;
 }
@@ -679,11 +685,31 @@ llvm::StringRef getVectorIntrinsic(Operation *op) {
       .Default([](Operation *) { return Ret(); });
 }
 
+/// How much of a tensor one vector core actually sees.
+///
+/// A compute block runs on one Cube core paired with several vector cores, and
+/// they split the data rather than the instruction stream: each core issues the
+/// same instructions over its own share of the tile. So the repeat count of a
+/// vector instruction shrinks by this factor while the instruction's own
+/// startup latency does not -- which is why this divides the element count fed
+/// to the cycle table instead of dividing the resulting cycles.
+///
+/// Returns the count unchanged when told of one core, which is both what an
+/// unpaired profile says and what Cube-side work gets: a fill staged for the
+/// Cube runs on the one Cube core and is priced from this same table, so it
+/// must not be divided by a pairing that does not apply to it.
+int64_t elementsPerVectorCore(int64_t elements, int vectorCores) {
+  if (vectorCores <= 1) {
+    return elements;
+  }
+  return (elements + vectorCores - 1) / vectorCores;
+}
+
 /// Cost of a reduction. A reduction is not one pass over the data: after the
 /// elementwise pass it costs a logarithmic tree inside each vector register and
 /// another one across registers. Mirrors the costmodel's own reduce model.
 OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
-                      const HardwareConfig &config) {
+                      const HardwareConfig &config, int vectorCores) {
   OpCost cost;
   cost.unit = HWUnit::Vector;
 
@@ -692,7 +718,11 @@ OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
   if (vectorWidth <= 0) {
     vectorWidth = 1;
   }
-  int64_t numVectors = (elements + vectorWidth - 1) / vectorWidth;
+  // Each core reduces its own share of the rows, so no cross-core combining
+  // step follows and the split is a plain division of the work.
+  int64_t numVectors = (elementsPerVectorCore(elements, vectorCores) +
+                        vectorWidth - 1) /
+                       vectorWidth;
 
   auto log2Steps = [](int64_t value) {
     int steps = 0;
@@ -710,7 +740,8 @@ OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
 }
 
 /// Cost of an elementwise compute op on the Vector core.
-OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
+OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config,
+                             int vectorCores) {
   OpCost cost;
   cost.unit = HWUnit::Vector;
 
@@ -726,12 +757,15 @@ OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
   }
 
   if (isa<linalg::ReduceOp>(op)) {
-    return estimateReduce(op, shapedType, *elements, config);
+    return estimateReduce(op, shapedType, *elements, config, vectorCores);
   }
 
   llvm::StringRef intrinsic = getVectorIntrinsic(op);
   cost.cycles = config.estimateVectorCyclesFromTable(
-      *elements, getShapedElementBits(shapedType), intrinsic);
+      elementsPerVectorCore(*elements, vectorCores),
+      getShapedElementBits(shapedType), intrinsic);
+  // Work done, not time spent: this is the whole block's arithmetic however
+  // many cores it was spread over.
   cost.flops = *elements;
   // With a known instruction the cost comes from the measured table; without
   // one it falls back to a flat cycle per pass, which is a guess worth
@@ -824,14 +858,49 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     // Profiling caught this directly: the cycles showed up under the Cube's
     // MTE2 while the hardware was spending them on the Vector core's MTE3,
     // which the model had at almost zero.
-    auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
-    llvm::StringRef fallbackSrc = guessed.first;
+    llvm::StringRef knownSrc;
+    llvm::StringRef knownDst;
     if (auto ends = getHivmTransferEnds(op)) {
-      const llvm::StringRef knownDst = getMemorySpaceName(ends->dest.getType());
-      if (knownDst == "l1" || knownDst == "l0a" || knownDst == "l0b") {
-        fallbackSrc = "ub";
-      }
+      knownSrc = getMemorySpaceName(ends->source.getType());
+      knownDst = getMemorySpaceName(ends->dest.getType());
     }
+    const bool destFeedsCube =
+        knownDst == "l1" || knownDst == "l0a" || knownDst == "l0b";
+
+    auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
+    llvm::StringRef fallbackSrc = destFeedsCube ? llvm::StringRef("ub")
+                                                : guessed.first;
+
+    // On the Vector core, with the source unreadable and the destination not
+    // naming a hand-off to the Cube, nothing left in the IR says this copy
+    // leaves the chip -- and assuming it does is not a harmless default. With
+    // 64x64 tiles that assumption charged 1.36 billion cycles, 39% of all the
+    // work in the estimate, to the vector load engine and made it the pipe the
+    // whole roofline was built from; msprof measures that engine at 5.7 us over
+    // the same run and its GM->UB traffic at 6 KB, against the tens of
+    // gigabytes implied. The same copies resolve to ub:l1 at 128x128, so what
+    // varies is what the IR still carries, not what the hardware does.
+    //
+    // These copies exist to stage data between the cores and between buffers,
+    // which is on-chip work; a transfer that leaves the chip is the case that
+    // has to be proven. Charge nothing and say so: as an unmodelled kind it
+    // shows up in the report as a hole, which is recoverable, rather than as a
+    // bottleneck, which is not.
+    if (!isCube && knownSrc.empty() && !destFeedsCube) {
+      OpCost cost;
+      cost.unit = HWUnit::VecMTE2;
+      cost.confidence = CostConfidence::NotModelled;
+      cost.srcSpace = "unresolved";
+      cost.dstSpace =
+          knownDst.empty() ? llvm::StringRef("unresolved") : knownDst;
+      if (Type sizingType = getTransferSizingType(op)) {
+        if (auto bytes = getShapedByteSize(sizingType)) {
+          cost.bytes = *bytes;
+        }
+      }
+      return cost;
+    }
+
     auto [srcSpace, dstSpace] =
         resolveHivmTransferSpaces(op, fallbackSrc, guessed.second);
     Type shapedType = getTransferSizingType(op);
@@ -868,8 +937,10 @@ std::optional<OpCost> estimateOpCost(Operation *op,
 
   // Remaining shaped compute. Cube-side non-matmul work (e.g. a fill or
   // transpose staged for the Cube pipe) is charged to the Cube unit; everything
-  // else is Vector work.
-  OpCost cost = estimateVectorCompute(op, config);
+  // else is Vector work. Only the latter is spread over the block's vector
+  // cores: the Cube side of a block is one core, so it sees the whole tile.
+  OpCost cost = estimateVectorCompute(
+      op, config, isCube ? 1 : config.getVectorCoresPerBlock());
   if (isCube) {
     cost.unit = HWUnit::Cube;
   }

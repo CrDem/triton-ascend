@@ -343,6 +343,23 @@ public:
   int64_t getBarrierCycles() const { return barrierCycles; }
   void setBarrierCycles(int64_t cycles) { barrierCycles = cycles; }
 
+  /// How many vector cores execute the vector work of one compute block.
+  ///
+  /// They split the data, not the instruction stream: on a profiled kernel both
+  /// vector sub-cores of a block report the same instruction count -- 152 166
+  /// MTE3 instructions each, against the 152 165 this model derives for one
+  /// core -- while each moves half of every tile. A consumer therefore divides
+  /// the repeat count of an instruction by this number and leaves the
+  /// instruction's startup latency alone.
+  ///
+  /// Defaults to 1, the behaviour before the field existed, because it
+  /// describes one part's core pairing and no profile should acquire it by
+  /// inheritance.
+  int getVectorCoresPerBlock() const { return vectorCoresPerBlock; }
+  void setVectorCoresPerBlock(int cores) {
+    vectorCoresPerBlock = cores >= 1 ? cores : 1;
+  }
+
   // Cube (GEMM) micro-architecture: migrated from tilesim cube_config.
   void getCubeModelThroughput(int elementBits, int &basicM, int &basicK,
                               int &basicN) const;
@@ -402,6 +419,9 @@ private:
   // Cost of one synchronisation barrier in cycles. Zero means "not modelled",
   // which is what every profile says until someone measures it.
   int64_t barrierCycles = 0;
+  // Vector cores sharing one compute block's vector work. One means "no
+  // pairing described", which leaves every existing profile unchanged.
+  int vectorCoresPerBlock = 1;
 };
 
 //===----------------------------------------------------------------------===//
