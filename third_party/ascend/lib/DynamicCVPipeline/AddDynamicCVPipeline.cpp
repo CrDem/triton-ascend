@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
@@ -48,6 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <tuple>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -259,12 +261,28 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // a wall the total cannot see past, which is worth knowing before trusting
     // the winner.
     int64_t tieBreaks = 0;
-    // How many different numbers the candidates scored. One means every
-    // ordering that compiled looked identical to the estimate, which says
-    // where to look next: either the generator is producing one shape under
-    // many names, or the estimate cannot see what separates them. Without this
-    // the two are indistinguishable from outside.
-    llvm::DenseSet<int64_t> distinctCosts;
+    // How many different scores the candidates got. One means every ordering
+    // that compiled looked identical to the estimate, which says where to look
+    // next: either the generator is producing one shape under many names, or
+    // the estimate cannot see what separates them. Without this the two are
+    // indistinguishable from outside.
+    //
+    // Keyed on the pair, not on the total: since the second bound decides
+    // ties, two candidates with the same total are no longer the same
+    // candidate, and counting totals alone under-reports how much the search
+    // can actually tell apart.
+    llvm::DenseSet<std::pair<int64_t, int64_t>> distinctCosts;
+    // Candidates whose total was indistinguishable from the best so far. The
+    // difference between "no ties happened" and "ties happened and none of
+    // them was an improvement" is not visible from the winner alone, and the
+    // two mean opposite things about whether the second bound is earning its
+    // keep.
+    int64_t tiedCandidates = 0;
+    // Every accepted candidate, so that a winner rejected further down the
+    // toolchain -- by the binary compiler running out of Unified Buffer, say,
+    // which no pass here can foresee -- leaves the next choices on record
+    // instead of sending the search back to the start.
+    SmallVector<std::tuple<int64_t, int64_t, int64_t>> ranked;
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
@@ -341,7 +359,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       }
 
       ++usable;
-      distinctCosts.insert(cost);
+      distinctCosts.insert({cost, second});
+      ranked.push_back({cost, second, seed});
       if (worstCost < cost) {
         worstCost = cost;
       }
@@ -353,6 +372,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       bool byTieBreak = false;
       if (!improves) {
         if (totalsAreTied(cost, bestCost)) {
+          ++tiedCandidates;
           improves = second < bestSecond;
           byTieBreak = improves;
         } else {
@@ -384,13 +404,32 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctCosts.size()
                    << " distinct estimate(s), worst " << worstCost
                    << " cycles; seed 0 is the untouched pipeline\n";
-      if (tieBreaks > 0) {
-        llvm::errs() << "[" << DEBUG_TYPE << "]   " << tieBreaks
-                     << " improvement(s) came from the second bound after the"
-                        " totals tied -- the winner is held back by the same"
-                        " constraint as the rest, and was chosen for having"
-                        " more room before the other one bites\n";
+      if (tiedCandidates > 0) {
+        llvm::errs() << "[" << DEBUG_TYPE << "]   " << tiedCandidates
+                     << " candidate(s) tied with the best on the total, "
+                     << tieBreaks << " of which won on the second bound";
+        if (tieBreaks == 0) {
+          llvm::errs() << " -- so the ties were real and none of them had more"
+                          " room than the incumbent, which is what to expect"
+                          " when the best candidate already has the shortest"
+                          " dependency chain";
+        }
+        llvm::errs() << "\n";
       }
+      // Ordered the same way the search ordered them, so the runner-up is a
+      // seed and not a re-run. Worth having because a winner can still be
+      // refused by the binary compiler for something no pass here models --
+      // Unified Buffer capacity being the case that has actually bitten.
+      llvm::sort(ranked);
+      const size_t shown = std::min<size_t>(ranked.size(), 5);
+      llvm::errs() << "[" << DEBUG_TYPE << "]   best " << shown
+                   << " seed(s), in case the winner is refused downstream:";
+      for (size_t i = 0; i < shown; ++i) {
+        llvm::errs() << " " << std::get<2>(ranked[i]) << "("
+                     << std::get<0>(ranked[i]) << "/" << std::get<1>(ranked[i])
+                     << ")";
+      }
+      llvm::errs() << "  [seed(total/second bound)]\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }

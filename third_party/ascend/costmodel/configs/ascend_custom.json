@@ -45,10 +45,10 @@
     },
     "ub": {
       "type": "on_chip_local",
-      "size_kb": 192,
+      "size_kb": 248,
       "bandwidth_gbps": 3200,
       "latency_cycles": 5,
-      "description": "Unified Buffer for Vector compute"
+      "description": "MEASURED capacity. The binary compiler names it when a kernel overruns: 'ub overflow, requires 2764800 bits while 2031616 bits available'. 2031616 bits is 253952 bytes, i.e. 248 KB, against the 192 KB inherited here from another part. Nothing in the estimate divides by this -- it is reported next to what the module allocates, because that is the constraint that decides whether a block partition can be compiled at all."
     }
   },
   "compute_units": {

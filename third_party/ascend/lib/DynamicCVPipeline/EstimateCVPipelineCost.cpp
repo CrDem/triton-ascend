@@ -2528,6 +2528,44 @@ FlagCensus takeFlagCensus(ModuleOp module) {
   return census;
 }
 
+/// How much Unified Buffer the module asks for.
+///
+/// This is the constraint that decides whether a block partition can exist at
+/// all, and nothing in the estimate knew about it. Splitting a run of vector
+/// work into more blocks materialises the values that cross the new boundary:
+/// a score tile consumed in place inside one block has to become a real buffer
+/// once a barrier lands in the middle of it. So a finer partition buys overlap
+/// with UB, and a variant can be ranked best here and then be rejected outright
+/// by the binary compiler -- which is exactly what happened to a candidate that
+/// needed 345 600 bytes against the 253 952 the part has.
+///
+/// The sum of every allocation, not a high-water mark: liveness is not tracked
+/// here, so two buffers that never coexist are still both counted. That makes
+/// this an over-estimate, which is why it is reported and not used to reject
+/// anything -- throwing away a variant that would have fitted is worse than
+/// letting one through. It is also a lower bound in the other direction, since
+/// the downstream compiler adds its own multi-buffering on top. Both errors go
+/// the same way for every variant, so the comparison between variants is still
+/// worth reading.
+struct UBFootprint {
+  int64_t bytes = 0;
+  int64_t allocations = 0;
+};
+
+UBFootprint measureUBFootprint(ModuleOp module) {
+  UBFootprint footprint;
+  module.walk([&](memref::AllocOp alloc) {
+    if (getMemorySpaceName(alloc.getType()) != "ub") {
+      return;
+    }
+    if (auto bytes = getShapedByteSize(alloc.getType())) {
+      footprint.bytes += *bytes;
+      ++footprint.allocations;
+    }
+  });
+  return footprint;
+}
+
 /// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
 /// goes through an inter-core buffer rather than an intra-core one. A block
 /// whose operations disagree about their core touches both, so any edge to it
@@ -2644,6 +2682,9 @@ struct ModuleEstimate {
   BufferDepths buffers;
   /// Synchronisation flags spent, against a budget nothing else here shows.
   FlagCensus flags;
+  /// Unified Buffer asked for, against the capacity that decides whether this
+  /// partition compiles at all.
+  UBFootprint ub;
   /// The buffer whose reuse constrains the kernel most, and its bound.
   BufferRecurrence recurrence;
   int64_t recurrenceBound = 0;
@@ -2686,10 +2727,12 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
                                      const HardwareConfig &config,
                                      const FusionFactors &fusion,
                                      const BufferDepths &buffers,
-                                     const FlagCensus &flags) {
+                                     const FlagCensus &flags,
+                                     const UBFootprint &ub) {
   ModuleEstimate estimate;
   estimate.buffers = buffers;
   estimate.flags = flags;
+  estimate.ub = ub;
   estimate.order = topologicalBlockOrder(breakdown);
 
   BarrierTally weightedBarriers;
@@ -3035,6 +3078,21 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                                       : "")
        << ". Live count is by program order, so it is an over-estimate of what"
           " the allocator's interference colouring would need\n";
+  }
+  if (estimate.ub.allocations > 0) {
+    const MemorySpace *ub = config.getMemorySpace("ub");
+    os << "[" << DEBUG_TYPE << "]     unified buffer: "
+       << estimate.ub.allocations << " allocation(s) totalling "
+       << estimate.ub.bytes << " bytes";
+    if (ub && ub->sizeBytes > 0) {
+      os << " against a capacity of " << ub->sizeBytes;
+    }
+    os << ". Summed, not a high-water mark -- buffers that never coexist are"
+          " still both counted -- and the binary compiler multi-buffers on top"
+          " of this, so it is neither an upper nor a lower bound. It is here"
+          " because a finer block partition pays for its overlap in UB, and a"
+          " variant that overruns is rejected outright by that compiler, not"
+          " by anything the estimate can see\n";
   }
   if (scalarOps > 0) {
     const int perInstruction = config.getScalarCyclesPerInstruction();
@@ -3402,7 +3460,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // into different blocks has to change the number.
   const ModuleEstimate estimate =
       computeModuleEstimate(breakdown, *config, fusion,
-                            readBufferDepths(module), takeFlagCensus(module));
+                            readBufferDepths(module), takeFlagCensus(module),
+                            measureUBFootprint(module));
   const int64_t totalCycles = estimate.total;
 
   // Kept for comparison: what the model reported before blocks constrained it,
