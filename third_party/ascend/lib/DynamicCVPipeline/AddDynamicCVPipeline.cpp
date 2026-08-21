@@ -44,6 +44,7 @@
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -81,6 +82,27 @@ namespace {
 // treats that as an infinitely expensive candidate rather than as an error.
 
 constexpr const char *kVariantCountEnvVar = "TRITON_ASCEND_CV_VARIANTS";
+
+/// Two totals this close to each other are treated as the same number.
+///
+/// The estimate is the larger of two bounds, and the resource bound does not
+/// depend on how operations were grouped -- so once a candidate reaches it,
+/// every other candidate that also reaches it scores identically, and the
+/// search has nothing left to compare. Exact equality is the common case;
+/// near-equality happens because the fusion factor rounds per block, and one
+/// run had a candidate win by a single cycle out of half a billion. Neither is
+/// a finding, so both are called a tie and decided on the second bound.
+///
+/// 0.0001 is deliberately tight. Widening it starts trading a real difference
+/// in the leading bound for a difference in the trailing one, which is the
+/// wrong way round.
+constexpr int64_t kTieRelativeDenominator = 10000;
+
+bool totalsAreTied(int64_t a, int64_t b) {
+  const int64_t diff = a > b ? a - b : b - a;
+  const int64_t scale = a > b ? a : b;
+  return diff * kTieRelativeDenominator <= scale;
+}
 
 /// How many orderings to try. One or fewer means the ordinary single
 /// compilation, which is what every build that does not ask for a search gets.
@@ -227,8 +249,16 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   if (variantCount > 1) {
     int64_t bestSeed = -1;
     int64_t bestCost = 0;
+    // The bound the total did not come from, for the winner. Used only to
+    // separate candidates whose totals tie.
+    int64_t bestSecond = 0;
     int64_t worstCost = 0;
     int64_t usable = 0;
+    // How often the second bound was what decided. A search that never used it
+    // was ordered by the total alone; one that used it often is running against
+    // a wall the total cannot see past, which is worth knowing before trusting
+    // the winner.
+    int64_t tieBreaks = 0;
     // How many different numbers the candidates scored. One means every
     // ordering that compiled looked identical to the estimate, which says
     // where to look next: either the generator is producing one shape under
@@ -255,6 +285,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     for (int64_t seed = 0; seed < variantCount; ++seed) {
       bool accepted = false;
       int64_t cost = 0;
+      int64_t second = 0;
       int errCode = 0;
 
       {
@@ -284,6 +315,15 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         if (ran && costAttr) {
           accepted = true;
           cost = costAttr.getInt();
+          auto resourceAttr = moduleOp->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineCostResource);
+          auto recurrenceAttr = moduleOp->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineCostRecurrence);
+          // Falling back to the total itself makes every tie compare equal,
+          // which is exactly the behaviour before the second bound existed.
+          second = resourceAttr && recurrenceAttr
+                       ? std::min(resourceAttr.getInt(), recurrenceAttr.getInt())
+                       : cost;
         } else if (!ran) {
           auto codeAttr =
               moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
@@ -305,11 +345,34 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       if (worstCost < cost) {
         worstCost = cost;
       }
-      if (bestSeed < 0 || cost < bestCost) {
+      // Order by the total, and by the other bound only when the totals cannot
+      // be told apart. The two bounds are not interchangeable -- the total is
+      // still what the model claims the kernel costs -- so this never lets a
+      // candidate with a worse total win.
+      bool improves = bestSeed < 0;
+      bool byTieBreak = false;
+      if (!improves) {
+        if (totalsAreTied(cost, bestCost)) {
+          improves = second < bestSecond;
+          byTieBreak = improves;
+        } else {
+          improves = cost < bestCost;
+        }
+      }
+      if (improves) {
         bestSeed = seed;
         bestCost = cost;
+        bestSecond = second;
+        if (byTieBreak) {
+          ++tieBreaks;
+        }
         llvm::errs() << "[" << DEBUG_TYPE << "]   seed " << seed << ": " << cost
-                     << " cycles (best so far)\n";
+                     << " cycles";
+        if (byTieBreak) {
+          llvm::errs() << " (tied on the total; won on the other bound at "
+                       << second << ")";
+        }
+        llvm::errs() << " (best so far)\n";
       }
     }
 
@@ -321,6 +384,13 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctCosts.size()
                    << " distinct estimate(s), worst " << worstCost
                    << " cycles; seed 0 is the untouched pipeline\n";
+      if (tieBreaks > 0) {
+        llvm::errs() << "[" << DEBUG_TYPE << "]   " << tieBreaks
+                     << " improvement(s) came from the second bound after the"
+                        " totals tied -- the winner is held back by the same"
+                        " constraint as the rest, and was chosen for having"
+                        " more room before the other one bites\n";
+      }
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }

@@ -890,9 +890,10 @@ std::optional<OpCost> estimateOpCost(Operation *op,
       OpCost cost;
       cost.unit = HWUnit::VecMTE2;
       cost.confidence = CostConfidence::NotModelled;
-      cost.srcSpace = "unresolved";
-      cost.dstSpace =
-          knownDst.empty() ? llvm::StringRef("unresolved") : knownDst;
+      // "?" rather than a word: the transfer table gives the path a narrow
+      // column, and a long name runs into the operation name beside it.
+      cost.srcSpace = "?";
+      cost.dstSpace = knownDst.empty() ? llvm::StringRef("?") : knownDst;
       if (Type sizingType = getTransferSizingType(op)) {
         if (auto bytes = getShapedByteSize(sizingType)) {
           cost.bytes = *bytes;
@@ -2318,6 +2319,9 @@ struct BufferDepths {
   /// is the business of DecoupleComputeAndMemory, which this pipeline does not
   /// run, so raising it changes neither the IR nor the estimate.
   int64_t requestedLoad = 1;
+  /// The pipeline asked for inter-core double buffering and the flag budget
+  /// refused it, so the IR is single-buffered whatever the count says.
+  bool interDowngraded = false;
 
   /// Depth that gates an edge: crossing cores goes through an inter-core
   /// buffer, staying on one core through an intra-core one.
@@ -2344,7 +2348,105 @@ BufferDepths readBufferDepths(ModuleOp module) {
   read(CVPipeline::kInterCoreBufCount, depths.requestedInter);
   read(CVPipeline::kLoadStoreBufCount, depths.requestedLoad);
   depths.inter = std::min(depths.requestedInter, kMaxUsefulInterCoreDepth);
+  // AddMultiBufferOuterScope compiles single-buffered when the double-buffer
+  // groups would not fit in the flag budget, and leaves the count attribute
+  // alone while doing it. Dividing by two here would then credit an overlap
+  // that is not in the IR -- and hide the cost of the very thing that caused
+  // the downgrade, since one extra flag is all it takes.
+  if (module->hasAttr(CVPipeline::kInterCoreBufDowngraded)) {
+    depths.interDowngraded = true;
+    depths.inter = 1;
+  }
   return depths;
+}
+
+/// How many synchronisation flags the compiled module uses, and how many are
+/// live at the same time.
+///
+/// The hardware has a small fixed set of set/wait flags and the pipeline
+/// allocates out of it: FlagIdManager caps ids at 14, at 7 while inter-core
+/// double buffering is on, and AnalyzeFlag abandons the whole CV pipeline for
+/// any id outside that range. So the budget is a hard limit on how finely
+/// blocks may be split -- and it appears in no other number this report
+/// prints, which is why a variant can fail to compile, or quietly lose its
+/// double buffering, for a reason the estimate never mentions.
+///
+/// Two counts, answering different questions. Distinct ids is what the module
+/// spends as it stands. Peak live is what it would need if ids were reassigned
+/// as well as possible: FlagIdReuseManager colours an interference graph, so
+/// what it can get away with is that graph's chromatic number, and the peak
+/// number of overlapping lifetimes is a lower bound on it.
+///
+/// Lifetimes are taken in program order here -- a flag is live from its first
+/// set to its last wait. The allocator uses reachability, which can prove two
+/// flags disjoint where program order cannot, so this peak is never lower than
+/// what the allocator needs and may be higher. It is therefore reported and
+/// nothing else: rejecting a variant on a number known to be pessimistic would
+/// discard variants that would have compiled.
+struct FlagCensus {
+  int distinct = 0;
+  int peakLive = 0;
+  int highestId = -1;
+};
+
+FlagCensus takeFlagCensus(ModuleOp module) {
+  FlagCensus census;
+
+  // Flag id -> [index of its first set/wait, index of its last], counted over
+  // sync operations only so the indices are dense in what matters.
+  llvm::DenseMap<int, std::pair<int64_t, int64_t>> span;
+  int64_t index = 0;
+  module.walk([&](Operation *op) {
+    if (!isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(op)) {
+      return;
+    }
+    int id = -1;
+    // The pipeline spells this three ways depending on which pass wrote it;
+    // getFlagFromSyncOp in AddMultiBufferOuterScope reads the same three.
+    for (llvm::StringRef name : {"flag_id", "static_flag_id", "flag"}) {
+      if (auto attr = op->getAttrOfType<IntegerAttr>(name)) {
+        id = static_cast<int>(attr.getInt());
+        break;
+      }
+    }
+    if (id < 0) {
+      return;
+    }
+    ++index;
+    auto it = span.find(id);
+    if (it == span.end()) {
+      span[id] = {index, index};
+    } else {
+      it->second.second = index;
+    }
+    census.highestId = std::max(census.highestId, id);
+  });
+
+  census.distinct = static_cast<int>(span.size());
+
+  // Sweep the lifetimes. Every index belongs to exactly one operation and so
+  // to one flag, which is why opens and closes of different flags never tie;
+  // the +1 before -1 ordering only matters for a flag whose set and wait are
+  // the same operation index.
+  llvm::SmallVector<std::pair<int64_t, int>> events;
+  events.reserve(span.size() * 2);
+  for (const auto &entry : span) {
+    events.push_back({entry.second.first, +1});
+    events.push_back({entry.second.second, -1});
+  }
+  llvm::sort(events, [](const std::pair<int64_t, int> &a,
+                        const std::pair<int64_t, int> &b) {
+    if (a.first != b.first) {
+      return a.first < b.first;
+    }
+    return a.second > b.second;
+  });
+  int live = 0;
+  for (const auto &event : events) {
+    live += event.second;
+    census.peakLive = std::max(census.peakLive, live);
+  }
+  return census;
 }
 
 /// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
@@ -2461,6 +2563,8 @@ struct ModuleEstimate {
   int64_t serialisedBound = 0;
   /// Buffer depths as recorded on the module by BufferCountManager.
   BufferDepths buffers;
+  /// Synchronisation flags spent, against a budget nothing else here shows.
+  FlagCensus flags;
   /// The buffer whose reuse constrains the kernel most, and its bound.
   BufferRecurrence recurrence;
   int64_t recurrenceBound = 0;
@@ -2502,9 +2606,11 @@ struct ModuleEstimate {
 ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
                                      const HardwareConfig &config,
                                      const FusionFactors &fusion,
-                                     const BufferDepths &buffers) {
+                                     const BufferDepths &buffers,
+                                     const FlagCensus &flags) {
   ModuleEstimate estimate;
   estimate.buffers = buffers;
+  estimate.flags = flags;
   estimate.order = topologicalBlockOrder(breakdown);
 
   BarrierTally weightedBarriers;
@@ -2834,7 +2940,29 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE << "]     buffer depths read from the module: intra "
      << estimate.buffers.intra << ", inter-core " << estimate.buffers.inter
      << "\n";
-  if (estimate.buffers.requestedInter > estimate.buffers.inter) {
+  if (estimate.flags.distinct > 0) {
+    // The budget is a hardware limit, not a cost: exceeding it does not make
+    // the kernel slow, it makes it not compile (AnalyzeFlag) or silently
+    // single-buffered (AddMultiBufferOuterScope). Printed next to the buffer
+    // depths because the two interact -- double buffering halves the budget.
+    const int budget = estimate.buffers.inter > 1 ? 8 : 15;
+    os << "[" << DEBUG_TYPE << "]     synchronisation flags: "
+       << estimate.flags.distinct << " distinct, highest id "
+       << estimate.flags.highestId << ", at most " << estimate.flags.peakLive
+       << " live at once, against a budget of " << budget
+       << (estimate.buffers.inter > 1 ? " (halved by inter-core double"
+                                        " buffering)"
+                                      : "")
+       << ". Live count is by program order, so it is an over-estimate of what"
+          " the allocator's interference colouring would need\n";
+  }
+  if (estimate.buffers.interDowngraded) {
+    os << "[" << DEBUG_TYPE
+       << "]       note: inter-core double buffering was asked for and refused"
+          " -- the synchronisation flags it needs do not fit the hardware"
+          " budget, so AddMultiBufferOuterScope compiled single-buffered."
+          " Costed at depth 1, which is what the IR contains\n";
+  } else if (estimate.buffers.requestedInter > estimate.buffers.inter) {
     os << "[" << DEBUG_TYPE << "]       note: inter_core_buf_count="
        << estimate.buffers.requestedInter
        << " was requested, but the pipeline only distinguishes 1 from more"
@@ -3175,8 +3303,9 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // The estimate is assembled from the blocks, not from a single roofline over
   // every operation: the whole point is that regrouping the same operations
   // into different blocks has to change the number.
-  const ModuleEstimate estimate = computeModuleEstimate(
-      breakdown, *config, fusion, readBufferDepths(module));
+  const ModuleEstimate estimate =
+      computeModuleEstimate(breakdown, *config, fusion,
+                            readBufferDepths(module), takeFlagCensus(module));
   const int64_t totalCycles = estimate.total;
 
   // Kept for comparison: what the model reported before blocks constrained it,
@@ -3188,6 +3317,12 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(totalCycles));
   module->setAttr(kCVPipelineCostRoofline,
                   builder.getI64IntegerAttr(rooflineCycles));
+  // Separately, so a consumer can see which of the two the total came from and
+  // how much room the other one had.
+  module->setAttr(kCVPipelineCostResource,
+                  builder.getI64IntegerAttr(estimate.throughputBound));
+  module->setAttr(kCVPipelineCostRecurrence,
+                  builder.getI64IntegerAttr(estimate.recurrenceBound));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,
