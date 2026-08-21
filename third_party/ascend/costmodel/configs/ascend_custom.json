@@ -359,6 +359,14 @@
     "description": "Fixed cost of crossing one synchronisation barrier: the flag write, its propagation, and the wait that observes it. Charged as latency in the block schedule, not as pipe occupancy, because a barrier stops the core from issuing rather than keeping an engine busy -- so it can only ever show up through the recurrence bound, never through the resource bound. UNMEASURED on this target: 0 means the barrier is treated as free, which is what the model did before this field existed. Set it before comparing IR variants that differ in HOW MANY barriers they contain (a finer block partition adds barriers), because at 0 splitting a compute block in two is free and a search over partitions has a degenerate optimum at one operation per block.",
     "barrier_cycles": 0
   },
+  "vector_datapath": {
+    "description": "MEASURED. Bytes one vector core consumes per cycle. vec_cycle_tables was migrated from a part whose datapath is 128 B/cycle -- a 256-byte repeat at compute=2 -- and its numbers are rescaled by the ratio rather than edited, so the relative cost between intrinsics is preserved. Derived by least squares over three tile configurations spanning 3.1x in total repeats, which gave 0.89 cycles per repeat and, independently and without being fitted, 35.8 cycles of per-instruction startup against the 35 already in the model. That second agreement is what says the formula's shape is right and only this one number was wrong. 0.89 cycles per 256-byte repeat is 288 B/cycle; 256 is the physically natural value next to it and is what is set here, leaving the model about 6% over on the compute term.",
+    "bytes_per_cycle": 256
+  },
+  "scalar_issue": {
+    "description": "UNMEASURED, and left at zero for that reason. Each core's scalar unit runs address arithmetic, loop bookkeeping and predicate evaluation; the profiler puts that at 19-24% of the Cube's active time and 14-20% of the Vector's, and -- the part that matters for choosing a block partition -- at 232, 239 and 252 cycles per iteration across three tile configurations whose area differs fourfold. It scales with blocks, not with data. What is missing is the split between per-instruction and per-block: every run so far had eleven blocks, so the two cannot be told apart. The estimate report prints the weighted instruction count next to this, which is the other half of the division; one profiled run fills it in.",
+    "cycles_per_instruction": 0
+  },
   "core_pairing": {
     "description": "MEASURED. How many vector cores execute one compute block's vector work. The runtime reports 28 cube cores and 56 vector cores, msprof prints two vector sub-block rows against every cube row, and the two rows carry the SAME instruction count -- 152 166 MTE3 instructions each on flash attention, against the 152 165 this model derives for a single core -- while the block's tile is only moved once. That is a split of the data, not of the instruction stream, so a repeat count is halved and a startup latency is not. Only the vector arithmetic uses this: the transfer engines are charged from bandwidths that were themselves read off a running sub-core, so they already contain the split and must not be divided again.",
     "vector_cores_per_block": 2
@@ -535,6 +543,13 @@
     },
     "l1:ub": {
       "bandwidth_gbps": 137
+    },
+    "_comment_l1_l0": "MEASURED. Staging the Cube's operands from L1 into L0A/L0B, which the profiler reports as aic_mte1_time and which nothing in the model charged until the matmul started paying for it. msprof gives aic_mte1_active_bw between 292 and 361 GB/s across configurations, and the arithmetic agrees from the other side: four instructions per inner iteration moving 128 KB in about 560 cycles is ~234 B/cycle, i.e. ~386 GB/s. 355 sits inside that range. Worth a direct microbenchmark: the figure comes from one kernel's occupancy and inherits whatever else that occupancy contains.",
+    "l1:l0a": {
+      "bandwidth_gbps": 355
+    },
+    "l1:l0b": {
+      "bandwidth_gbps": 355
     }
   },
   "vec_cycle_tables": {

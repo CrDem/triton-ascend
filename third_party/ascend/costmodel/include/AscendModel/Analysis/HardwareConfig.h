@@ -360,6 +360,40 @@ public:
     vectorCoresPerBlock = cores >= 1 ? cores : 1;
   }
 
+  /// Bytes one vector core consumes per cycle.
+  ///
+  /// vec_cycle_tables gives cycles per 256-byte repeat, so its numbers already
+  /// contain a datapath width: compute=2 for a plain add is 128 B/cycle. What
+  /// carries over from the part those tables were measured on is the *ratio*
+  /// between intrinsics -- a divide costs four times an add there and should
+  /// here too -- not the absolute count. So a consumer rescales the table by
+  /// kVecTableBytesPerCycle / this, and the table itself is left as migrated.
+  ///
+  /// Defaults to the table's own width, which leaves every existing profile
+  /// costed exactly as before.
+  int getVectorBytesPerCycle() const { return vectorBytesPerCycle; }
+
+  /// Width the migrated vec_cycle_tables were measured at: a 256-byte repeat
+  /// at compute=2 is 128 bytes per cycle.
+  static constexpr int kVecTableBytesPerCycle = 128;
+
+  /// Cycles one scalar instruction occupies its core's scalar unit for.
+  ///
+  /// Address arithmetic, loop bookkeeping and predicate evaluation are not
+  /// free: the profiler puts them at a fifth to a quarter of each core's
+  /// active time, and they scale with the number of blocks rather than with
+  /// the data, so they are exactly what makes a finer block partition cost
+  /// something. They overlap the compute pipes rather than queueing behind
+  /// them, so a consumer takes the maximum against those, not the sum.
+  ///
+  /// Defaults to 0, i.e. not charged, because the per-instruction figure has
+  /// not been measured yet -- only the per-iteration total has. The report
+  /// prints the instruction count next to that total so the division can be
+  /// done from one profiled run rather than guessed at here.
+  int getScalarCyclesPerInstruction() const {
+    return scalarCyclesPerInstruction;
+  }
+
   // Cube (GEMM) micro-architecture: migrated from tilesim cube_config.
   void getCubeModelThroughput(int elementBits, int &basicM, int &basicK,
                               int &basicN) const;
@@ -422,6 +456,12 @@ private:
   // Vector cores sharing one compute block's vector work. One means "no
   // pairing described", which leaves every existing profile unchanged.
   int vectorCoresPerBlock = 1;
+  // Vector datapath width. Defaulting to the table's own width makes the
+  // rescaling a no-op for profiles that do not declare one.
+  int vectorBytesPerCycle = kVecTableBytesPerCycle;
+  // Cycles per scalar instruction. Zero means "not modelled", which is what
+  // every profile says until the number is measured.
+  int scalarCyclesPerInstruction = 0;
 };
 
 //===----------------------------------------------------------------------===//

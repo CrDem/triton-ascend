@@ -415,7 +415,15 @@ HWUnit getTransferUnit(llvm::StringRef src, llvm::StringRef dst) {
   if (src == "l0c") {
     return dst == "ub" ? HWUnit::FixPipeUB : HWUnit::FixPipe;
   }
-  if (dst == "l1" || dst == "l0a" || dst == "l0b") {
+  if (dst == "l0a" || dst == "l0b") {
+    // Into the Cube's operand buffers. From L1 this is its MTE1, an engine the
+    // profiler reports apart from MTE2 and which nothing charged until now.
+    if (src == "l1") {
+      return HWUnit::CubeMTE1;
+    }
+    return src == "ub" ? HWUnit::MTE3ToL1 : HWUnit::CubeMTE2;
+  }
+  if (dst == "l1") {
     // Feeding the Cube: from HBM/L2 this is its MTE2; from UB it is the vector
     // store engine writing on chip instead of out to HBM, which this target
     // can do directly -- the bandwidth table has a ub:l1 entry, so no round
@@ -514,6 +522,8 @@ int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
   case HWUnit::VecMTE2:
   // Reading L1 into UB is still the load engine starting up.
   case HWUnit::MTE1ToUB:
+  // So is staging L1 into the Cube's operand buffers.
+  case HWUnit::CubeMTE1:
     return config.getMTE2StartupLatency();
   case HWUnit::FixPipe:
   case HWUnit::FixPipeUB:
@@ -571,6 +581,14 @@ struct OpCost {
   int64_t cycles = 0;
   int64_t bytes = 0;
   int64_t flops = 0;
+  /// A second engine the same operation occupies, for the case where one IR
+  /// operation drives two of them at once. A matmul is the reason this exists:
+  /// it runs the MACs *and* stages its operands from L1 into L0A/L0B, and the
+  /// second is a separate engine with its own busy time -- one the profiler
+  /// reports as a third of the Cube's. Zero cycles means "only one engine",
+  /// which is every other operation.
+  HWUnit sideUnit = HWUnit::Scalar;
+  int64_t sideCycles = 0;
   CostConfidence confidence = CostConfidence::Modelled;
   /// Address spaces a transfer moves between, empty for everything else.
   /// Kept so the report can show which path each transfer took: the same
@@ -617,6 +635,26 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
   // costmodel's own dialect op and needs extracting before it can be reused.
   cost.cycles = config.estimateCubeCycles(m, n, k);
   cost.flops = 2 * m * n * k;
+
+  // Both operands have to be staged from L1 into L0A/L0B before the MACs can
+  // run, on the Cube's MTE1. No operation in the IR stands for that move --
+  // the matmul reads L1 and the transfer is implicit -- so it is charged from
+  // the operand shapes here, or it is not charged at all.
+  //
+  // The count checks out against the hardware: msprof reports exactly four
+  // MTE1 instructions per inner iteration of a kernel whose loop body holds
+  // two matmuls, which is one per operand. The time did too -- 128 KB moved in
+  // about 560 cycles is ~234 B/cycle, against the 355 GB/s the profiler
+  // reports for that engine when active.
+  if (auto lhsBytes = getShapedByteSize(lhsType)) {
+    if (auto rhsBytes = getShapedByteSize(rhsType)) {
+      const int cores = config.getActiveBandwidthCores();
+      cost.sideUnit = HWUnit::CubeMTE1;
+      cost.sideCycles =
+          config.estimateTransferCycles("l1", "l0a", *lhsBytes, cores) +
+          config.estimateTransferCycles("l1", "l0b", *rhsBytes, cores);
+    }
+  }
   return cost;
 }
 
@@ -792,13 +830,17 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   }
 
   // Pointer arithmetic and scalar loads/stores emitted by the LLVM lowering.
-  // They run on the scalar unit, outside the Cube/Vector roofline, so they are
-  // charged zero -- but recognised, so they do not masquerade as compute of
-  // unknown size.
+  // They run on their core's scalar unit, which the profiler measures at a
+  // fifth to a quarter of that core's active time -- so not free, and worth
+  // charging as soon as the per-instruction figure is known. Until then the
+  // profile leaves it at zero and the cost is recognised but not counted,
+  // which at least keeps it from masquerading as compute of unknown size.
   if (isa<LLVM::LLVMDialect>(op->getDialect())) {
     OpCost cost;
     cost.unit = HWUnit::Scalar;
-    cost.confidence = CostConfidence::NotModelled;
+    cost.cycles = config.getScalarCyclesPerInstruction();
+    cost.confidence = cost.cycles > 0 ? CostConfidence::Generic
+                                      : CostConfidence::NotModelled;
     return cost;
   }
 
@@ -932,7 +974,9 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   if (!getRepresentativeShapedType(op)) {
     OpCost cost;
     cost.unit = HWUnit::Scalar;
-    cost.confidence = CostConfidence::NotModelled;
+    cost.cycles = config.getScalarCyclesPerInstruction();
+    cost.confidence = cost.cycles > 0 ? CostConfidence::Generic
+                                      : CostConfidence::NotModelled;
     return cost;
   }
 
@@ -1554,7 +1598,12 @@ int64_t cubePathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
           ? cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB)
           : std::max(cyclesOf(HWUnit::FixPipe), cyclesOf(HWUnit::FixPipeUB));
 
+  // MTE1 and the Cube's scalar issue are engines of their own and overlap the
+  // rest: the profiler has aic_mte1_ratio and aic_scalar_ratio adding to well
+  // over one alongside aic_cube_ratio, so they run at the same time as the
+  // MACs rather than queueing behind them.
   return std::max({cyclesOf(HWUnit::Cube), cyclesOf(HWUnit::CubeMTE2),
+                   cyclesOf(HWUnit::CubeMTE1), cyclesOf(HWUnit::ScalarCube),
                    drainCycles});
 }
 
@@ -1581,8 +1630,11 @@ int64_t vectorPathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
           ? cyclesOf(HWUnit::MTE1ToUB) + cyclesOf(HWUnit::MTE3ToL1)
           : std::max(cyclesOf(HWUnit::MTE1ToUB), cyclesOf(HWUnit::MTE3ToL1));
 
-  return std::max(cyclesOf(HWUnit::Vector),
-                  std::max(offChipTransferCycles, onChipTransferCycles));
+  // Scalar keeps its meaning as the Vector core's own issue; the Cube's went
+  // to ScalarCube. Same reasoning as on the Cube path: aiv_vec_ratio and
+  // aiv_scalar_ratio sum past one, so they overlap.
+  return std::max({cyclesOf(HWUnit::Vector), cyclesOf(HWUnit::Scalar),
+                   offChipTransferCycles, onChipTransferCycles});
 }
 
 int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
@@ -1826,6 +1878,11 @@ struct CostBreakdown {
   /// of their cost because only one branch runs. Reported so a jump in the
   /// estimate can be traced to branch structure rather than looking arbitrary.
   int64_t branchedOps = 0;
+  /// Scalar instructions issued over the whole run, loop weights applied and
+  /// synchronisation excluded (its stall is the schedule's business, not the
+  /// scalar unit's). Reported so the per-instruction cost can be divided out
+  /// of a profiled aic_scalar_time / aiv_scalar_time rather than guessed.
+  int64_t weightedScalarOps = 0;
   int64_t totalWeightedCycles = 0;
 
   void recordBlock(Operation *op, const OpCost &cost, const LoopWeight &weight,
@@ -1842,8 +1899,21 @@ struct CostBreakdown {
     }
     stats.costedOps += 1;
     stats.workCycles += weight.weighted(cost.cycles);
-    stats.unitCycles[cost.unit] += weight.weighted(cost.cycles);
-    stats.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
+    // Scalar work belongs to the core that issues it. Both cores have their
+    // own scalar unit and the profiler reports them apart, so leaving them on
+    // one unit would make Cube and Vector blocks queue behind each other on a
+    // pipe that does not exist.
+    const HWUnit unit = cost.unit == HWUnit::Scalar && isCube
+                            ? HWUnit::ScalarCube
+                            : cost.unit;
+    stats.unitCycles[unit] += weight.weighted(cost.cycles);
+    stats.unitCyclesOneIter[unit] += weight.perIteration(cost.cycles);
+    if (cost.sideCycles > 0) {
+      stats.workCycles += weight.weighted(cost.sideCycles);
+      stats.unitCycles[cost.sideUnit] += weight.weighted(cost.sideCycles);
+      stats.unitCyclesOneIter[cost.sideUnit] +=
+          weight.perIteration(cost.sideCycles);
+    }
     stats.opCounts[op->getName().getStringRef()] += 1;
 
     // emplace_back rather than push_back({}): DenseMap's default constructor
@@ -1860,8 +1930,13 @@ struct CostBreakdown {
     } else {
       BlockSegment &segment = stats.segments.back();
       segment.costedOps += 1;
-      segment.unitCycles[cost.unit] += weight.weighted(cost.cycles);
-      segment.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
+      segment.unitCycles[unit] += weight.weighted(cost.cycles);
+      segment.unitCyclesOneIter[unit] += weight.perIteration(cost.cycles);
+      if (cost.sideCycles > 0) {
+        segment.unitCycles[cost.sideUnit] += weight.weighted(cost.sideCycles);
+        segment.unitCyclesOneIter[cost.sideUnit] +=
+            weight.perIteration(cost.sideCycles);
+      }
     }
   }
 
@@ -1912,6 +1987,10 @@ struct CostBreakdown {
     }
 
     totalWeightedCycles += weight.weighted(cost.cycles);
+    if ((cost.unit == HWUnit::Scalar || cost.unit == HWUnit::ScalarCube) &&
+        !isSyncOp(op)) {
+      weightedScalarOps += weight.weighted(1);
+    }
     if (weight.branchDivisor > 1) {
       ++branchedOps;
     }
@@ -2853,13 +2932,14 @@ void printPipeComparison(llvm::raw_ostream &os,
       {"aic_fixpipe_time",
        cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB),
        "fixpipe + fixpipe_ub"},
-      {"aic_mte1_time", 0, "no term: nothing models L1 -> L0A/L0B"},
+      {"aic_mte1_time", cyclesOf(HWUnit::CubeMTE1), "cube_mte1"},
       {"aiv_vec_time", cyclesOf(HWUnit::Vector), "vector"},
       {"aiv_mte2_time", cyclesOf(HWUnit::VecMTE2) + cyclesOf(HWUnit::MTE1ToUB),
        "vec_mte2 + mte1_l1_ub"},
       {"aiv_mte3_time", cyclesOf(HWUnit::MTE3) + cyclesOf(HWUnit::MTE3ToL1),
        "mte3 + mte3_ub_l1"},
-      {"aic/aiv_scalar_time", 0, "no term: scalar work is charged zero"},
+      {"aic_scalar_time", cyclesOf(HWUnit::ScalarCube), "scalar_cube"},
+      {"aiv_scalar_time", cyclesOf(HWUnit::Scalar), "scalar"},
   };
 
   os << "[" << DEBUG_TYPE
@@ -2877,7 +2957,7 @@ void printPipeComparison(llvm::raw_ostream &os,
 /// result so that a surprising total can be attributed to a term.
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                    const FusionFactors &fusion, const HardwareConfig &config,
-                   int64_t branchedOps) {
+                   int64_t branchedOps, int64_t scalarOps) {
   auto line = [&](llvm::StringRef what, int64_t cycles) {
     os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
        << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
@@ -2955,6 +3035,23 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                                       : "")
        << ". Live count is by program order, so it is an over-estimate of what"
           " the allocator's interference colouring would need\n";
+  }
+  if (scalarOps > 0) {
+    const int perInstruction = config.getScalarCyclesPerInstruction();
+    os << "[" << DEBUG_TYPE << "]     scalar issue: " << scalarOps
+       << " instruction(s) over the run at " << perInstruction
+       << " cycle(s) each";
+    if (perInstruction == 0) {
+      // The count is the useful half. One profiled run turns it into the
+      // constant: aic_scalar_time and aiv_scalar_time are what these
+      // instructions cost, so the measured microseconds times the clock and
+      // divided by this count is the figure to set. Guessing it here instead
+      // would put an unmeasured number into every estimate.
+      os << ", so nothing is charged for them. Divide the profiler's"
+            " aic_scalar_time and aiv_scalar_time by this count to get the"
+            " figure for scalar_issue.cycles_per_instruction";
+    }
+    os << "\n";
   }
   if (estimate.buffers.interDowngraded) {
     os << "[" << DEBUG_TYPE
@@ -3414,7 +3511,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   };
 
   auto reportDetail = [&](llvm::raw_ostream &os) {
-    printEstimate(os, estimate, fusion, *config, breakdown.branchedOps);
+    printEstimate(os, estimate, fusion, *config, breakdown.branchedOps,
+                  breakdown.weightedScalarOps);
     printLoops(os, loopReports);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);
