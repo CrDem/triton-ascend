@@ -26,6 +26,7 @@
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
@@ -51,8 +52,16 @@ struct BufferInfo {
   int64_t originalSize = 0;
   int64_t reducedSize = 0;
   int64_t alignedSize = 0;
+  int64_t multiBufferCount = 1;
   scf::ForOp forOp = nullptr;
   bool fromHint = false;
+};
+
+struct TensorInfo {
+  tensor::EmptyOp emptyOp = nullptr;
+  int64_t originalSize = 0;
+  int64_t reducedSize = 0;
+  int64_t alignedSize = 0;
 };
 
 struct UBEstimateResult {
@@ -79,9 +88,14 @@ int getAlignUnit(Type elementType);
 
 SmallVector<BufferInfo> collectBuffers(ModuleOp module);
 
+SmallVector<TensorInfo> collectTensorEmpties(ModuleOp module);
+
 void computeBufferSize(BufferInfo &buf);
 
-UBEstimateResult checkUBOverflow(ModuleOp module);
+void computeTensorSize(TensorInfo &tensor);
+
+UBEstimateResult checkUBOverflow(ArrayRef<BufferInfo> buffers,
+                                 ArrayRef<TensorInfo> tensors);
 
 LogicalResult pruneMultiBufferMarks(ModuleOp module);
 

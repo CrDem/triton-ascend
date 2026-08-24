@@ -275,6 +275,14 @@ groupOpsBySsbufferId(SmallVector<Operation *> &allOps,
     }
     opsById[*id].push_back(op);
   }
+  // Also register ops that carry ssbuffer.block_id but have no results
+  for (Operation *op : allOps) {
+    auto id = getOpBlockId(op);
+    if (!id.has_value() || !op->getResults().empty())
+      continue;
+    if (seen.insert(op).second)
+      opsById[*id].push_back(op);
+  }
   return 0;
 }
 
@@ -348,7 +356,16 @@ collectInnerBlockInfo(const MainLoop &loop,
   // (e.g. scf.if) are included so their scalar deps get tracked; cross-block
   // judgment still attributes them to the ifOp via getOutermostSsbufferId.
   for (auto &p : opsById) {
-    Value groupKey = p.second.front()->getResult(0);
+    Operation *keyOp = nullptr;
+    for (Operation *op : p.second) {
+      if (!op->getResults().empty()) {
+        keyOp = op;
+        break;
+      }
+    }
+    if (!keyOp)
+      continue;
+    Value groupKey = keyOp->getResult(0);
     InnerBlockInfo bi;
     bi.blockId = groupKey;
     bi.ops = p.second;
@@ -432,10 +449,7 @@ buildDepUserMap(DenseMap<Value, InnerBlockInfo> &blocks,
   return depUserMap;
 }
 
-// Check if depVal matches the special pattern: linalg::FillOp whose outs comes
-// from a tensor::EmptyOp. When this pattern is detected, the pass can avoid
-// allocating a multi-buffer (alloc + copy + select + to_tensor) by cloning
-// the empty+fill ops to the consumer's position instead.
+// Check if depVal matches the special pattern with linalg::FillOp
 static bool isEmptyFillPattern(Value depVal) {
   Operation *defOp = depVal.getDefiningOp();
   auto fillOp = dyn_cast<linalg::FillOp>(defOp);
@@ -446,10 +460,13 @@ static bool isEmptyFillPattern(Value depVal) {
     return false;
 
   Value outs = fillOp.getOutputs()[0];
-  if (!outs || !isa_and_nonnull<tensor::EmptyOp>(outs.getDefiningOp()))
+  if (!outs)
     return false;
-
-  return true;
+  Operation *outsDef = outs.getDefiningOp();
+  if (!outsDef)
+    return false;
+  return isa<tensor::EmptyOp>(outsDef) ||
+         isa<bufferization::AllocTensorOp>(outsDef);
 }
 
 // Check if depVal is the result of a bufferization.alloc_tensor
@@ -458,7 +475,8 @@ static bool isAllocTensorPattern(Value depVal) {
 }
 
 SmallVector<Value>
-collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap) {
+collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap,
+                    const DenseSet<Value> &clonedDepVals) {
   SmallVector<Value> valueList;
   SmallVector<Operation *> seenOps;
 
@@ -478,9 +496,8 @@ collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap) {
       if (isa<tensor::EmptyOp>(op))
         continue;
 
-      // Skip tensor::EmptyOp + linalg::FillOp pattern - it gets cloned
-      // to the consumer's position instead of being multi-buffered
-      if (isEmptyFillPattern(depVal))
+      // Skip depVals that were already cloned by cloneEmptyFillsInBlocks
+      if (clonedDepVals.contains(depVal))
         continue;
 
       // Skip bufferization.alloc_tensor
@@ -1407,7 +1424,7 @@ static int processDepVal(Value depVal, const MainLoop &loop,
   // Read the module-level `ssbuffer.insertionOptimization` attribute inline so
   // processDepVal can be called multiple times in the same pass run and stay
   // in sync with whatever the Python caller last wrote onto the ModuleOp.
-  bool enableOpt = false;
+  bool enableOpt = true;
   if (mlir::ModuleOp mod = loop->getParentOfType<mlir::ModuleOp>())
     enableOpt = mod->hasAttr(CVPipeline::kInsertionOptimization);
 
@@ -1523,9 +1540,7 @@ static int processDepVal(Value depVal, const MainLoop &loop,
   return 0;
 }
 
-// For each depVal matching `patternCheck`, groups cross-block users by
-// userBlockId and calls `cloneFn` at the first user of each group to clone
-// ops (with kBlockId = userBlockId) and return the replacement Value.
+// If `clonedDepVals` is non-null, depVals that were actually cloned
 static int cloneDepsToConsumers(
     const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
     DenseMap<Value, SmallVector<Value>> &depValueMap,
@@ -1533,7 +1548,8 @@ static int cloneDepsToConsumers(
     llvm::function_ref<bool(Value)> patternCheck,
     llvm::function_ref<Value(IRMapping &, OpBuilder &, Value depVal,
                              int userBlockId, ArrayRef<Operation *> users)>
-        cloneFn) {
+        cloneFn,
+    DenseSet<Value> *clonedDepVals = nullptr) {
   SmallVector<Operation *> seenOps;
 
   for (auto &blockPair : blocks) {
@@ -1590,6 +1606,8 @@ static int cloneDepsToConsumers(
         Value newVal = cloneFn(mapper, builder, depVal, userBlockId, users);
         if (!newVal)
           continue;
+        if (clonedDepVals)
+          clonedDepVals->insert(depVal);
         for (Operation *user : users) {
           user->replaceUsesOfWith(depVal, newVal);
         }
@@ -1602,34 +1620,35 @@ static int cloneDepsToConsumers(
 // Phase 1: clone empty+fill (and any `ins` defining ops sharing the empty's
 // parentOp) to consumer blocks; runs before dep collection because the cloned
 // fill's `ins` chain may reach a producer-side tensor that Phase 2 must see.
-static int
-cloneEmptyFillsInBlocks(const MainLoop &loop,
-                        DenseMap<Value, InnerBlockInfo> &blocks,
-                        DenseMap<Value, SmallVector<Value>> &depValueMap,
-                        DenseMap<Value, SmallVector<Operation *>> &depUserMap,
-                        OpBuilder &globalBuilder) {
+static int cloneEmptyFillsInBlocks(
+    const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
+    DenseMap<Value, SmallVector<Value>> &depValueMap,
+    DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+    OpBuilder &globalBuilder, DenseSet<Value> *clonedDepVals = nullptr) {
   return cloneDepsToConsumers(
       loop, blocks, depValueMap, depUserMap, globalBuilder, isEmptyFillPattern,
       [](IRMapping &mapper, OpBuilder &builder, Value depVal, int userBlockId,
          ArrayRef<Operation *> users) -> Value {
         auto fillOp = cast<linalg::FillOp>(depVal.getDefiningOp());
-        auto origEmpty =
-            cast<tensor::EmptyOp>(fillOp.getOutputs()[0].getDefiningOp());
+        // outs may come from either tensor::EmptyOp (the original case) or
+        // bufferization.alloc_tensor (the new case). Both are "fresh tensor"
+        // sources and treated identically below.
+        Operation *origAllocLike = fillOp.getOutputs()[0].getDefiningOp();
 
         // Collect the `ins` operands whose defining op shares the parentOp with
-        // the tensor::EmptyOp.
+        // the empty/alloc_tensor.
         SmallVector<Value> insToClone;
-        Operation *emptyParent = origEmpty->getParentOp();
+        Operation *allocParent = origAllocLike->getParentOp();
         for (Value insVal : fillOp.getInputs()) {
           Operation *insDef = insVal.getDefiningOp();
-          if (!insDef || insDef->getParentOp() != emptyParent)
+          if (!insDef || insDef->getParentOp() != allocParent)
             continue;
           insToClone.push_back(insVal);
         }
 
-        Operation *newEmpty = builder.clone(*origEmpty, mapper);
-        newEmpty->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
-        mapper.map(origEmpty->getResult(0), newEmpty->getResult(0));
+        Operation *newAllocLike = builder.clone(*origAllocLike, mapper);
+        newAllocLike->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
+        mapper.map(origAllocLike->getResult(0), newAllocLike->getResult(0));
 
         for (Value insVal : insToClone) {
           Operation *insDef = insVal.getDefiningOp();
@@ -1641,7 +1660,8 @@ cloneEmptyFillsInBlocks(const MainLoop &loop,
         Operation *newFill = builder.clone(*fillOp, mapper);
         newFill->setAttr(kBlockId, builder.getI32IntegerAttr(userBlockId));
         return newFill->getResult(0);
-      });
+      },
+      clonedDepVals);
 }
 
 // Clone bufferization.alloc_tensor to each consumer block
@@ -1665,11 +1685,13 @@ cloneAllocTensorsInBlocks(const MainLoop &loop,
 }
 
 // Process cross-block tensor dependencies for double buffering
-static int processTensorDependencies(
-    const MainLoop &loop, DenseMap<Value, InnerBlockInfo> &blocks,
-    DenseMap<Value, SmallVector<Value>> &depValueMap,
-    DenseMap<Value, SmallVector<Operation *>> &depUserMap, BufferMap &bufferMap,
-    OpBuilder &globalBuilder, int &groupId) {
+static int
+processTensorDependencies(const MainLoop &loop,
+                          DenseMap<Value, InnerBlockInfo> &blocks,
+                          DenseMap<Value, SmallVector<Value>> &depValueMap,
+                          DenseMap<Value, SmallVector<Operation *>> &depUserMap,
+                          BufferMap &bufferMap, OpBuilder &globalBuilder,
+                          int &groupId, const DenseSet<Value> &clonedDepVals) {
   SmallVector<Operation *> seenOps;
 
   for (auto &blockPair : blocks) {
@@ -1705,10 +1727,8 @@ static int processTensorDependencies(
       if (parentOp != loop.getOperation())
         continue;
 
-      // The empty+fill pattern has already been cloned by
-      // cloneEmptyFillsInBlocks (run before dep collection). Skip
-      // any remaining occurrences here.
-      if (isEmptyFillPattern(depVal))
+      // Skip depVals that were already cloned by cloneEmptyFillsInBlocks.
+      if (clonedDepVals.contains(depVal))
         continue;
 
       auto userIt = depUserMap.find(depVal);
@@ -1981,13 +2001,20 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   if (blocks.empty())
     return -1;
 
+  // Memref-type dep values are not supported here.
+  if (hasMemrefDepValue(depValueMap)) {
+    LDBG("ERROR: Memref type dependent values found in user IR, fallback");
+    return -1;
+  }
+
   // Phase 1: build initial depUserMap and clone empty+fill patterns. We use
   // a fresh user map built from the initial allOps so the clone can find
   // consumer-block users; the cloned fills will rewrite those users' uses.
   DenseMap<Value, SmallVector<Operation *>> initialDepUserMap =
       buildDepUserMap(blocks, allOps, depValueMap);
+  DenseSet<Value> phase1ClonedDepVals;
   if (cloneEmptyFillsInBlocks(mainLoop, blocks, depValueMap, initialDepUserMap,
-                              globalBuilder) != 0)
+                              globalBuilder, &phase1ClonedDepVals) != 0)
     return -1;
 
   rematerializeTensorRootedScalarDeps(mainLoop);
@@ -2013,12 +2040,20 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   if (blocks.empty())
     return -1;
 
-  // Memref-type dep values are not supported here; fail loudly so downstream
-  // passes don't see an unmarked-but-skipped scope.
-  if (hasMemrefDepValue(depValueMap)) {
-    LDBG("Falling Back: Memref type dependent values found!");
-    return -1;
+  // Drop memref-typed deps from Phase 2's collection
+  int droppedMemrefDeps = 0;
+  for (auto &p : depValueMap) {
+    llvm::erase_if(p.second, [&droppedMemrefDeps](Value v) {
+      if (isa<MemRefType>(v.getType())) {
+        ++droppedMemrefDeps;
+        return true;
+      }
+      return false;
+    });
   }
+  if (droppedMemrefDeps > 0)
+    LDBG("Dropped " + std::to_string(droppedMemrefDeps) +
+         " clone-induced memref deps from Phase 2 depValueMap");
 
   auto depUserMap = buildDepUserMap(blocks, allOps, depValueMap);
 
@@ -2026,7 +2061,7 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   if (cloneAllocTensorsInBlocks(mainLoop, blocks, depValueMap, depUserMap,
                                 globalBuilder) != 0)
     return -1;
-  auto valueList = collectBufferValues(depValueMap);
+  auto valueList = collectBufferValues(depValueMap, phase1ClonedDepVals);
   LLVM_DEBUG(
       llvm::dbgs()
       << "[addInnerMultiBuffer] before insertBuffersBeforeLoop, valueList.size="
@@ -2045,7 +2080,8 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   LLVM_DEBUG(llvm::dbgs()
              << "[addInnerMultiBuffer] before processTensorDependencies\n");
   if (processTensorDependencies(mainLoop, blocks, depValueMap, depUserMap,
-                                bufferMap, globalBuilder, groupId) != 0) {
+                                bufferMap, globalBuilder, groupId,
+                                phase1ClonedDepVals) != 0) {
     return -1;
   }
 

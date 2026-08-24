@@ -30,11 +30,11 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
-#include <limits>
 
 using namespace mlir;
 using namespace triton;
@@ -76,17 +76,15 @@ SmallVector<BufferInfo> triton::collectBuffers(ModuleOp module) {
 
       annotation::MarkOp markOp = findMarkOp(allocOp);
       if (markOp) {
-        if (markOp->hasAttr(hivm::MultiBufferAttr::name)) {
+        if (auto attr = markOp->getAttrOfType<IntegerAttr>(
+                hivm::MultiBufferAttr::name)) {
           buf.kind = BufferInfo::Kind::Annot;
           buf.markOp = markOp;
+          buf.multiBufferCount = std::max<int64_t>(attr.getInt(), 1);
           buf.fromHint = markOp->hasAttr(CVPipeline::kGMLoadHintAttr);
           if (buf.fromHint)
             markOp->removeAttr(CVPipeline::kGMLoadHintAttr);
-        } else {
-          buf.kind = BufferInfo::Kind::Unannot;
         }
-      } else {
-        buf.kind = BufferInfo::Kind::Unannot;
       }
 
       buffers.push_back(buf);
@@ -99,131 +97,167 @@ SmallVector<BufferInfo> triton::collectBuffers(ModuleOp module) {
   return buffers;
 }
 
-void triton::computeBufferSize(BufferInfo &buf) {
-  auto memrefType = mlir::cast<MemRefType>(buf.allocOp.getResult().getType());
-  ArrayRef<int64_t> shape = memrefType.getShape();
-  Type elementType = memrefType.getElementType();
+SmallVector<TensorInfo> triton::collectTensorEmpties(ModuleOp module) {
+  SmallVector<TensorInfo> tensors;
+
+  module.walk([&](scope::ScopeOp scopeOp) {
+    bool isCube = false;
+    bool isVector = false;
+    if (failed(getScopeType(scopeOp, isCube, isVector)) || !isVector)
+      return WalkResult::advance();
+
+    scopeOp.walk([&](tensor::EmptyOp emptyOp) {
+      if (emptyOp->getParentOfType<scope::ScopeOp>() != scopeOp)
+        return;
+
+      auto tensorType = emptyOp.getType();
+      if (!tensorType.hasStaticShape() || tensorType.getRank() == 0 ||
+          llvm::any_of(tensorType.getShape(),
+                       [](int64_t dim) { return dim == 0; })) {
+        LOG_DEBUG("unsupported tensor.empty shape, skipping " << emptyOp);
+        return;
+      }
+
+      TensorInfo tensor;
+      tensor.emptyOp = emptyOp;
+      LOG_DEBUG("tensor.empty: " << emptyOp);
+      tensors.push_back(tensor);
+    });
+
+    return WalkResult::advance();
+  });
+
+  LOG_DEBUG("collected " << tensors.size() << " tensor.empty ops");
+  return tensors;
+}
+
+static void computeShapedSize(ShapedType shapedType, int64_t &originalSize,
+                              int64_t &reducedSize, int64_t &alignedSize) {
+  ArrayRef<int64_t> shape = shapedType.getShape();
+  Type elementType = shapedType.getElementType();
   unsigned bitWidth = elementType.getIntOrFloatBitWidth();
 
-  for (auto dim : shape) {
-    if (ShapedType::isDynamic(dim)) {
-      LOG_DEBUG("dynamic dim encountered, skipping size computation for "
-                << buf.allocOp);
-      return;
-    }
-  }
-
-  if (shape.empty() || shape[0] == 0) {
-    LOG_DEBUG("zero-sized or rank-0 buffer, skipping size computation");
+  if (!shapedType.hasStaticShape() || shape.empty() || bitWidth == 0 ||
+      llvm::any_of(shape, [](int64_t dim) { return dim == 0; })) {
+    LOG_DEBUG("unsupported shape, skipping size computation");
     return;
   }
 
   int64_t numElements = 1;
   for (auto dim : shape) {
-    if (numElements > std::numeric_limits<int64_t>::max() / dim) {
-      LOG_DEBUG("overflow in element count computation, clamping");
-      numElements = std::numeric_limits<int64_t>::max();
-      break;
-    }
     numElements *= dim;
   }
-  buf.originalSize = numElements * bitWidth;
+  originalSize = numElements * bitWidth;
 
-  // TileAndBindSubBlock: dim0 = ceil(dim0 / K_SUB_BLOCK_DIM)
+  // TileAndBindSubBlock splits dim0 across two sub-blocks (one-to-two):
+  // reducedDim0 = ceil(dim0 / K_SUB_BLOCK_DIM), where K_SUB_BLOCK_DIM = 2.
   int64_t reducedDim0 = (shape[0] + UBConstants::K_SUB_BLOCK_DIM - 1) /
                         UBConstants::K_SUB_BLOCK_DIM;
-  int64_t reducedElements = numElements * reducedDim0 / shape[0];
-  buf.reducedSize = reducedElements * bitWidth;
+  int64_t reducedElements = numElements / shape[0] * reducedDim0;
+  reducedSize = reducedElements * bitWidth;
 
-  // EnableStrideAlign: align last dim to 32B
-  int64_t lastDim = (shape.size() == 1) ? reducedDim0 : shape.back();
-  int alignUnit = getAlignUnit(elementType);
-
-  if (lastDim % alignUnit != 0) {
-    int64_t alignedLastDim = (lastDim + alignUnit - 1) / alignUnit * alignUnit;
-    buf.alignedSize =
-        (buf.reducedSize * alignedLastDim + lastDim - 1) / lastDim;
-    buf.alignedSize =
-        llvm::alignTo(buf.alignedSize, UBConstants::ALIGN_UNIT_BITS);
-  } else {
-    buf.alignedSize = buf.reducedSize;
+  int64_t lastDim = shape.size() == 1 ? reducedDim0 : shape.back();
+  int64_t alignUnit = getAlignUnit(elementType);
+  if (lastDim % alignUnit == 0) {
+    alignedSize = reducedSize;
+    return;
   }
+
+  int64_t alignedLastDim = (lastDim + alignUnit - 1) / alignUnit * alignUnit;
+  alignedSize = (reducedSize * alignedLastDim + lastDim - 1) / lastDim;
+  alignedSize = llvm::alignTo(alignedSize, UBConstants::ALIGN_UNIT_BITS);
 }
 
-UBEstimateResult triton::checkUBOverflow(ModuleOp module) {
-  auto buffers = collectBuffers(module);
-  for (auto &buf : buffers)
-    computeBufferSize(buf);
+void triton::computeBufferSize(BufferInfo &buf) {
+  auto memrefType = mlir::cast<MemRefType>(buf.allocOp.getResult().getType());
+  computeShapedSize(memrefType, buf.originalSize, buf.reducedSize,
+                    buf.alignedSize);
+}
 
+void triton::computeTensorSize(TensorInfo &tensor) {
+  computeShapedSize(tensor.emptyOp.getType(), tensor.originalSize,
+                    tensor.reducedSize, tensor.alignedSize);
+}
+
+UBEstimateResult triton::checkUBOverflow(ArrayRef<BufferInfo> buffers,
+                                         ArrayRef<TensorInfo> tensors) {
   UBEstimateResult result;
-  int64_t total = 0;
-  for (auto &buf : buffers) {
-    if (buf.alignedSize <= 0)
-      continue;
-    int64_t n = 1;
-    if (buf.kind == BufferInfo::Kind::Annot && buf.markOp)
-      if (auto attr = buf.markOp->getAttrOfType<IntegerAttr>(
-              hivm::MultiBufferAttr::name))
-        n = attr.getInt();
-    // Conservative: assume full expansion (alignedSize × N). Will be
-    // refined with PlanMemory-based for-loop tree model later.
-    total += buf.alignedSize * n;
+  for (const auto &buf : buffers) {
+    if (buf.alignedSize > 0)
+      result.totalBits += buf.alignedSize * buf.multiBufferCount;
   }
-
-  result.totalBits = total;
+  for (const auto &tensor : tensors) {
+    if (tensor.alignedSize > 0)
+      result.totalBits += tensor.alignedSize;
+  }
 
   LOG_DEBUG("UB = " << result.totalBits << " bits");
   return result;
 }
 
+static SmallVector<size_t>
+collectPruneCandidates(ArrayRef<BufferInfo> buffers) {
+  SmallVector<size_t> candidates;
+  for (size_t index = 0; index < buffers.size(); ++index) {
+    const auto &buf = buffers[index];
+    if (buf.kind == BufferInfo::Kind::Annot && buf.markOp &&
+        buf.alignedSize > 0 && !buf.fromHint)
+      candidates.push_back(index);
+  }
+  return candidates;
+}
+
+static bool shouldPrune(const UBEstimateResult &result,
+                        ArrayRef<size_t> candidates) {
+  LOG_DEBUG("initial UB = " << result.totalBits << " bits, max = "
+                            << UBConstants::UB_SPACE_SIZE_BITS << " bits");
+
+  if (result.totalBits <= UBConstants::UB_SPACE_SIZE_BITS) {
+    LOG_DEBUG("safe, no pruning needed");
+    return false;
+  }
+
+  if (candidates.empty()) {
+    LOG_DEBUG("no computable multi_buffer marks to prune");
+    return false;
+  }
+
+  LOG_DEBUG("collected " << candidates.size() << " annot marks");
+  return true;
+}
+
 LogicalResult triton::pruneMultiBufferMarks(ModuleOp module) {
+  // Step 1: collect buffers and tensors once, then compute their static sizes.
   auto buffers = collectBuffers(module);
   for (auto &buf : buffers)
     computeBufferSize(buf);
 
-  int64_t total = 0;
-  SmallVector<std::pair<annotation::MarkOp, int64_t>> annotMarks;
-  for (auto &buf : buffers) {
-    if (buf.alignedSize <= 0)
-      continue;
-    int64_t n = 1;
-    if (buf.kind == BufferInfo::Kind::Annot && buf.markOp)
-      if (auto attr = buf.markOp->getAttrOfType<IntegerAttr>(
-              hivm::MultiBufferAttr::name))
-        n = attr.getInt();
-    total += buf.alignedSize * n;
+  auto tensors = collectTensorEmpties(module);
+  for (auto &tensor : tensors)
+    computeTensorSize(tensor);
 
-    if (buf.kind == BufferInfo::Kind::Annot && buf.markOp &&
-        buf.alignedSize > 0 && !buf.fromHint) {
-      annotMarks.push_back({buf.markOp, buf.alignedSize});
-    }
-  }
-
-  LOG_DEBUG("initial UB = " << total << " bits, max = "
-                            << UBConstants::UB_SPACE_SIZE_BITS << " bits");
-
-  if (total <= UBConstants::UB_SPACE_SIZE_BITS) {
-    LOG_DEBUG("safe, no pruning needed");
+  // Step 2: compute the initial UB usage and collect pruning candidates.
+  auto result = checkUBOverflow(buffers, tensors);
+  auto candidates = collectPruneCandidates(buffers);
+  if (!shouldPrune(result, candidates))
     return success();
-  }
 
-  if (annotMarks.empty()) {
-    LOG_DEBUG("no computable multi_buffer marks to prune");
-    return success();
-  }
+  // Step 3: sort eligible non-hint marks by buffer size, largest first.
+  llvm::sort(candidates, [&](size_t lhs, size_t rhs) {
+    return buffers[lhs].alignedSize > buffers[rhs].alignedSize;
+  });
 
-  llvm::sort(annotMarks,
-             [](const auto &a, const auto &b) { return a.second > b.second; });
-
-  LOG_DEBUG("collected " << annotMarks.size() << " annot marks");
-
+  // Step 4: remove marks one by one, update BufferInfo, and fully re-estimate.
   int deleted = 0;
-  for (auto &[markOp, size] : annotMarks) {
-    markOp->removeAttr(hivm::MultiBufferAttr::name);
+  for (size_t index : candidates) {
+    auto &buf = buffers[index];
+    buf.markOp->removeAttr(hivm::MultiBufferAttr::name);
+    buf.kind = BufferInfo::Kind::Unannot;
+    buf.multiBufferCount = 1;
     ++deleted;
 
-    auto result = checkUBOverflow(module);
-    LOG_DEBUG("after deleting mark #" << deleted << " (size " << size
+    result = checkUBOverflow(buffers, tensors);
+    LOG_DEBUG("after deleting mark #" << deleted << " (size " << buf.alignedSize
                                       << " bits): UB = " << result.totalBits
                                       << " bits");
 

@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace mlir {
 namespace triton {
@@ -57,6 +58,31 @@ enum class GraphOptimizationRuleId : uint16_t {
   ChunkCoalescing = 32,
   StridedLoadStoreRewrite = 64,
 };
+
+constexpr const char *
+getGraphOptimizationRuleName(GraphOptimizationRuleId rule) {
+  switch (rule) {
+  case GraphOptimizationRuleId::LoadStoreTranspose:
+    return "LoadStoreTranspose";
+  case GraphOptimizationRuleId::TransposePointwiseReorder:
+    return "TransposePointwiseReorder";
+  case GraphOptimizationRuleId::StoreCoalescing:
+    return "StoreCoalescing";
+  case GraphOptimizationRuleId::RowCoalescing:
+    return "RowCoalescing";
+  case GraphOptimizationRuleId::DiagonalMaskRemoval:
+    return "DiagonalMaskRemoval";
+  case GraphOptimizationRuleId::ConvertModuloToMask:
+    return "ConvertModuloToMask";
+  case GraphOptimizationRuleId::StridedAxisCoalescing:
+    return "StridedAxisCoalescing";
+  case GraphOptimizationRuleId::ChunkCoalescing:
+    return "ChunkCoalescing";
+  case GraphOptimizationRuleId::StridedLoadStoreRewrite:
+    return "StridedLoadStoreRewrite";
+  }
+  return "Unknown";
+}
 
 constexpr uint16_t getGraphOptimizationRuleMask(GraphOptimizationRuleId rule) {
   return static_cast<uint16_t>(rule);
@@ -89,11 +115,10 @@ struct GraphOptimizationOptions {
   uint16_t enabledRuleMask = kAllGraphOptimizationRuleMask;
   unsigned maxRewritesPerFunction = 64;
   unsigned ubCapacityBytes = 0;
-  bool emitRemarks = false;
-  // RowCoalescing changes the launch grid and is valid only for the
-  // force_simt_only compilation route.  This must be an explicit per-pass
-  // option rather than inferred from later pipeline state.
-  bool forceSimtOnly = false;
+  // RowCoalescing changes the launch grid and is valid only for
+  // compile_mode="simt_only".  Keep the source selector rather than a
+  // second derived force flag so every consumer follows one mode contract.
+  std::string compileMode = "simd_simt_template";
 };
 
 std::unique_ptr<OperationPass<ModuleOp>>

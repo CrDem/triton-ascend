@@ -492,12 +492,12 @@ static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue,
   }
 
   auto broadcastOp = dyn_cast<linalg::BroadcastOp>(outerInOp);
-  if (!broadcastOp)
-    return true;
-  if (auto btUsage = CVPipeline::getBTSizeFromValidBroadcastOp(broadcastOp)) {
-    if (btUsage != -1 && btUsage <= CVPipeline::CACHE_TABLE_BUFFER_SIZE) {
-      LOG_DEBUG("Not split because broadcast bias is small. " << matmulOp);
-      return false;
+  if (broadcastOp) {
+    if (auto btUsage = CVPipeline::getBTSizeFromValidBroadcastOp(broadcastOp)) {
+      if (btUsage != -1 && btUsage <= CVPipeline::CACHE_TABLE_BUFFER_SIZE) {
+        LOG_DEBUG("Not split because broadcast bias is small. " << matmulOp);
+        return false;
+      }
     }
   }
 
@@ -507,7 +507,6 @@ static bool shouldSplitByInput(linalg::MatmulOp matmulOp, Value &outerOutValue,
     LOG_DEBUG("Not split because L0C remain. " << matmulOp);
     return false;
   }
-  // from broadcast [N]->[M, N] // S11 S12 S19 S20
   return true;
 }
 
@@ -720,6 +719,8 @@ static LogicalResult splitMatmul(linalg::MatmulOp matmulOp,
                                                   splitInfo.outerOutValue);
     auto selectOp = rewriter.create<arith::SelectOp>(
         loc, executed, splitInfo.outerOutValue, fillOp.getResult(0));
+    fillOp->setAttr(CVPipeline::kForMayNotExec, rewriter.getUnitAttr());
+    selectOp->setAttr(CVPipeline::kForMayNotExec, rewriter.getUnitAttr());
     newOutValue = selectOp.getResult();
     preservedUsers.insert(selectOp);
     preservedUsers.insert(fillOp);

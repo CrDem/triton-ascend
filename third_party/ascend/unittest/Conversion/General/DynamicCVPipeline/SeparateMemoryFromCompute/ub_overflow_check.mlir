@@ -134,3 +134,84 @@ func.func @hint_protected_kept() {
   } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
   return
 }
+
+
+// -----
+
+// ============================================================================
+// Test 5: Hint protection survives multiple pruning rounds.
+//   Hint: 256x144xf32, alignedSize=589824, expanded=1179648.
+//   Auto: two 256x96xf32, alignedSize=393216, expanded=786432 each.
+//   Initial=2752512; after one prune=2359296; after two=1966080.
+// ============================================================================
+
+func.func @multi_round_hint_protection() {
+  // CHECK-LABEL: func.func @multi_round_hint_protection
+  // CHECK-NOT: gm_load_hint
+
+  scope.scope : () -> () {
+    // CHECK: memref.alloc() : memref<256x144xf32>
+    // CHECK-NEXT: annotation.mark %{{.*}} {hivm.multi_buffer = 2 : i32} : memref<256x144xf32>
+    %hint = memref.alloc() : memref<256x144xf32>
+    annotation.mark %hint {gm_load_hint, hivm.multi_buffer = 2 : i32} : memref<256x144xf32>
+
+    // CHECK: memref.alloc() : memref<256x96xf32>
+    // CHECK-NEXT: annotation.mark %{{.*}} : memref<256x96xf32>
+    %auto1 = memref.alloc() : memref<256x96xf32>
+    annotation.mark %auto1 {hivm.multi_buffer = 2 : i32} : memref<256x96xf32>
+
+    // CHECK: memref.alloc() : memref<256x96xf32>
+    // CHECK-NEXT: annotation.mark %{{.*}} : memref<256x96xf32>
+    %auto2 = memref.alloc() : memref<256x96xf32>
+    annotation.mark %auto2 {hivm.multi_buffer = 2 : i32} : memref<256x96xf32>
+    scope.return
+  } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
+  return
+}
+
+// -----
+
+// ============================================================================
+// Test 6: A blind tensor.empty contributes to UB and triggers pruning.
+//   Alloc expanded=1572864; tensor=524288; total=2097152 > 2031616.
+// ============================================================================
+
+func.func @blind_tensor_triggers_pruning() {
+  // CHECK-LABEL: func.func @blind_tensor_triggers_pruning
+
+  scope.scope : () -> () {
+    // CHECK: memref.alloc() : memref<256x192xf32>
+    // CHECK-NEXT: annotation.mark %{{.*}} : memref<256x192xf32>
+    %alloc = memref.alloc() : memref<256x192xf32>
+    annotation.mark %alloc {hivm.multi_buffer = 2 : i32} : memref<256x192xf32>
+
+    // CHECK: tensor.empty() : tensor<256x128xf32>
+    %empty = tensor.empty() : tensor<256x128xf32>
+    scope.return
+  } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
+  return
+}
+
+// -----
+
+// ============================================================================
+// Test 7: A same-shape tensor.empty is still counted independently.
+//   Alloc expanded=1572864; tensor=786432; total=2359296 > 2031616.
+//   Removing the mark leaves 1572864 bits, which is safe.
+// ============================================================================
+
+func.func @same_shape_tensor_counted() {
+  // CHECK-LABEL: func.func @same_shape_tensor_counted
+
+  scope.scope : () -> () {
+    // CHECK: memref.alloc() : memref<256x192xf32>
+    // CHECK-NEXT: annotation.mark %{{.*}} : memref<256x192xf32>
+    %alloc = memref.alloc() : memref<256x192xf32>
+    annotation.mark %alloc {hivm.multi_buffer = 2 : i32} : memref<256x192xf32>
+
+    // CHECK: tensor.empty() : tensor<256x192xf32>
+    %empty = tensor.empty() : tensor<256x192xf32>
+    scope.return
+  } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
+  return
+}

@@ -24,6 +24,7 @@
 #include "ascend/include/Utils/Utils.h"
 
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
@@ -340,7 +341,7 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
         }
       }
       if (!isa<mlir::scf::IfOp, mlir::scf::ForOp, mlir::scf::WhileOp,
-               triton::ReduceOp>(op)) {
+               scope::ScopeOp, triton::ReduceOp>(op)) {
         assert(op->getNumResults() == 1 &&
                "Ops used for meta computation are expected to have one result");
       }
@@ -505,8 +506,8 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
             // We need to ensure the intermediate ops are marked MixUse
             // so that they will be replaced instead of be erased without
             // conversion.
-            return (isa<triton::LoadOp>(curOp) || isa<triton::StoreOp>(curOp) ||
-                    isa<triton::ascend::IndirectStoreOp>(curOp)) &&
+            return (isa<triton::LoadOp, triton::StoreOp,
+                        triton::ascend::IndirectStoreOp>(curOp)) &&
                    !isMetaUse(curOp);
           },
           /*actionFn*/

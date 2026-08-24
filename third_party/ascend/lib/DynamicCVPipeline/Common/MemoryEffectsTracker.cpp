@@ -34,9 +34,11 @@
 // Unknown ops (no SideEffect interface) act as full barriers: they depend on
 // all prior writers/readers and become the sole writer for every slot.
 
-#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
-#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
+
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -63,6 +65,9 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/BuiltinAttributes.h"
 
+#include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "DynamicCVPipeline/Common/Utils.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 
 using namespace mlir;
 static constexpr const char *DEBUG_TYPE = "memory-effects-tracker";
@@ -359,9 +364,13 @@ MemoryDependenceGraph::collectOuterEffects(Operation *op, bool &unknown,
 AliasResult MemoryDependenceGraph::queryAlias(Value lhs, Value rhs) {
   auto lhsSource = getViewSource(lhs);
   auto rhsSource = getViewSource(rhs);
+  if (!lhsSource) {
+    lhsSource = lhs;
+  }
   if (!rhsSource) {
     rhsSource = rhs;
   }
+
   auto isFuncEntryArg = [](const Value &val) -> bool {
     auto arg = llvm::dyn_cast<BlockArgument>(val);
     if (!arg) {
@@ -371,8 +380,7 @@ AliasResult MemoryDependenceGraph::queryAlias(Value lhs, Value rhs) {
     return block->isEntryBlock() &&
            llvm::isa<func::FuncOp>(block->getParentOp());
   };
-  if (isFuncEntryArg(getViewSource(lhs)) &&
-      isFuncEntryArg(getViewSource(rhs))) {
+  if (isFuncEntryArg(lhsSource) && isFuncEntryArg(rhsSource)) {
     return lhs == rhs ? AliasResult::MustAlias : AliasResult::NoAlias;
   }
   return aa.alias(lhsSource, rhsSource);
