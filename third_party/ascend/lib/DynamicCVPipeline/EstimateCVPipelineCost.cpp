@@ -196,6 +196,7 @@ constexpr const char *kFusionVectorEnvVar =
 
 using mlir::ascend::HardwareConfig;
 using mlir::ascend::HWUnit;
+using mlir::ascend::MemorySpace;
 
 //===----------------------------------------------------------------------===//
 // Shape helpers
@@ -415,7 +416,15 @@ HWUnit getTransferUnit(llvm::StringRef src, llvm::StringRef dst) {
   if (src == "l0c") {
     return dst == "ub" ? HWUnit::FixPipeUB : HWUnit::FixPipe;
   }
-  if (dst == "l1" || dst == "l0a" || dst == "l0b") {
+  if (dst == "l0a" || dst == "l0b") {
+    // Into the Cube's operand buffers. From L1 this is its MTE1, an engine the
+    // profiler reports apart from MTE2 and which nothing charged until now.
+    if (src == "l1") {
+      return HWUnit::CubeMTE1;
+    }
+    return src == "ub" ? HWUnit::MTE3ToL1 : HWUnit::CubeMTE2;
+  }
+  if (dst == "l1") {
     // Feeding the Cube: from HBM/L2 this is its MTE2; from UB it is the vector
     // store engine writing on chip instead of out to HBM, which this target
     // can do directly -- the bandwidth table has a ub:l1 entry, so no round
@@ -514,6 +523,8 @@ int64_t getTransferStartupLatency(HWUnit unit, const HardwareConfig &config) {
   case HWUnit::VecMTE2:
   // Reading L1 into UB is still the load engine starting up.
   case HWUnit::MTE1ToUB:
+  // So is staging L1 into the Cube's operand buffers.
+  case HWUnit::CubeMTE1:
     return config.getMTE2StartupLatency();
   case HWUnit::FixPipe:
   case HWUnit::FixPipeUB:
@@ -571,7 +582,22 @@ struct OpCost {
   int64_t cycles = 0;
   int64_t bytes = 0;
   int64_t flops = 0;
+  /// A second engine the same operation occupies, for the case where one IR
+  /// operation drives two of them at once. A matmul is the reason this exists:
+  /// it runs the MACs *and* stages its operands from L1 into L0A/L0B, and the
+  /// second is a separate engine with its own busy time -- one the profiler
+  /// reports as a third of the Cube's. Zero cycles means "only one engine",
+  /// which is every other operation.
+  HWUnit sideUnit = HWUnit::Scalar;
+  int64_t sideCycles = 0;
   CostConfidence confidence = CostConfidence::Modelled;
+  /// Address spaces a transfer moves between, empty for everything else.
+  /// Kept so the report can show which path each transfer took: the same
+  /// operation kind can land on several engines with very different
+  /// bandwidths, and the by-kind table collapses that away. Safe as
+  /// StringRefs -- getMemorySpaceName returns string literals.
+  llvm::StringRef srcSpace;
+  llvm::StringRef dstSpace;
 };
 
 /// Cost of a linalg.matmul on the Cube core.
@@ -598,12 +624,38 @@ std::optional<OpCost> estimateMatmul(linalg::MatmulOp matmulOp,
   int64_t k = lhsType.getShape()[1];
   int64_t n = rhsType.getShape()[1];
 
+  // No startup latency. The fractal count alone matches the hardware: msprof
+  // reports 299648 cube instructions costing 153.4M cycles on a kernel whose
+  // tiles are 128x128x128, which is 511.9 cycles each against ceil(128/16)^3 =
+  // 512. Adding the 20-cycle pipeline fill on top made it 532 and was the whole
+  // of the error -- back-to-back matmuls fill the cube pipe once, not once per
+  // operation, and this kernel never issues an isolated one.
+  //
   // TODO: switch to the tilesim-migrated L1-pipe model used by
   // ascend::MatmulOp::estimateCycles; that formula is currently tied to the
   // costmodel's own dialect op and needs extracting before it can be reused.
-  cost.cycles =
-      config.estimateCubeCycles(m, n, k) + config.getCubeStartupLatency();
+  cost.cycles = config.estimateCubeCycles(m, n, k);
   cost.flops = 2 * m * n * k;
+
+  // Both operands have to be staged from L1 into L0A/L0B before the MACs can
+  // run, on the Cube's MTE1. No operation in the IR stands for that move --
+  // the matmul reads L1 and the transfer is implicit -- so it is charged from
+  // the operand shapes here, or it is not charged at all.
+  //
+  // The count checks out against the hardware: msprof reports exactly four
+  // MTE1 instructions per inner iteration of a kernel whose loop body holds
+  // two matmuls, which is one per operand. The time did too -- 128 KB moved in
+  // about 560 cycles is ~234 B/cycle, against the 355 GB/s the profiler
+  // reports for that engine when active.
+  if (auto lhsBytes = getShapedByteSize(lhsType)) {
+    if (auto rhsBytes = getShapedByteSize(rhsType)) {
+      const int cores = config.getActiveBandwidthCores();
+      cost.sideUnit = HWUnit::CubeMTE1;
+      cost.sideCycles =
+          config.estimateTransferCycles("l1", "l0a", *lhsBytes, cores) +
+          config.estimateTransferCycles("l1", "l0b", *rhsBytes, cores);
+    }
+  }
   return cost;
 }
 
@@ -613,6 +665,8 @@ OpCost estimateTransfer(Type shapedType, llvm::StringRef srcSpace,
                         const HardwareConfig &config) {
   OpCost cost;
   cost.unit = getTransferUnit(srcSpace, dstSpace);
+  cost.srcSpace = srcSpace;
+  cost.dstSpace = dstSpace;
 
   auto bytes = getShapedByteSize(shapedType);
   if (!bytes) {
@@ -670,11 +724,31 @@ llvm::StringRef getVectorIntrinsic(Operation *op) {
       .Default([](Operation *) { return Ret(); });
 }
 
+/// How much of a tensor one vector core actually sees.
+///
+/// A compute block runs on one Cube core paired with several vector cores, and
+/// they split the data rather than the instruction stream: each core issues the
+/// same instructions over its own share of the tile. So the repeat count of a
+/// vector instruction shrinks by this factor while the instruction's own
+/// startup latency does not -- which is why this divides the element count fed
+/// to the cycle table instead of dividing the resulting cycles.
+///
+/// Returns the count unchanged when told of one core, which is both what an
+/// unpaired profile says and what Cube-side work gets: a fill staged for the
+/// Cube runs on the one Cube core and is priced from this same table, so it
+/// must not be divided by a pairing that does not apply to it.
+int64_t elementsPerVectorCore(int64_t elements, int vectorCores) {
+  if (vectorCores <= 1) {
+    return elements;
+  }
+  return (elements + vectorCores - 1) / vectorCores;
+}
+
 /// Cost of a reduction. A reduction is not one pass over the data: after the
 /// elementwise pass it costs a logarithmic tree inside each vector register and
 /// another one across registers. Mirrors the costmodel's own reduce model.
 OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
-                      const HardwareConfig &config) {
+                      const HardwareConfig &config, int vectorCores) {
   OpCost cost;
   cost.unit = HWUnit::Vector;
 
@@ -683,7 +757,11 @@ OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
   if (vectorWidth <= 0) {
     vectorWidth = 1;
   }
-  int64_t numVectors = (elements + vectorWidth - 1) / vectorWidth;
+  // Each core reduces its own share of the rows, so no cross-core combining
+  // step follows and the split is a plain division of the work.
+  int64_t numVectors = (elementsPerVectorCore(elements, vectorCores) +
+                        vectorWidth - 1) /
+                       vectorWidth;
 
   auto log2Steps = [](int64_t value) {
     int steps = 0;
@@ -701,7 +779,8 @@ OpCost estimateReduce(Operation *op, Type shapedType, int64_t elements,
 }
 
 /// Cost of an elementwise compute op on the Vector core.
-OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
+OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config,
+                             int vectorCores) {
   OpCost cost;
   cost.unit = HWUnit::Vector;
 
@@ -717,12 +796,15 @@ OpCost estimateVectorCompute(Operation *op, const HardwareConfig &config) {
   }
 
   if (isa<linalg::ReduceOp>(op)) {
-    return estimateReduce(op, shapedType, *elements, config);
+    return estimateReduce(op, shapedType, *elements, config, vectorCores);
   }
 
   llvm::StringRef intrinsic = getVectorIntrinsic(op);
   cost.cycles = config.estimateVectorCyclesFromTable(
-      *elements, getShapedElementBits(shapedType), intrinsic);
+      elementsPerVectorCore(*elements, vectorCores),
+      getShapedElementBits(shapedType), intrinsic);
+  // Work done, not time spent: this is the whole block's arithmetic however
+  // many cores it was spread over.
   cost.flops = *elements;
   // With a known instruction the cost comes from the measured table; without
   // one it falls back to a flat cycle per pass, which is a guess worth
@@ -749,13 +831,17 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   }
 
   // Pointer arithmetic and scalar loads/stores emitted by the LLVM lowering.
-  // They run on the scalar unit, outside the Cube/Vector roofline, so they are
-  // charged zero -- but recognised, so they do not masquerade as compute of
-  // unknown size.
+  // They run on their core's scalar unit, which the profiler measures at a
+  // fifth to a quarter of that core's active time -- so not free, and worth
+  // charging as soon as the per-instruction figure is known. Until then the
+  // profile leaves it at zero and the cost is recognised but not counted,
+  // which at least keeps it from masquerading as compute of unknown size.
   if (isa<LLVM::LLVMDialect>(op->getDialect())) {
     OpCost cost;
     cost.unit = HWUnit::Scalar;
-    cost.confidence = CostConfidence::NotModelled;
+    cost.cycles = config.getScalarCyclesPerInstruction();
+    cost.confidence = cost.cycles > 0 ? CostConfidence::Generic
+                                      : CostConfidence::NotModelled;
     return cost;
   }
 
@@ -803,9 +889,64 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   if (isa<hivm::CopyOp>(op)) {
     // The CV pipeline emits these to stage data between the cores; on the newer
     // topology the destination is often L1, keeping the traffic on chip.
+    //
+    // The destination carries an address space, the source usually does not --
+    // it is still a tensor at this point -- so the source has to be inferred,
+    // and inferring it from the operation's core gets the important case
+    // backwards. A copy that lands in L1 is the Vector core handing its result
+    // up to the Cube: it reads UB and writes L1, which is the on-chip
+    // mte3_ub_l1 mover. Falling back to "hbm" instead makes it a Cube load from
+    // off-chip memory -- wrong core, wrong engine, wrong bandwidth.
+    //
+    // Profiling caught this directly: the cycles showed up under the Cube's
+    // MTE2 while the hardware was spending them on the Vector core's MTE3,
+    // which the model had at almost zero.
+    llvm::StringRef knownSrc;
+    llvm::StringRef knownDst;
+    if (auto ends = getHivmTransferEnds(op)) {
+      knownSrc = getMemorySpaceName(ends->source.getType());
+      knownDst = getMemorySpaceName(ends->dest.getType());
+    }
+    const bool destFeedsCube =
+        knownDst == "l1" || knownDst == "l0a" || knownDst == "l0b";
+
     auto guessed = guessTransferSpaces(isCube, /*isLoad=*/true);
+    llvm::StringRef fallbackSrc = destFeedsCube ? llvm::StringRef("ub")
+                                                : guessed.first;
+
+    // On the Vector core, with the source unreadable and the destination not
+    // naming a hand-off to the Cube, nothing left in the IR says this copy
+    // leaves the chip -- and assuming it does is not a harmless default. With
+    // 64x64 tiles that assumption charged 1.36 billion cycles, 39% of all the
+    // work in the estimate, to the vector load engine and made it the pipe the
+    // whole roofline was built from; msprof measures that engine at 5.7 us over
+    // the same run and its GM->UB traffic at 6 KB, against the tens of
+    // gigabytes implied. The same copies resolve to ub:l1 at 128x128, so what
+    // varies is what the IR still carries, not what the hardware does.
+    //
+    // These copies exist to stage data between the cores and between buffers,
+    // which is on-chip work; a transfer that leaves the chip is the case that
+    // has to be proven. Charge nothing and say so: as an unmodelled kind it
+    // shows up in the report as a hole, which is recoverable, rather than as a
+    // bottleneck, which is not.
+    if (!isCube && knownSrc.empty() && !destFeedsCube) {
+      OpCost cost;
+      cost.unit = HWUnit::VecMTE2;
+      cost.confidence = CostConfidence::NotModelled;
+      // "?" rather than a word: the transfer table gives the path a narrow
+      // column, and a long name runs into the operation name beside it.
+      cost.srcSpace = "?";
+      cost.dstSpace = knownDst.empty() ? llvm::StringRef("?") : knownDst;
+      if (Type sizingType = getTransferSizingType(op)) {
+        if (auto bytes = getShapedByteSize(sizingType)) {
+          cost.bytes = *bytes;
+        }
+      }
+      return cost;
+    }
+
     auto [srcSpace, dstSpace] =
-        resolveHivmTransferSpaces(op, guessed.first, guessed.second);
+        resolveHivmTransferSpaces(op, fallbackSrc, guessed.second);
     Type shapedType = getTransferSizingType(op);
     if (!shapedType) {
       OpCost cost;
@@ -834,14 +975,44 @@ std::optional<OpCost> estimateOpCost(Operation *op,
   if (!getRepresentativeShapedType(op)) {
     OpCost cost;
     cost.unit = HWUnit::Scalar;
-    cost.confidence = CostConfidence::NotModelled;
+    cost.cycles = config.getScalarCyclesPerInstruction();
+    cost.confidence = cost.cycles > 0 ? CostConfidence::Generic
+                                      : CostConfidence::NotModelled;
     return cost;
   }
 
-  // Remaining shaped compute. Cube-side non-matmul work (e.g. a fill or
-  // transpose staged for the Cube pipe) is charged to the Cube unit; everything
-  // else is Vector work.
-  OpCost cost = estimateVectorCompute(op, config);
+  // Cube-side fills and transposes cost nothing of their own, and that is a
+  // measurement rather than an omission.
+  //
+  // The profiler's aic_cube_time is the matmul term and nothing else. At
+  // 128x128 it reads 92 981.68 us, which at 1.65 GHz is 153 420 272 cycles
+  // against the 153 419 776 this model charges for linalg.matmul alone --
+  // 496 cycles apart out of 153 million. At 64x64 the same holds. And there is
+  // no other engine with room for them: MTE1, MTE2 and the two drain engines
+  // are each measured and each already accounted for within a few percent,
+  // while these two would add 59.8M cycles.
+  //
+  // What the hardware does with them follows from that. Zeroing the
+  // accumulator is the matmul's own initialisation -- the first MAC along K
+  // writes instead of accumulating -- and transposing an operand is folded
+  // into the layout conversion that staging it into L0B already performs,
+  // whose cost is inside the MTE1 figure this model now matches to 1.4%.
+  //
+  // Charged as modelled-at-zero rather than dropped, so the report still shows
+  // they were seen: "no cycles" and "not noticed" have to stay distinguishable.
+  if (isCube && isa<linalg::FillOp, linalg::TransposeOp>(op)) {
+    OpCost cost;
+    cost.unit = HWUnit::Cube;
+    cost.confidence = CostConfidence::Modelled;
+    return cost;
+  }
+
+  // Remaining shaped compute. Cube-side non-matmul work is charged to the Cube
+  // unit; everything else is Vector work. Only the latter is spread over the
+  // block's vector cores: the Cube side of a block is one core, so it sees the
+  // whole tile.
+  OpCost cost = estimateVectorCompute(
+      op, config, isCube ? 1 : config.getVectorCoresPerBlock());
   if (isCube) {
     cost.unit = HWUnit::Cube;
   }
@@ -1454,7 +1625,12 @@ int64_t cubePathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
           ? cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB)
           : std::max(cyclesOf(HWUnit::FixPipe), cyclesOf(HWUnit::FixPipeUB));
 
+  // MTE1 and the Cube's scalar issue are engines of their own and overlap the
+  // rest: the profiler has aic_mte1_ratio and aic_scalar_ratio adding to well
+  // over one alongside aic_cube_ratio, so they run at the same time as the
+  // MACs rather than queueing behind them.
   return std::max({cyclesOf(HWUnit::Cube), cyclesOf(HWUnit::CubeMTE2),
+                   cyclesOf(HWUnit::CubeMTE1), cyclesOf(HWUnit::ScalarCube),
                    drainCycles});
 }
 
@@ -1481,8 +1657,11 @@ int64_t vectorPathRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
           ? cyclesOf(HWUnit::MTE1ToUB) + cyclesOf(HWUnit::MTE3ToL1)
           : std::max(cyclesOf(HWUnit::MTE1ToUB), cyclesOf(HWUnit::MTE3ToL1));
 
-  return std::max(cyclesOf(HWUnit::Vector),
-                  std::max(offChipTransferCycles, onChipTransferCycles));
+  // Scalar keeps its meaning as the Vector core's own issue; the Cube's went
+  // to ScalarCube. Same reasoning as on the Cube path: aiv_vec_ratio and
+  // aiv_scalar_ratio sum past one, so they overlap.
+  return std::max({cyclesOf(HWUnit::Vector), cyclesOf(HWUnit::Scalar),
+                   offChipTransferCycles, onChipTransferCycles});
 }
 
 int64_t combineRoofline(const llvm::DenseMap<HWUnit, int64_t> &unitCycles,
@@ -1687,8 +1866,31 @@ constexpr int64_t kNoBlockId = -1;
 /// consumer block -> blocks it depends on.
 using BlockDepMap = llvm::MapVector<int64_t, llvm::SetVector<int64_t>>;
 
+/// One shape of data transfer: same operation kind, same engine, same pair of
+/// address spaces, same size, same loop weighting.
+///
+/// Grouped rather than listed per operation because the question this answers
+/// is whether a kind that got more expensive did so by running more often or
+/// by moving more bytes -- and the by-kind table cannot say, since it collapses
+/// every engine a kind touched into whichever one was seen last.
+struct TransferStats {
+  llvm::StringRef kind;
+  HWUnit unit = HWUnit::Scalar;
+  llvm::StringRef srcSpace;
+  llvm::StringRef dstSpace;
+  int64_t bytes = 0;
+  int64_t cyclesEach = 0;
+  int64_t multiplier = 1;
+  int64_t branchDivisor = 1;
+  int64_t count = 0;
+  int64_t weightedCycles = 0;
+};
+
 struct CostBreakdown {
   llvm::MapVector<llvm::StringRef, OpKindStats> byOpKind;
+  /// Every bulk transfer, grouped. Small enough to search linearly: a kernel
+  /// has a handful of distinct transfer shapes, not thousands.
+  llvm::SmallVector<TransferStats> transfers;
   llvm::SmallVector<Operation *> unknownSizeOps;
   llvm::MapVector<Operation *, DynamicLoopStats> dynamicLoops;
   llvm::MapVector<int64_t, BlockStats> blocks;
@@ -1703,6 +1905,14 @@ struct CostBreakdown {
   /// of their cost because only one branch runs. Reported so a jump in the
   /// estimate can be traced to branch structure rather than looking arbitrary.
   int64_t branchedOps = 0;
+  /// Scalar instructions issued over the whole run, loop weights applied and
+  /// synchronisation excluded (its stall is the schedule's business, not the
+  /// scalar unit's). Split by core, because that is how the profiler reports
+  /// the time they cost: dividing aic_scalar_time by a count that also
+  /// contains the Vector core's instructions gives a number that means
+  /// nothing.
+  int64_t weightedScalarOpsCube = 0;
+  int64_t weightedScalarOpsVector = 0;
   int64_t totalWeightedCycles = 0;
 
   void recordBlock(Operation *op, const OpCost &cost, const LoopWeight &weight,
@@ -1719,8 +1929,21 @@ struct CostBreakdown {
     }
     stats.costedOps += 1;
     stats.workCycles += weight.weighted(cost.cycles);
-    stats.unitCycles[cost.unit] += weight.weighted(cost.cycles);
-    stats.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
+    // Scalar work belongs to the core that issues it. Both cores have their
+    // own scalar unit and the profiler reports them apart, so leaving them on
+    // one unit would make Cube and Vector blocks queue behind each other on a
+    // pipe that does not exist.
+    const HWUnit unit = cost.unit == HWUnit::Scalar && isCube
+                            ? HWUnit::ScalarCube
+                            : cost.unit;
+    stats.unitCycles[unit] += weight.weighted(cost.cycles);
+    stats.unitCyclesOneIter[unit] += weight.perIteration(cost.cycles);
+    if (cost.sideCycles > 0) {
+      stats.workCycles += weight.weighted(cost.sideCycles);
+      stats.unitCycles[cost.sideUnit] += weight.weighted(cost.sideCycles);
+      stats.unitCyclesOneIter[cost.sideUnit] +=
+          weight.perIteration(cost.sideCycles);
+    }
     stats.opCounts[op->getName().getStringRef()] += 1;
 
     // emplace_back rather than push_back({}): DenseMap's default constructor
@@ -1737,14 +1960,53 @@ struct CostBreakdown {
     } else {
       BlockSegment &segment = stats.segments.back();
       segment.costedOps += 1;
-      segment.unitCycles[cost.unit] += weight.weighted(cost.cycles);
-      segment.unitCyclesOneIter[cost.unit] += weight.perIteration(cost.cycles);
+      segment.unitCycles[unit] += weight.weighted(cost.cycles);
+      segment.unitCyclesOneIter[unit] += weight.perIteration(cost.cycles);
+      if (cost.sideCycles > 0) {
+        segment.unitCycles[cost.sideUnit] += weight.weighted(cost.sideCycles);
+        segment.unitCyclesOneIter[cost.sideUnit] +=
+            weight.perIteration(cost.sideCycles);
+      }
     }
+  }
+
+  /// Transfers only: an operation that never went through estimateTransfer
+  /// leaves both address spaces empty and is skipped.
+  void recordTransfer(Operation *op, const OpCost &cost,
+                      const LoopWeight &weight) {
+    if (cost.srcSpace.empty() && cost.dstSpace.empty()) {
+      return;
+    }
+    const llvm::StringRef kind = op->getName().getStringRef();
+    for (TransferStats &row : transfers) {
+      if (row.kind == kind && row.unit == cost.unit &&
+          row.srcSpace == cost.srcSpace && row.dstSpace == cost.dstSpace &&
+          row.bytes == cost.bytes && row.cyclesEach == cost.cycles &&
+          row.multiplier == weight.multiplier &&
+          row.branchDivisor == weight.branchDivisor) {
+        row.count += 1;
+        row.weightedCycles += weight.weighted(cost.cycles);
+        return;
+      }
+    }
+    TransferStats row;
+    row.kind = kind;
+    row.unit = cost.unit;
+    row.srcSpace = cost.srcSpace;
+    row.dstSpace = cost.dstSpace;
+    row.bytes = cost.bytes;
+    row.cyclesEach = cost.cycles;
+    row.multiplier = weight.multiplier;
+    row.branchDivisor = weight.branchDivisor;
+    row.count = 1;
+    row.weightedCycles = weight.weighted(cost.cycles);
+    transfers.push_back(row);
   }
 
   void record(Operation *op, const OpCost &cost, const LoopWeight &weight,
               bool isCube) {
     recordBlock(op, cost, weight, isCube);
+    recordTransfer(op, cost, weight);
 
     OpKindStats &stats = byOpKind[op->getName().getStringRef()];
     stats.count += 1;
@@ -1755,6 +2017,11 @@ struct CostBreakdown {
     }
 
     totalWeightedCycles += weight.weighted(cost.cycles);
+    if ((cost.unit == HWUnit::Scalar || cost.unit == HWUnit::ScalarCube) &&
+        !isSyncOp(op)) {
+      (isCube ? weightedScalarOpsCube : weightedScalarOpsVector) +=
+          weight.weighted(1);
+    }
     if (weight.branchDivisor > 1) {
       ++branchedOps;
     }
@@ -2009,14 +2276,26 @@ topologicalBlockOrder(const CostBreakdown &breakdown) {
 /// topological sort only because it closes a cycle, i.e. it is loop-carried;
 /// it is skipped, since this schedules one pass through the graph and the
 /// iteration count is applied separately.
+/// How much of a schedule was barrier overhead rather than work, so the report
+/// can say it instead of leaving the number to be inferred from a gap.
+struct BarrierTally {
+  int64_t count = 0;
+  int64_t cycles = 0;
+  void charge(int64_t barrierCycles) {
+    ++count;
+    cycles += barrierCycles;
+  }
+};
+
 int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
                            llvm::ArrayRef<int64_t> order,
                            const HardwareConfig &config,
                            const FusionFactors &fusion, bool perIteration,
                            llvm::MapVector<int64_t, BlockSchedule> &schedule,
-                           UnitBusyCycles &busy) {
+                           UnitBusyCycles &busy, BarrierTally &barriers) {
   llvm::DenseMap<HWUnit, int64_t> pipeAvailable;
   int64_t makespan = 0;
+  const int64_t barrierCycles = config.getBarrierCycles();
 
   for (int64_t blockId : order) {
     auto blockEntry = breakdown.blocks.find(blockId);
@@ -2028,7 +2307,8 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
 
     int64_t earliest = 0;
     int64_t criticalPred = kNoBlockId;
-    auto considerDeps = [&](const BlockDepMap &deps) {
+    bool waitedOnFlag = false;
+    auto considerDeps = [&](const BlockDepMap &deps, bool isSync) {
       auto it = deps.find(id);
       if (it == deps.end()) {
         return;
@@ -2038,6 +2318,9 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
         if (scheduled == schedule.end()) {
           continue; // back edge: the producer runs in a later pass
         }
+        if (isSync) {
+          waitedOnFlag = true;
+        }
         if (scheduled->second.finish > earliest) {
           earliest = scheduled->second.finish;
           criticalPred = producer;
@@ -2045,8 +2328,17 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
       }
     };
     // Flags first: those are the barriers the hardware really enforces.
-    considerDeps(breakdown.syncDeps);
-    considerDeps(breakdown.dataDeps);
+    considerDeps(breakdown.syncDeps, /*isSync=*/true);
+    considerDeps(breakdown.dataDeps, /*isSync=*/false);
+
+    // A flag wait is not free even once the producer has finished: the flag
+    // has to be written, propagated and observed. Only synchronisation edges
+    // are charged -- a dataflow edge inside one core is ordered by the issue
+    // queue, with no flag involved.
+    if (waitedOnFlag && barrierCycles > 0) {
+      earliest += barrierCycles;
+      barriers.charge(barrierCycles);
+    }
 
     const double factor = getFusionFactor(stats, fusion);
 
@@ -2057,9 +2349,21 @@ int64_t scheduleBlockGraph(const CostBreakdown &breakdown,
     bool sawWork = false;
     bool waitedOnPipe = false;
 
+    bool sawWorkingSegment = false;
     for (const BlockSegment &segment : stats.segments) {
       const llvm::DenseMap<HWUnit, int64_t> &units =
           perIteration ? segment.unitCyclesOneIter : segment.unitCycles;
+      // A barrier separates this segment from the previous one, so the core
+      // pays for it again here. Charged only between segments that both carry
+      // work: an empty segment is an artefact of two adjacent sync operations,
+      // not a second stop.
+      if (segment.costedOps > 0) {
+        if (sawWorkingSegment && barrierCycles > 0) {
+          cursor += barrierCycles;
+          barriers.charge(barrierCycles);
+        }
+        sawWorkingSegment = true;
+      }
       int64_t segmentFinish = cursor;
       for (const auto &entry : units) {
         const int64_t cycles = static_cast<int64_t>(entry.second * factor);
@@ -2125,6 +2429,9 @@ struct BufferDepths {
   /// is the business of DecoupleComputeAndMemory, which this pipeline does not
   /// run, so raising it changes neither the IR nor the estimate.
   int64_t requestedLoad = 1;
+  /// The pipeline asked for inter-core double buffering and the flag budget
+  /// refused it, so the IR is single-buffered whatever the count says.
+  bool interDowngraded = false;
 
   /// Depth that gates an edge: crossing cores goes through an inter-core
   /// buffer, staying on one core through an intra-core one.
@@ -2151,7 +2458,143 @@ BufferDepths readBufferDepths(ModuleOp module) {
   read(CVPipeline::kInterCoreBufCount, depths.requestedInter);
   read(CVPipeline::kLoadStoreBufCount, depths.requestedLoad);
   depths.inter = std::min(depths.requestedInter, kMaxUsefulInterCoreDepth);
+  // AddMultiBufferOuterScope compiles single-buffered when the double-buffer
+  // groups would not fit in the flag budget, and leaves the count attribute
+  // alone while doing it. Dividing by two here would then credit an overlap
+  // that is not in the IR -- and hide the cost of the very thing that caused
+  // the downgrade, since one extra flag is all it takes.
+  if (module->hasAttr(CVPipeline::kInterCoreBufDowngraded)) {
+    depths.interDowngraded = true;
+    depths.inter = 1;
+  }
   return depths;
+}
+
+/// How many synchronisation flags the compiled module uses, and how many are
+/// live at the same time.
+///
+/// The hardware has a small fixed set of set/wait flags and the pipeline
+/// allocates out of it: FlagIdManager caps ids at 14, at 7 while inter-core
+/// double buffering is on, and AnalyzeFlag abandons the whole CV pipeline for
+/// any id outside that range. So the budget is a hard limit on how finely
+/// blocks may be split -- and it appears in no other number this report
+/// prints, which is why a variant can fail to compile, or quietly lose its
+/// double buffering, for a reason the estimate never mentions.
+///
+/// Two counts, answering different questions. Distinct ids is what the module
+/// spends as it stands. Peak live is what it would need if ids were reassigned
+/// as well as possible: FlagIdReuseManager colours an interference graph, so
+/// what it can get away with is that graph's chromatic number, and the peak
+/// number of overlapping lifetimes is a lower bound on it.
+///
+/// Lifetimes are taken in program order here -- a flag is live from its first
+/// set to its last wait. The allocator uses reachability, which can prove two
+/// flags disjoint where program order cannot, so this peak is never lower than
+/// what the allocator needs and may be higher. It is therefore reported and
+/// nothing else: rejecting a variant on a number known to be pessimistic would
+/// discard variants that would have compiled.
+struct FlagCensus {
+  int distinct = 0;
+  int peakLive = 0;
+  int highestId = -1;
+};
+
+FlagCensus takeFlagCensus(ModuleOp module) {
+  FlagCensus census;
+
+  // Flag id -> [index of its first set/wait, index of its last], counted over
+  // sync operations only so the indices are dense in what matters.
+  llvm::DenseMap<int, std::pair<int64_t, int64_t>> span;
+  int64_t index = 0;
+  module.walk([&](Operation *op) {
+    if (!isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp>(op)) {
+      return;
+    }
+    int id = -1;
+    // The pipeline spells this three ways depending on which pass wrote it;
+    // getFlagFromSyncOp in AddMultiBufferOuterScope reads the same three.
+    for (llvm::StringRef name : {"flag_id", "static_flag_id", "flag"}) {
+      if (auto attr = op->getAttrOfType<IntegerAttr>(name)) {
+        id = static_cast<int>(attr.getInt());
+        break;
+      }
+    }
+    if (id < 0) {
+      return;
+    }
+    ++index;
+    auto it = span.find(id);
+    if (it == span.end()) {
+      span[id] = {index, index};
+    } else {
+      it->second.second = index;
+    }
+    census.highestId = std::max(census.highestId, id);
+  });
+
+  census.distinct = static_cast<int>(span.size());
+
+  // Sweep the lifetimes. Every index belongs to exactly one operation and so
+  // to one flag, which is why opens and closes of different flags never tie;
+  // the +1 before -1 ordering only matters for a flag whose set and wait are
+  // the same operation index.
+  llvm::SmallVector<std::pair<int64_t, int>> events;
+  events.reserve(span.size() * 2);
+  for (const auto &entry : span) {
+    events.push_back({entry.second.first, +1});
+    events.push_back({entry.second.second, -1});
+  }
+  llvm::sort(events, [](const std::pair<int64_t, int> &a,
+                        const std::pair<int64_t, int> &b) {
+    if (a.first != b.first) {
+      return a.first < b.first;
+    }
+    return a.second > b.second;
+  });
+  int live = 0;
+  for (const auto &event : events) {
+    live += event.second;
+    census.peakLive = std::max(census.peakLive, live);
+  }
+  return census;
+}
+
+/// How much Unified Buffer the module asks for.
+///
+/// This is the constraint that decides whether a block partition can exist at
+/// all, and nothing in the estimate knew about it. Splitting a run of vector
+/// work into more blocks materialises the values that cross the new boundary:
+/// a score tile consumed in place inside one block has to become a real buffer
+/// once a barrier lands in the middle of it. So a finer partition buys overlap
+/// with UB, and a variant can be ranked best here and then be rejected outright
+/// by the binary compiler -- which is exactly what happened to a candidate that
+/// needed 345 600 bytes against the 253 952 the part has.
+///
+/// The sum of every allocation, not a high-water mark: liveness is not tracked
+/// here, so two buffers that never coexist are still both counted. That makes
+/// this an over-estimate, which is why it is reported and not used to reject
+/// anything -- throwing away a variant that would have fitted is worse than
+/// letting one through. It is also a lower bound in the other direction, since
+/// the downstream compiler adds its own multi-buffering on top. Both errors go
+/// the same way for every variant, so the comparison between variants is still
+/// worth reading.
+struct UBFootprint {
+  int64_t bytes = 0;
+  int64_t allocations = 0;
+};
+
+UBFootprint measureUBFootprint(ModuleOp module) {
+  UBFootprint footprint;
+  module.walk([&](memref::AllocOp alloc) {
+    if (getMemorySpaceName(alloc.getType()) != "ub") {
+      return;
+    }
+    if (auto bytes = getShapedByteSize(alloc.getType())) {
+      footprint.bytes += *bytes;
+      ++footprint.allocations;
+    }
+  });
+  return footprint;
 }
 
 /// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
@@ -2268,6 +2711,11 @@ struct ModuleEstimate {
   int64_t serialisedBound = 0;
   /// Buffer depths as recorded on the module by BufferCountManager.
   BufferDepths buffers;
+  /// Synchronisation flags spent, against a budget nothing else here shows.
+  FlagCensus flags;
+  /// Unified Buffer asked for, against the capacity that decides whether this
+  /// partition compiles at all.
+  UBFootprint ub;
   /// The buffer whose reuse constrains the kernel most, and its bound.
   BufferRecurrence recurrence;
   int64_t recurrenceBound = 0;
@@ -2281,6 +2729,10 @@ struct ModuleEstimate {
   llvm::MapVector<int64_t, BlockSchedule> weightedSchedule;
   UnitBusyCycles weightedBusy;
   UnitBusyCycles iterationBusy;
+  /// Barriers charged in the one-iteration schedule, which is the schedule the
+  /// recurrence bound is measured on. Zero whenever the profile leaves
+  /// barrier_cycles at its default.
+  BarrierTally iterationBarriers;
 };
 
 /// Combine the block schedule into one number, as the larger of two bounds.
@@ -2305,19 +2757,25 @@ struct ModuleEstimate {
 ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
                                      const HardwareConfig &config,
                                      const FusionFactors &fusion,
-                                     const BufferDepths &buffers) {
+                                     const BufferDepths &buffers,
+                                     const FlagCensus &flags,
+                                     const UBFootprint &ub) {
   ModuleEstimate estimate;
   estimate.buffers = buffers;
+  estimate.flags = flags;
+  estimate.ub = ub;
   estimate.order = topologicalBlockOrder(breakdown);
 
+  BarrierTally weightedBarriers;
   estimate.serialisedBound = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/false,
-      estimate.weightedSchedule, estimate.weightedBusy);
+      estimate.weightedSchedule, estimate.weightedBusy, weightedBarriers);
   estimate.throughputBound = combineRoofline(estimate.weightedBusy, config);
 
   estimate.iterationLatency = scheduleBlockGraph(
       breakdown, estimate.order, config, fusion, /*perIteration=*/true,
-      estimate.iterationSchedule, estimate.iterationBusy);
+      estimate.iterationSchedule, estimate.iterationBusy,
+      estimate.iterationBarriers);
   estimate.initiationInterval = combineRoofline(estimate.iterationBusy, config);
 
   // Measured on one iteration, so the result is a lower bound on the
@@ -2519,11 +2977,62 @@ void printBlocks(llvm::raw_ostream &os, const CostBreakdown &breakdown,
             "reads a value the other block produced");
 }
 
+/// The per-pipe busy times again, grouped and named the way the hardware
+/// profiler names them.
+///
+/// Comparing an estimate against msprof is otherwise a manual exercise every
+/// time: the model counts cycles per HWUnit, the profiler reports microseconds
+/// per column, and the two vocabularies do not line up. Printing the prediction
+/// in the profiler's own terms makes calibration a subtraction -- which is how
+/// the fixpipe bandwidth turned out to be three times too slow and how a
+/// UB->L1 copy was found charged to the Cube's load engine.
+///
+/// Two columns are listed with nothing in them on purpose. A blank there is a
+/// statement: the model has no term for that hardware at all, so whatever the
+/// profiler reports in it is unaccounted for rather than mispredicted.
+void printPipeComparison(llvm::raw_ostream &os,
+                         const llvm::DenseMap<HWUnit, int64_t> &busy,
+                         const HardwareConfig &config) {
+  auto cyclesOf = [&](HWUnit unit) { return cyclesOfUnit(busy, unit); };
+
+  struct Row {
+    const char *column;
+    int64_t cycles;
+    const char *from;
+  };
+  const Row rows[] = {
+      {"aic_mac_time", cyclesOf(HWUnit::Cube), "cube"},
+      {"aic_mte2_time", cyclesOf(HWUnit::CubeMTE2), "cube_mte2"},
+      {"aic_fixpipe_time",
+       cyclesOf(HWUnit::FixPipe) + cyclesOf(HWUnit::FixPipeUB),
+       "fixpipe + fixpipe_ub"},
+      {"aic_mte1_time", cyclesOf(HWUnit::CubeMTE1), "cube_mte1"},
+      {"aiv_vec_time", cyclesOf(HWUnit::Vector), "vector"},
+      {"aiv_mte2_time", cyclesOf(HWUnit::VecMTE2) + cyclesOf(HWUnit::MTE1ToUB),
+       "vec_mte2 + mte1_l1_ub"},
+      {"aiv_mte3_time", cyclesOf(HWUnit::MTE3) + cyclesOf(HWUnit::MTE3ToL1),
+       "mte3 + mte3_ub_l1"},
+      {"aic_scalar_time", cyclesOf(HWUnit::ScalarCube), "scalar_cube"},
+      {"aiv_scalar_time", cyclesOf(HWUnit::Scalar), "scalar"},
+  };
+
+  os << "[" << DEBUG_TYPE
+     << "]     predicted busy time per pipe, named as msprof names it, so a"
+        " profiler row can be subtracted from this one without translating:\n";
+  for (const Row &row : rows) {
+    os << "[" << DEBUG_TYPE << "]       "
+       << llvm::left_justify(row.column, 21)
+       << llvm::format("%12.1f us", config.cyclesToMicroseconds(row.cycles))
+       << "   " << row.from << "\n";
+  }
+}
+
 /// How the module number was assembled. Printed as a derivation rather than a
 /// result so that a surprising total can be attributed to a term.
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                    const FusionFactors &fusion, const HardwareConfig &config,
-                   int64_t branchedOps) {
+                   int64_t branchedOps, int64_t scalarOpsCube,
+                   int64_t scalarOpsVector) {
   auto line = [&](llvm::StringRef what, int64_t cycles) {
     os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
        << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
@@ -2559,6 +3068,7 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
        << " " << pipes[i].second;
   }
   os << "\n";
+  printPipeComparison(os, estimate.weightedBusy, config);
   line(resourceBound ? "  recurrence bound: buffer reuse"
                      : "> recurrence bound: buffer reuse",
        estimate.recurrenceBound);
@@ -2585,7 +3095,64 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE << "]     buffer depths read from the module: intra "
      << estimate.buffers.intra << ", inter-core " << estimate.buffers.inter
      << "\n";
-  if (estimate.buffers.requestedInter > estimate.buffers.inter) {
+  if (estimate.flags.distinct > 0) {
+    // The budget is a hardware limit, not a cost: exceeding it does not make
+    // the kernel slow, it makes it not compile (AnalyzeFlag) or silently
+    // single-buffered (AddMultiBufferOuterScope). Printed next to the buffer
+    // depths because the two interact -- double buffering halves the budget.
+    const int budget = estimate.buffers.inter > 1 ? 8 : 15;
+    os << "[" << DEBUG_TYPE << "]     synchronisation flags: "
+       << estimate.flags.distinct << " distinct, highest id "
+       << estimate.flags.highestId << ", at most " << estimate.flags.peakLive
+       << " live at once, against a budget of " << budget
+       << (estimate.buffers.inter > 1 ? " (halved by inter-core double"
+                                        " buffering)"
+                                      : "")
+       << ". Live count is by program order, so it is an over-estimate of what"
+          " the allocator's interference colouring would need\n";
+  }
+  if (estimate.ub.allocations > 0) {
+    const MemorySpace *ub = config.getMemorySpace("ub");
+    os << "[" << DEBUG_TYPE << "]     unified buffer: "
+       << estimate.ub.allocations << " allocation(s) totalling "
+       << estimate.ub.bytes << " bytes";
+    if (ub && ub->sizeBytes > 0) {
+      os << " against a capacity of " << ub->sizeBytes;
+    }
+    os << ". Summed, not a high-water mark -- buffers that never coexist are"
+          " still both counted -- and the binary compiler multi-buffers on top"
+          " of this, so it is neither an upper nor a lower bound. It is here"
+          " because a finer block partition pays for its overlap in UB, and a"
+          " variant that overruns is rejected outright by that compiler, not"
+          " by anything the estimate can see\n";
+  }
+  if (scalarOpsCube + scalarOpsVector > 0) {
+    const int perInstruction = config.getScalarCyclesPerInstruction();
+    os << "[" << DEBUG_TYPE << "]     scalar issue: " << scalarOpsCube
+       << " instruction(s) on the Cube core and " << scalarOpsVector
+       << " on the Vector core over the run, at " << perInstruction
+       << " cycle(s) each";
+    if (perInstruction == 0) {
+      // The counts are the useful half. One profiled run turns them into the
+      // constant: aic_scalar_time belongs to the first count and
+      // aiv_scalar_time to the second, so the measured microseconds times the
+      // clock and divided by the matching count is the figure to set. Guessing
+      // it here instead would put an unmeasured number into every estimate.
+      os << ", so nothing is charged for them. aic_scalar_time divided by the"
+            " first count and aiv_scalar_time by the second give the figure"
+            " for scalar_issue.cycles_per_instruction -- if the two disagree,"
+            " the cost is not per instruction and a per-block term is what is"
+            " missing";
+    }
+    os << "\n";
+  }
+  if (estimate.buffers.interDowngraded) {
+    os << "[" << DEBUG_TYPE
+       << "]       note: inter-core double buffering was asked for and refused"
+          " -- the synchronisation flags it needs do not fit the hardware"
+          " budget, so AddMultiBufferOuterScope compiled single-buffered."
+          " Costed at depth 1, which is what the IR contains\n";
+  } else if (estimate.buffers.requestedInter > estimate.buffers.inter) {
     os << "[" << DEBUG_TYPE << "]       note: inter_core_buf_count="
        << estimate.buffers.requestedInter
        << " was requested, but the pipeline only distinguishes 1 from more"
@@ -2606,6 +3173,29 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   os << "[" << DEBUG_TYPE << "]     " << branchedOps
      << " operation(s) in mutually exclusive branches, charged at a fraction"
         " of their cost because only one branch runs per iteration\n";
+
+  // What each barrier costs, and what that came to. A barrier is latency, not
+  // occupancy: it stops the core from issuing rather than keeping an engine
+  // busy, so it moves the schedule and through it the recurrence bound, and
+  // can never move the resource bound. Worth saying, because at zero a finer
+  // block partition is free and any search over partitions degenerates.
+  os << "[" << DEBUG_TYPE << "]     barrier cost: ";
+  if (config.getBarrierCycles() <= 0) {
+    os << "0 cycles (off; set synchronisation.barrier_cycles in the hardware"
+          " profile -- until then splitting a block costs nothing)\n";
+  } else {
+    os << config.getBarrierCycles() << " cycles each, "
+       << estimate.iterationBarriers.count << " crossed per iteration, "
+       << estimate.iterationBarriers.cycles << " cycles";
+    if (estimate.iterationLatency > 0) {
+      os << llvm::format(" (%.1f%% of the one-iteration schedule)",
+                         100.0 *
+                             static_cast<double>(
+                                 estimate.iterationBarriers.cycles) /
+                             static_cast<double>(estimate.iterationLatency));
+    }
+    os << "\n";
+  }
 
   os << "[" << DEBUG_TYPE << "]     per iteration, for reference: II "
      << estimate.initiationInterval << " cycles, barrier chain "
@@ -2682,6 +3272,60 @@ void printLoops(llvm::raw_ostream &os,
   }
 }
 
+/// Every distinct transfer the kernel performs: which engine, which path,
+/// how many bytes, and how often.
+///
+/// This is the view the by-kind table cannot give. There, one row per
+/// operation kind hides both the engine (`record()` keeps only the last one
+/// seen, so a kind split across engines shows one of them) and the size (a
+/// kind whose total doubled may be moving twice the bytes or running twice as
+/// often, and those call for opposite fixes). Bandwidths differ by more than
+/// 4x between paths on this profile, so which path a transfer took decides
+/// most of its cost.
+void printTransfers(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
+  if (breakdown.transfers.empty()) {
+    return;
+  }
+
+  llvm::SmallVector<TransferStats> rows(breakdown.transfers.begin(),
+                                        breakdown.transfers.end());
+  llvm::sort(rows, [](const TransferStats &lhs, const TransferStats &rhs) {
+    return lhs.weightedCycles > rhs.weightedCycles;
+  });
+
+  os << "[" << DEBUG_TYPE
+     << "] data transfers, grouped by engine, path and size. 'each' is one"
+        " execution and 'x' how many times the loops run it, so 'cycles' is"
+        " each x count x, divided by the branch divisor where one applies."
+        " Two transfers of the same operation kind can sit on engines whose"
+        " bandwidths differ several-fold, which the table above cannot show:\n";
+  os << "[" << DEBUG_TYPE
+     << "]     count       bytes       each          x        cycles  unit    "
+        "     path       operation\n";
+
+  for (const TransferStats &row : rows) {
+    // Built into a local: left_justify keeps a StringRef, not a copy.
+    std::string path = row.srcSpace.str();
+    path += ":";
+    path += row.dstSpace.str();
+
+    os << "[" << DEBUG_TYPE << "] "
+       << llvm::format("%9lld", static_cast<long long>(row.count))
+       << llvm::format("%12lld", static_cast<long long>(row.bytes))
+       << llvm::format("%11lld", static_cast<long long>(row.cyclesEach))
+       << llvm::format("%11lld", static_cast<long long>(row.multiplier))
+       << llvm::format("%14lld", static_cast<long long>(row.weightedCycles))
+       << "  "
+       << llvm::left_justify(mlir::ascend::stringifyHWUnit(row.unit), 11)
+       << llvm::left_justify(path, 11) << row.kind;
+    if (row.branchDivisor > 1) {
+      os << "  (/" << row.branchDivisor << ", one branch of "
+         << row.branchDivisor << " runs)";
+    }
+    os << "\n";
+  }
+}
+
 void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
   // Heaviest first: that is the order in which teaching the model new
   // operations pays off.
@@ -2730,6 +3374,8 @@ void printBreakdown(llvm::raw_ostream &os, const CostBreakdown &breakdown) {
       os << "[" << DEBUG_TYPE << "]     " << name << "\n";
     }
   };
+
+  printTransfers(os, breakdown);
 
   listKinds(CostConfidence::Generic,
             "charged by element count only, i.e. with no dedicated cost model");
@@ -2847,8 +3493,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   // The estimate is assembled from the blocks, not from a single roofline over
   // every operation: the whole point is that regrouping the same operations
   // into different blocks has to change the number.
-  const ModuleEstimate estimate = computeModuleEstimate(
-      breakdown, *config, fusion, readBufferDepths(module));
+  const ModuleEstimate estimate =
+      computeModuleEstimate(breakdown, *config, fusion,
+                            readBufferDepths(module), takeFlagCensus(module),
+                            measureUBFootprint(module));
   const int64_t totalCycles = estimate.total;
 
   // Kept for comparison: what the model reported before blocks constrained it,
@@ -2860,6 +3508,12 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(totalCycles));
   module->setAttr(kCVPipelineCostRoofline,
                   builder.getI64IntegerAttr(rooflineCycles));
+  // Separately, so a consumer can see which of the two the total came from and
+  // how much room the other one had.
+  module->setAttr(kCVPipelineCostResource,
+                  builder.getI64IntegerAttr(estimate.throughputBound));
+  module->setAttr(kCVPipelineCostRecurrence,
+                  builder.getI64IntegerAttr(estimate.recurrenceBound));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,
@@ -2951,11 +3605,22 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   };
 
   auto reportDetail = [&](llvm::raw_ostream &os) {
-    printEstimate(os, estimate, fusion, *config, breakdown.branchedOps);
+    printEstimate(os, estimate, fusion, *config, breakdown.branchedOps,
+                  breakdown.weightedScalarOpsCube,
+                  breakdown.weightedScalarOpsVector);
     printLoops(os, loopReports);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);
   };
+
+  // During a variant search the estimate runs once per candidate, and the full
+  // report for a few hundred of them is unreadable. The search silences every
+  // attempt and prints one line itself when a candidate improves on the best so
+  // far; the winner is then recompiled without the flag, so the report the user
+  // ends up reading describes exactly the IR that was kept.
+  if (module->hasAttr(kCVPipelineCostQuiet)) {
+    return;
+  }
 
   const int verbosity = getVerbosity();
   LLVM_DEBUG(reportTo(llvm::dbgs()); reportDetail(llvm::dbgs()));

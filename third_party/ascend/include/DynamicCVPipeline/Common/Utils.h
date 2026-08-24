@@ -55,6 +55,15 @@ inline constexpr llvm::StringLiteral kInterCoreBufCount =
     "ssbuffer.inter_core_buf_count";
 inline constexpr llvm::StringLiteral kLoadStoreBufCount =
     "ssbuffer.load_store_buf_count";
+/// Set when AddMultiBufferOuterScope wanted inter-core double buffering and
+/// could not have it, because the synchronisation flags the double-buffer
+/// groups would need do not fit in the hardware's budget. The pass then
+/// compiles single-buffered while ssbuffer.inter_core_buf_count still says 2,
+/// so anything reading that count for how deeply the IR actually overlaps has
+/// to check this too -- otherwise it credits the schedule with an overlap that
+/// was silently taken away.
+inline constexpr llvm::StringLiteral kInterCoreBufDowngraded =
+    "ssbuffer.inter_core_buf_downgraded";
 inline constexpr llvm::StringLiteral kAnalyzeFlagId =
     "ssbuffer.analyze_flag_id";
 inline constexpr llvm::StringLiteral kLoopCarriedL0C =
@@ -81,6 +90,10 @@ inline constexpr llvm::StringLiteral kDepMark = "ssbuffer.dep_mark";
 /// the rewritten bound alone looks like an ordinary trip count.
 inline constexpr llvm::StringLiteral kIterExtension =
     "ssbuffer.iter_extension";
+/// Selects one operation-level ordering variant, set on the module by the
+/// variant search before each attempt. Absent means the ordinary block-level
+/// path, which is what an ordinary compilation takes.
+inline constexpr llvm::StringLiteral kReorderSeed = "ssbuffer.reorder_seed";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kForMayNotExec =

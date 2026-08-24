@@ -1408,6 +1408,20 @@ void AddMultiBufferOuterScopePass::runOnOperation() {
   if (sum >= kMaxTotalFlags) {
     LDBG("[FlagBudget] budget exceeded (maxFlagId + groupCount >= "
          << kMaxTotalFlags << "), forcing single-buffer");
+    // Say it out loud, and leave a mark. This path costs about as much as any
+    // deliberate change to the pipeline -- inter-core double buffering was
+    // worth 12% on flash attention -- yet it used to happen under a debug-only
+    // log, with ssbuffer.inter_core_buf_count still reading 2 afterwards. A
+    // reader of that attribute, the cost model included, would then credit the
+    // schedule with an overlap the IR no longer contains, and a variant that
+    // lost double buffering by adding one flag would look free.
+    module->emitWarning()
+        << "[FlagBudget] inter-core double buffering disabled: "
+           "highest flag id " << maxFlagId << " plus " << groupCount
+        << " transfer group(s) needs " << (sum + 1) << " flags, and only "
+        << kMaxTotalFlags << " are available. Compiling single-buffered.";
+    module->setAttr(mlir::CVPipeline::kInterCoreBufDowngraded,
+                    UnitAttr::get(module->getContext()));
     isDoubleBuf = false;
   }
 

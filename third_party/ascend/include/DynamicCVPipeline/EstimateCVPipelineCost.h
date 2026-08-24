@@ -60,6 +60,25 @@ inline constexpr llvm::StringLiteral kCVPipelineEstimatedCycles =
 inline constexpr llvm::StringLiteral kCVPipelineCostRoofline =
     "ascend.cv_pipeline_cost_roofline";
 
+/// The two bounds kCVPipelineEstimatedCycles is the larger of, recorded
+/// separately (i64 each) so that two variants tying on the total can still be
+/// ordered.
+///
+/// Both are needed because the total throws away which constraint was slack.
+/// Two variants held back by the same wall are not equally good: the one whose
+/// other bound sits further below that wall has more room before something the
+/// model does not charge -- scalar time, L1->L0 traffic, barrier latency --
+/// pushes that bound over the wall and starts costing real time.
+///
+/// Measured on flash attention: intra-core buffer depths 2 and 3 produced an
+/// identical total of 288 578 196 cycles, recurrence bounds of 184 465 709 and
+/// 154 792 120, and 168 825 us against 147 302 us on hardware. The total could
+/// not tell them apart; the recurrence bound ranked them correctly.
+inline constexpr llvm::StringLiteral kCVPipelineCostResource =
+    "ascend.cv_pipeline_cost_resource";
+inline constexpr llvm::StringLiteral kCVPipelineCostRecurrence =
+    "ascend.cv_pipeline_cost_recurrence";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
@@ -88,6 +107,13 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUnknownOps =
 /// orders them -- but iter_start/iter_finish show exactly how much they did.
 inline constexpr llvm::StringLiteral kCVPipelineBlocks =
     "ascend.cv_pipeline_blocks";
+
+/// Unit attribute asking the estimate to record its results on the module but
+/// print nothing. Set by the variant search, which evaluates one candidate per
+/// attempt and would otherwise emit a full report for each of them; the search
+/// prints its own one-line summary instead. Not for ordinary compilation.
+inline constexpr llvm::StringLiteral kCVPipelineCostQuiet =
+    "ascend.cv_pipeline_cost_quiet";
 
 /// Number of loops whose trip count is only known at run time (i64), such as a
 /// loop bounded by a sequence length passed to the kernel. Their bodies are

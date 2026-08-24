@@ -330,6 +330,70 @@ public:
   /// pipeline.
   bool areMutexUnits(llvm::StringRef a, llvm::StringRef b) const;
 
+  /// Fixed cost of crossing one synchronisation barrier, in cycles: the flag
+  /// write, its propagation, and the wait that observes it. This is latency,
+  /// not occupancy -- a barrier does not keep a pipe busy, it prevents the
+  /// core from issuing -- so a consumer of this number belongs in a schedule
+  /// and not in a roofline.
+  ///
+  /// Defaults to 0, i.e. off, because it has not been measured on this target
+  /// and an unmeasured constant should not silently move everyone's numbers.
+  /// It matters as soon as the number of barriers becomes something a search
+  /// varies: with it at zero, splitting a compute block in two is free.
+  int64_t getBarrierCycles() const { return barrierCycles; }
+  void setBarrierCycles(int64_t cycles) { barrierCycles = cycles; }
+
+  /// How many vector cores execute the vector work of one compute block.
+  ///
+  /// They split the data, not the instruction stream: on a profiled kernel both
+  /// vector sub-cores of a block report the same instruction count -- 152 166
+  /// MTE3 instructions each, against the 152 165 this model derives for one
+  /// core -- while each moves half of every tile. A consumer therefore divides
+  /// the repeat count of an instruction by this number and leaves the
+  /// instruction's startup latency alone.
+  ///
+  /// Defaults to 1, the behaviour before the field existed, because it
+  /// describes one part's core pairing and no profile should acquire it by
+  /// inheritance.
+  int getVectorCoresPerBlock() const { return vectorCoresPerBlock; }
+  void setVectorCoresPerBlock(int cores) {
+    vectorCoresPerBlock = cores >= 1 ? cores : 1;
+  }
+
+  /// Bytes one vector core consumes per cycle.
+  ///
+  /// vec_cycle_tables gives cycles per 256-byte repeat, so its numbers already
+  /// contain a datapath width: compute=2 for a plain add is 128 B/cycle. What
+  /// carries over from the part those tables were measured on is the *ratio*
+  /// between intrinsics -- a divide costs four times an add there and should
+  /// here too -- not the absolute count. So a consumer rescales the table by
+  /// kVecTableBytesPerCycle / this, and the table itself is left as migrated.
+  ///
+  /// Defaults to the table's own width, which leaves every existing profile
+  /// costed exactly as before.
+  int getVectorBytesPerCycle() const { return vectorBytesPerCycle; }
+
+  /// Width the migrated vec_cycle_tables were measured at: a 256-byte repeat
+  /// at compute=2 is 128 bytes per cycle.
+  static constexpr int kVecTableBytesPerCycle = 128;
+
+  /// Cycles one scalar instruction occupies its core's scalar unit for.
+  ///
+  /// Address arithmetic, loop bookkeeping and predicate evaluation are not
+  /// free: the profiler puts them at a fifth to a quarter of each core's
+  /// active time, and they scale with the number of blocks rather than with
+  /// the data, so they are exactly what makes a finer block partition cost
+  /// something. They overlap the compute pipes rather than queueing behind
+  /// them, so a consumer takes the maximum against those, not the sum.
+  ///
+  /// Defaults to 0, i.e. not charged, because the per-instruction figure has
+  /// not been measured yet -- only the per-iteration total has. The report
+  /// prints the instruction count next to that total so the division can be
+  /// done from one profiled run rather than guessed at here.
+  int getScalarCyclesPerInstruction() const {
+    return scalarCyclesPerInstruction;
+  }
+
   // Cube (GEMM) micro-architecture: migrated from tilesim cube_config.
   void getCubeModelThroughput(int elementBits, int &basicM, int &basicK,
                               int &basicN) const;
@@ -386,6 +450,18 @@ private:
   // unit-name strings that share a pipeline and cannot run in parallel.
   // Default 910B: {"vec_mte2", "mte3"} (AIV MTE2<->MTE3).
   std::vector<std::vector<std::string>> mutexGroups;
+  // Cost of one synchronisation barrier in cycles. Zero means "not modelled",
+  // which is what every profile says until someone measures it.
+  int64_t barrierCycles = 0;
+  // Vector cores sharing one compute block's vector work. One means "no
+  // pairing described", which leaves every existing profile unchanged.
+  int vectorCoresPerBlock = 1;
+  // Vector datapath width. Defaulting to the table's own width makes the
+  // rescaling a no-op for profiles that do not declare one.
+  int vectorBytesPerCycle = kVecTableBytesPerCycle;
+  // Cycles per scalar instruction. Zero means "not modelled", which is what
+  // every profile says until the number is measured.
+  int scalarCyclesPerInstruction = 0;
 };
 
 //===----------------------------------------------------------------------===//

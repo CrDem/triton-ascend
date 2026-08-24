@@ -159,6 +159,9 @@ void PipelineScheduler::initPipelines() {
   pipelines.emplace(HWUnit::FixPipeUB, HWUnitPipeline(HWUnit::FixPipeUB));
   pipelines.emplace(HWUnit::MTE3ToL1, HWUnitPipeline(HWUnit::MTE3ToL1));
   pipelines.emplace(HWUnit::MTE1ToUB, HWUnitPipeline(HWUnit::MTE1ToUB));
+  // Cube operand staging (L1 -> L0A/L0B) and the Cube core's own scalar issue.
+  pipelines.emplace(HWUnit::CubeMTE1, HWUnitPipeline(HWUnit::CubeMTE1));
+  pipelines.emplace(HWUnit::ScalarCube, HWUnitPipeline(HWUnit::ScalarCube));
 }
 
 void PipelineScheduler::addOperation(PipelineOp op) {

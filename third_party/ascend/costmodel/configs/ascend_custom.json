@@ -3,9 +3,10 @@
   "name": "Ascend custom (PLACEHOLDER: values inherited from 910B)",
   "vendor": "Huawei",
   "version": "0.1-draft",
+  "_comment_clock": "MEASURED. msprof reports Current Freq: 1650 and Rated Freq: 1650 on this part. The 1.85 inherited from 910B made every microsecond figure 12% optimistic while leaving cycle counts untouched, so it hid rather than showed. cycles_per_us is not parsed -- the loader derives it from frequency_ghz -- and is kept only so the two do not disagree on paper.",
   "clock": {
-    "frequency_ghz": 1.85,
-    "cycles_per_us": 1850
+    "frequency_ghz": 1.65,
+    "cycles_per_us": 1650
   },
   "memory_spaces": {
     "hbm": {
@@ -44,10 +45,10 @@
     },
     "ub": {
       "type": "on_chip_local",
-      "size_kb": 192,
+      "size_kb": 248,
       "bandwidth_gbps": 3200,
       "latency_cycles": 5,
-      "description": "Unified Buffer for Vector compute"
+      "description": "MEASURED capacity. The binary compiler names it when a kernel overruns: 'ub overflow, requires 2764800 bits while 2031616 bits available'. 2031616 bits is 253952 bytes, i.e. 248 KB, against the 192 KB inherited here from another part. Nothing in the estimate divides by this -- it is reported next to what the module allocates, because that is the constraint that decides whether a block partition can be compiled at all."
     }
   },
   "compute_units": {
@@ -354,6 +355,22 @@
       ]
     }
   },
+  "synchronisation": {
+    "description": "Fixed cost of crossing one synchronisation barrier: the flag write, its propagation, and the wait that observes it. Charged as latency in the block schedule, not as pipe occupancy, because a barrier stops the core from issuing rather than keeping an engine busy -- so it can only ever show up through the recurrence bound, never through the resource bound. UNMEASURED on this target: 0 means the barrier is treated as free, which is what the model did before this field existed. Set it before comparing IR variants that differ in HOW MANY barriers they contain (a finer block partition adds barriers), because at 0 splitting a compute block in two is free and a search over partitions has a degenerate optimum at one operation per block.",
+    "barrier_cycles": 0
+  },
+  "vector_datapath": {
+    "description": "MEASURED. Bytes one vector core consumes per cycle. vec_cycle_tables was migrated from a part whose datapath is 128 B/cycle -- a 256-byte repeat at compute=2 -- and its numbers are rescaled by the ratio rather than edited, so the relative cost between intrinsics is preserved. Derived by least squares over three tile configurations spanning 3.1x in total repeats, which gave 0.89 cycles per repeat and, independently and without being fitted, 35.8 cycles of per-instruction startup against the 35 already in the model. That second agreement is what says the formula's shape is right and only this one number was wrong. 0.89 cycles per 256-byte repeat is 288 B/cycle; 256 is the physically natural value next to it and is what is set here, leaving the model about 6% over on the compute term.",
+    "bytes_per_cycle": 256
+  },
+  "scalar_issue": {
+    "description": "UNMEASURED, and left at zero for that reason. Each core's scalar unit runs address arithmetic, loop bookkeeping and predicate evaluation; the profiler puts that at 19-24% of the Cube's active time and 14-20% of the Vector's, and -- the part that matters for choosing a block partition -- at 232, 239 and 252 cycles per iteration across three tile configurations whose area differs fourfold. It scales with blocks, not with data. What is missing is the split between per-instruction and per-block: every run so far had eleven blocks, so the two cannot be told apart. The estimate report prints the weighted instruction count next to this, which is the other half of the division; one profiled run fills it in.",
+    "cycles_per_instruction": 0
+  },
+  "core_pairing": {
+    "description": "MEASURED. How many vector cores execute one compute block's vector work. The runtime reports 28 cube cores and 56 vector cores, msprof prints two vector sub-block rows against every cube row, and the two rows carry the SAME instruction count -- 152 166 MTE3 instructions each on flash attention, against the 152 165 this model derives for a single core -- while the block's tile is only moved once. That is a split of the data, not of the instruction stream, so a repeat count is halved and a startup latency is not. Only the vector arithmetic uses this: the transfer engines are charged from bandwidths that were themselves read off a running sub-core, so they already contain the split and must not be divided again.",
+    "vector_cores_per_block": 2
+  },
   "cube_model": {
     "description": "Cube (GEMM) L1-pipe roofline parameters (tilesim 910B1 cube_config).",
     "throughput": [
@@ -517,14 +534,22 @@
     "hbm:l2_agg": {
       "bandwidth_gbps": 1638.4
     },
+    "_comment_l0c_ub": "MEASURED, not a placeholder any more. msprof reports aic_fixpipe_active_bw = 244.9 GB/s on flash attention, read straight off the engine rather than inferred from its occupancy. The inherited 70 GB/s made the Cube drain look three to four times slower than the matmul that fed it, which is backwards for a path that exists to keep the result on chip.",
     "l0c:ub": {
-      "bandwidth_gbps": 70
+      "bandwidth_gbps": 245
     },
     "ub:l1": {
       "bandwidth_gbps": 137
     },
     "l1:ub": {
       "bandwidth_gbps": 137
+    },
+    "_comment_l1_l0": "MEASURED. Staging the Cube's operands from L1 into L0A/L0B, which the profiler reports as aic_mte1_time and which nothing in the model charged until the matmul started paying for it. msprof gives aic_mte1_active_bw between 292 and 361 GB/s across configurations, and the arithmetic agrees from the other side: four instructions per inner iteration moving 128 KB in about 560 cycles is ~234 B/cycle, i.e. ~386 GB/s. 355 sits inside that range. Worth a direct microbenchmark: the figure comes from one kernel's occupancy and inherits whatever else that occupancy contains.",
+    "l1:l0a": {
+      "bandwidth_gbps": 355
+    },
+    "l1:l0b": {
+      "bandwidth_gbps": 355
     }
   },
   "vec_cycle_tables": {
