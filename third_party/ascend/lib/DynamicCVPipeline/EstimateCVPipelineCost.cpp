@@ -3514,6 +3514,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.throughputBound));
   module->setAttr(kCVPipelineCostRecurrence,
                   builder.getI64IntegerAttr(estimate.recurrenceBound));
+  module->setAttr(kCVPipelineCostUBBytes,
+                  builder.getI64IntegerAttr(estimate.ub.bytes));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,

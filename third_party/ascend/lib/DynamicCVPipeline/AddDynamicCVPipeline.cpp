@@ -106,6 +106,45 @@ bool totalsAreTied(int64_t a, int64_t b) {
   return diff * kTieRelativeDenominator <= scale;
 }
 
+constexpr const char *kMaxUBBytesEnvVar = "TRITON_ASCEND_CV_MAX_UB_BYTES";
+
+/// Unified Buffer a candidate may ask for before the search discards it.
+///
+/// The search has no other way to know: overrunning UB is diagnosed by the
+/// binary compiler, in a separate process, after the whole of this compilation
+/// has finished -- so a candidate that cannot be built looks perfectly healthy
+/// here and gets picked. And it is the good candidates that overrun, because
+/// the overlap they win is bought by materialising the values that cross each
+/// new block boundary.
+///
+/// Not the hardware's capacity. The figure being compared is a sum over every
+/// allocation, with no liveness, against a compiler that then multi-buffers
+/// what it is given; the two are not the same quantity and no arithmetic
+/// relates them. What the threshold is for is separating this kernel's
+/// candidates from each other, so it is bisected on hardware like the block
+/// limit was, starting from the number a candidate that *does* build reports.
+///
+/// Zero, the default, means no filtering at all -- an over-estimate used to
+/// reject would throw away candidates that would have fitted, which is worse
+/// than letting an unbuildable one through and reading the next line of the
+/// ranking.
+int64_t getMaxUBBytes() {
+  static const int64_t limit = [] {
+    const char *env = std::getenv(kMaxUBBytesEnvVar);
+    if (!env) {
+      return int64_t{0};
+    }
+    int64_t value = 0;
+    if (llvm::StringRef(env).getAsInteger(10, value) || value < 0) {
+      llvm::errs() << "[" << DEBUG_TYPE << "] " << kMaxUBBytesEnvVar << "='"
+                   << env << "' is not a byte count; ignoring\n";
+      return int64_t{0};
+    }
+    return value;
+  }();
+  return limit;
+}
+
 /// How many orderings to try. One or fewer means the ordinary single
 /// compilation, which is what every build that does not ask for a search gets.
 int getVariantCount() {
@@ -282,7 +321,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // toolchain -- by the binary compiler running out of Unified Buffer, say,
     // which no pass here can foresee -- leaves the next choices on record
     // instead of sending the search back to the start.
-    SmallVector<std::tuple<int64_t, int64_t, int64_t>> ranked;
+    SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t>> ranked;
+    const int64_t maxUBBytes = getMaxUBBytes();
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
@@ -304,6 +344,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       bool accepted = false;
       int64_t cost = 0;
       int64_t second = 0;
+      int64_t ubBytes = 0;
       int errCode = 0;
 
       {
@@ -342,6 +383,17 @@ void AddDynamicCVPipelinePass::runOnOperation() {
           second = resourceAttr && recurrenceAttr
                        ? std::min(resourceAttr.getInt(), recurrenceAttr.getInt())
                        : cost;
+          if (auto ubAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                  mlir::triton::kCVPipelineCostUBBytes)) {
+            ubBytes = ubAttr.getInt();
+          }
+          // -3: it compiled and scored, but asks for more Unified Buffer than
+          // the caller allowed. Counted as a rejection rather than ranked, so
+          // the summary shows how much of the search this threw away.
+          if (maxUBBytes > 0 && ubBytes > maxUBBytes) {
+            accepted = false;
+            errCode = -3;
+          }
         } else if (!ran) {
           auto codeAttr =
               moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
@@ -360,7 +412,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
       ++usable;
       distinctCosts.insert({cost, second});
-      ranked.push_back({cost, second, seed});
+      ranked.push_back({cost, second, ubBytes, seed});
       if (worstCost < cost) {
         worstCost = cost;
       }
@@ -435,12 +487,12 @@ void AddDynamicCVPipelinePass::runOnOperation() {
             std::get<1>(ranked[i]) == std::get<1>(ranked[i - 1])) {
           continue;
         }
-        llvm::errs() << " " << std::get<2>(ranked[i]) << "("
+        llvm::errs() << " " << std::get<3>(ranked[i]) << "("
                      << std::get<0>(ranked[i]) << "/" << std::get<1>(ranked[i])
-                     << ")";
+                     << "/" << std::get<2>(ranked[i]) << "B)";
         ++shown;
       }
-      llvm::errs() << "  [seed(total/second bound)]\n";
+      llvm::errs() << "  [seed(total/second bound/unified buffer)]\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }
@@ -451,6 +503,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         llvm::errs() << "a pipeline failure and no error code\n";
       } else if (entry.first == -2) {
         llvm::errs() << "no estimate produced\n";
+      } else if (entry.first == -3) {
+        llvm::errs() << "more Unified Buffer than " << kMaxUBBytesEnvVar
+                     << " allows\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }

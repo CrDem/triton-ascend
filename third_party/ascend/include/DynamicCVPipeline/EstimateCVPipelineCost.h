@@ -79,6 +79,23 @@ inline constexpr llvm::StringLiteral kCVPipelineCostResource =
 inline constexpr llvm::StringLiteral kCVPipelineCostRecurrence =
     "ascend.cv_pipeline_cost_recurrence";
 
+/// Bytes of Unified Buffer the module allocates (i64), summed over every
+/// allocation rather than tracked by liveness.
+///
+/// Recorded because it is the constraint that decides whether a block
+/// partition can be compiled at all, and the only one of that kind the
+/// estimate can see. A finer partition buys overlap with UB -- each new block
+/// boundary materialises the value crossing it -- so the candidates a search
+/// likes best are systematically the ones most likely to be refused by the
+/// binary compiler, which reports the overrun and nothing else.
+///
+/// Not comparable to that compiler's own figure: this counts buffers that
+/// never coexist, and the compiler multi-buffers on top of what it is given.
+/// It is comparable *between candidates of one kernel*, which is what a search
+/// needs.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBBytes =
+    "ascend.cv_pipeline_cost_ub_bytes";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
