@@ -44,6 +44,21 @@ public:
 // Create the pass
 std::unique_ptr<OperationPass<ModuleOp>> createSplitDataflowPass();
 
+class SplitDataflowReducedPass
+    : public PassWrapper<SplitDataflowReducedPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitDataflowReducedPass)
+
+  // Constructor
+  SplitDataflowReducedPass() = default;
+
+  // Run the pass
+  void runOnOperation() override;
+};
+
+// Create the pass
+std::unique_ptr<OperationPass<ModuleOp>> createSplitDataflowReducedPass();
+
 } // namespace triton
 } // namespace mlir
 

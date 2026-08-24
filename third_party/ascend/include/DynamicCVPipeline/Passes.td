@@ -78,12 +78,12 @@ def MainLoopUnroll : Pass<"main-loop-unroll", "mlir::ModuleOp"> {
     ];
     // The probe pipeline runs inter-core-transfer-and-sync, so every dialect it
     // may create ops from has to be loaded before this pass starts.
-    let dependentDialects = ["mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
-        "mlir::func::FuncDialect", "mlir::linalg::LinalgDialect",
-        "mlir::tensor::TensorDialect", "mlir::memref::MemRefDialect",
-        "mlir::bufferization::BufferizationDialect", "mlir::hivm::HIVMDialect",
-        "mlir::scope::ScopeDialect", "mlir::annotation::AnnotationDialect",
-        "mlir::LLVM::LLVMDialect"];
+    let dependentDialects = ["hivm::HIVMDialect", "arith::ArithDialect", "scf::SCFDialect",
+        "func::FuncDialect", "linalg::LinalgDialect",
+        "tensor::TensorDialect", "memref::MemRefDialect",
+        "bufferization::BufferizationDialect", "hivm::HIVMDialect",
+        "scope::ScopeDialect", "annotation::AnnotationDialect",
+        "LLVM::LLVMDialect"];
 }
 
 def MarkMainLoopPass : Pass<"mark-main-loop", "mlir::ModuleOp"> {

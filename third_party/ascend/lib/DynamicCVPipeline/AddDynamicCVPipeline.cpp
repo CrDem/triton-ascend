@@ -24,6 +24,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
@@ -89,10 +90,6 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   ModuleOp moduleBackup(moduleOp->clone());
   PassManager pm(&getContext(), moduleOp.getOperationName());
 
-  pm.addPass(createPreCheckAvailablePass());
-  pm.addPass(createStandardizeOpPass());
-  pm.addPass(createPlanComputeBlockPass());
-  pm.addPass(createComputeBlockOptPass());
   // Unroll the main loop once the compute blocks are planned but before the
   // dataflow is split, so that the inter core transfers, their sync flags and
   // the multi buffers below are planned for each unrolled copy separately.
@@ -102,8 +99,13 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     MainLoopUnrollOptions unrollOptions;
     unrollOptions.unrollFactor = this->mainLoopUnrollFactor;
     pm.addPass(createMainLoopUnrollPass(unrollOptions));
+    pm.addPass(createCanonicalizerPass());
   }
 
+  pm.addPass(createPreCheckAvailablePass());
+  pm.addPass(createStandardizeOpPass());
+  pm.addPass(createPlanComputeBlockPass());
+  pm.addPass(createComputeBlockOptPass());
   pm.addPass(createSplitDataflowPass());
   pm.addPass(createAnalyzeDataFlowPass());
   pm.addPass(createAllocMultiCachePass());

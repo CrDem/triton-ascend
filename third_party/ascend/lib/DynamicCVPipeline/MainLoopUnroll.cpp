@@ -33,11 +33,14 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
 #include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/InterCoreTransferAndSync.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/MarkMainLoop.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
+#include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
+
+#include <iostream>
 
 static constexpr const char *DEBUG_TYPE = "main-loop-unroll";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -67,39 +70,46 @@ private:
   // `mark-main-loop` marked there.
   FailureOr<llvm::DenseSet<int>> probeMainLoops(ModuleOp module);
 
-  // Shift the compute block ids of `root` and everything nested in it, so that
-  // an unrolled copy gets compute blocks of its own.
-  void shiftBlockIds(Operation *root, int copyIdx, int stride);
 };
 
 FailureOr<llvm::DenseSet<int>> MainLoopUnrollPass::probeMainLoops(
     ModuleOp module) {
-  ModuleOp probe(module->clone());
-  auto destroyProbe = llvm::make_scope_exit([&]() { probe->destroy(); });
+  // Create new MLIRContext
+  MLIRContext *oldCtx = &getContext();
+  MLIRContext newCtx;
+  newCtx.allowUnregisteredDialects(oldCtx->allowsUnregisteredDialects());
+  newCtx.appendDialectRegistry(oldCtx->getDialectRegistry());
+  newCtx.loadAllAvailableDialects();
+  newCtx.disableMultithreading();
 
+  // Create module clone
+  OpBuilder builder(&newCtx);
+  OwningOpRef<ModuleOp> probe = builder.create<ModuleOp>(module->getLoc());
+  probe->getOperation()->setAttrs(module->getAttrDictionary());
+  IRMapping mapper;
+  for (auto &op : module->getRegion(0).front().getOperations()) {
+      probe->getBody()->push_back(op.clone(mapper));
+  }
+  
   // These are the very passes SplitDataflow runs: the main loop is the loop
   // that ends up carrying the inter core transfers, so it can only be found
   // once those transfers have been inserted.
-  PassManager pm(module.getContext(), module.getOperationName());
-  pm.addPass(createAddBlockIdForControlOpsPass());
-  pm.addPass(createDataDependencyAnalysisPass());
-  pm.addPass(createInterCoreTransferAndSyncPass());
-  pm.addPass(createMarkMainLoopPass());
+  PassManager pm(&newCtx);
+  pm.addPass(createPreCheckAvailablePass());
+  pm.addPass(createStandardizeOpPass());
+  pm.addPass(createPlanComputeBlockPass());
+  pm.addPass(createComputeBlockOptPass());
+  pm.addPass(createSplitDataflowReducedPass());
 
   // Diagnostics of the probe run point at a module that is about to be thrown
   // away, so they would only confuse; a failure is reported by the caller.
-  bool probeFailed = false;
-  {
-    ScopedDiagnosticHandler handler(module.getContext(),
-                                    [](Diagnostic &) { return success(); });
-    probeFailed = failed(pm.run(probe)) || CVPipeline::hasFallbackAttr(probe);
-  }
-  if (probeFailed) {
+  if (failed(pm.run(*probe))) {
+    std::cout << "[VDV DEBUG] MainLoopUnroll pass - preliminary passes failed" << std::endl;
+    LDBG("MainLoopUnrollPass failed!\n");
     return failure();
   }
-
   llvm::DenseSet<int> mainLoopTags;
-  probe.walk([&](scf::ForOp forOp) {
+  probe->walk([&](scf::ForOp forOp) {
     if (!forOp->hasAttr(CVPipeline::kMainLoop)) {
       return;
     }
@@ -108,20 +118,6 @@ FailureOr<llvm::DenseSet<int>> MainLoopUnrollPass::probeMainLoops(
     }
   });
   return mainLoopTags;
-}
-
-void MainLoopUnrollPass::shiftBlockIds(Operation *root, int copyIdx,
-                                       int stride) {
-  if (copyIdx == 0) {
-    return;
-  }
-  Builder builder(root->getContext());
-  root->walk([&](Operation *op) {
-    if (auto blockId = CVPipeline::getOpBlockId(op)) {
-      op->setAttr(CVPipeline::kBlockId,
-                  builder.getI32IntegerAttr(*blockId + copyIdx * stride));
-    }
-  });
 }
 
 void MainLoopUnrollPass::runOnOperation() {
@@ -171,19 +167,10 @@ void MainLoopUnrollPass::runOnOperation() {
     }
   });
 
-  // Each unrolled copy has to form compute blocks of its own: passes such as
-  // inter-core-transfer-and-sync look a block up by id and would otherwise see
-  // a single block spanning all the copies. Ids of the copies stay above the
-  // ids already in use, so they keep growing along the program order.
-  const int blockIdStride = CVPipeline::getAvailableBlockId(module);
-
   for (scf::ForOp forOp : mainLoops) {
     LDBG("Unrolling main loop by " << factor);
     auto unrolled = mlir::loopUnrollByFactor(
-        forOp, static_cast<uint64_t>(factor),
-        [&](unsigned copyIdx, Operation *clonedOp, OpBuilder) {
-          shiftBlockIds(clonedOp, static_cast<int>(copyIdx), blockIdStride);
-        });
+        forOp, static_cast<uint64_t>(factor));
 
     if (failed(unrolled)) {
       // Unrolling is an optimization: keep the original loop and go on.
@@ -191,13 +178,6 @@ void MainLoopUnrollPass::runOnOperation() {
                            << "Failed to unroll the main loop by " << factor
                            << ", keeping it as is.";
       continue;
-    }
-
-    // The epilogue loop is a plain clone of the original loop, so its blocks
-    // need to be renumbered as well.
-    if (unrolled->epilogueLoopOp) {
-      shiftBlockIds((*unrolled->epilogueLoopOp).getOperation(), factor,
-                    blockIdStride);
     }
   }
 }

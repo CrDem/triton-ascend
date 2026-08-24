@@ -44,6 +44,8 @@
 #define GEN_PASS_DECL_MAINLOOPUNROLL
 #include "ascend/include/DynamicCVPipeline/Passes.h.inc"
 
+using namespace mlir;
+
 #define GEN_PASS_DEF_MAINLOOPUNROLL
 #include "ascend/include/DynamicCVPipeline/Passes.h.inc"
 
