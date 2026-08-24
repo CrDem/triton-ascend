@@ -125,6 +125,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
@@ -2570,17 +2571,32 @@ FlagCensus takeFlagCensus(ModuleOp module) {
 /// by the binary compiler -- which is exactly what happened to a candidate that
 /// needed 345 600 bytes against the 253 952 the part has.
 ///
-/// The sum of every allocation, not a high-water mark: liveness is not tracked
-/// here, so two buffers that never coexist are still both counted. That makes
-/// this an over-estimate, which is why it is reported and not used to reject
-/// anything -- throwing away a variant that would have fitted is worse than
-/// letting one through. It is also a lower bound in the other direction, since
-/// the downstream compiler adds its own multi-buffering on top. Both errors go
-/// the same way for every variant, so the comparison between variants is still
-/// worth reading.
+/// Two numbers, because the useful one needs the schedule and the other does
+/// not. The plain sum counts buffers that never coexist and so is wrong by more
+/// than a factor of two on this kernel -- 526 336 bytes summed against a part
+/// that has 253 952 and compiles the module anyway. The peak is what the
+/// hardware has to hold at once, and it is a computation rather than a guess:
+/// every allocation's size is exact, and the interval over which it is live is
+/// read off the same block schedule the recurrence bound uses.
+///
+/// Neither figure equals what the binary compiler will demand. That compiler
+/// multi-buffers again on top of what it is handed, aligns to banks, and adds
+/// temporaries after this pass has run. What survives all of that is the
+/// *difference* between two variants of one kernel, which is why a consumer
+/// compares a candidate against the untouched pipeline rather than against a
+/// capacity.
+struct UBAllocation {
+  int64_t bytes = 0;
+  /// Compute blocks that touch the buffer, in no particular order: only the
+  /// first and last of them in schedule order are used.
+  llvm::SmallVector<int64_t, 4> blocks;
+};
+
 struct UBFootprint {
   int64_t bytes = 0;
+  int64_t peakBytes = 0;
   int64_t allocations = 0;
+  llvm::SmallVector<UBAllocation, 8> perAllocation;
 };
 
 UBFootprint measureUBFootprint(ModuleOp module) {
@@ -2589,12 +2605,101 @@ UBFootprint measureUBFootprint(ModuleOp module) {
     if (getMemorySpaceName(alloc.getType()) != "ub") {
       return;
     }
-    if (auto bytes = getShapedByteSize(alloc.getType())) {
-      footprint.bytes += *bytes;
-      ++footprint.allocations;
+    auto bytes = getShapedByteSize(alloc.getType());
+    if (!bytes) {
+      return;
     }
+
+    UBAllocation entry;
+    entry.bytes = *bytes;
+
+    // Everything that can reach the buffer, following the casts and views that
+    // hand it on without copying it: a block holding nothing but a
+    // reinterpret_cast still keeps the buffer alive for whoever reads the
+    // result. Following them over-states the live range where a view outlives
+    // its use, which widens intervals rather than narrowing them -- the safe
+    // direction, since a peak that is too wide rejects a variant that would
+    // have fitted only if the same widening did not also apply to the baseline
+    // it is compared against, and it does.
+    llvm::SmallVector<Value, 8> worklist{alloc.getResult()};
+    llvm::SmallPtrSet<Operation *, 16> seen;
+    llvm::SmallDenseSet<int64_t, 4> blocks;
+    auto note = [&](Operation *op) {
+      if (auto id = CVPipeline::getOpBlockId(op)) {
+        blocks.insert(static_cast<int64_t>(*id));
+      }
+    };
+    note(alloc);
+    while (!worklist.empty()) {
+      Value value = worklist.pop_back_val();
+      for (Operation *user : value.getUsers()) {
+        if (!seen.insert(user).second) {
+          continue;
+        }
+        note(user);
+        for (Value result : user->getResults()) {
+          if (isa<ShapedType>(result.getType())) {
+            worklist.push_back(result);
+          }
+        }
+      }
+    }
+
+    entry.blocks.assign(blocks.begin(), blocks.end());
+    footprint.bytes += entry.bytes;
+    ++footprint.allocations;
+    footprint.perAllocation.push_back(std::move(entry));
   });
   return footprint;
+}
+
+/// Most Unified Buffer live at any one point of the block schedule.
+///
+/// A buffer is taken to be live from the first block that touches it to the
+/// last, which is the same span the recurrence bound measures for a transfer,
+/// and for the same reason: nothing may reuse the storage in between. Swept
+/// with a difference array over the schedule, so the cost is linear in blocks.
+void computeUBPeak(UBFootprint &footprint, ArrayRef<int64_t> order) {
+  if (order.empty() || footprint.perAllocation.empty()) {
+    // No schedule to be live against; the sum is the only honest answer.
+    footprint.peakBytes = footprint.bytes;
+    return;
+  }
+
+  llvm::DenseMap<int64_t, size_t> position;
+  for (size_t i = 0; i < order.size(); ++i) {
+    position[order[i]] = i;
+  }
+
+  llvm::SmallVector<int64_t> delta(order.size() + 1, 0);
+  for (const UBAllocation &entry : footprint.perAllocation) {
+    size_t lo = order.size();
+    size_t hi = 0;
+    bool placed = false;
+    for (int64_t id : entry.blocks) {
+      auto it = position.find(id);
+      if (it == position.end()) {
+        continue;
+      }
+      lo = std::min(lo, it->second);
+      hi = std::max(hi, it->second);
+      placed = true;
+    }
+    if (!placed) {
+      // Touched only by operations the pipeline left unassigned. Nothing says
+      // when it dies, so it is charged for the whole schedule.
+      lo = 0;
+      hi = order.size() - 1;
+    }
+    delta[lo] += entry.bytes;
+    delta[hi + 1] -= entry.bytes;
+  }
+
+  int64_t live = 0;
+  for (size_t i = 0; i < order.size(); ++i) {
+    live += delta[i];
+    footprint.peakBytes = std::max(footprint.peakBytes, live);
+  }
 }
 
 /// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
@@ -2765,6 +2870,8 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
   estimate.flags = flags;
   estimate.ub = ub;
   estimate.order = topologicalBlockOrder(breakdown);
+  // Needs the order, so it cannot be done where the allocations were collected.
+  computeUBPeak(estimate.ub, estimate.order);
 
   BarrierTally weightedBarriers;
   estimate.serialisedBound = scheduleBlockGraph(
@@ -3114,17 +3221,20 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   if (estimate.ub.allocations > 0) {
     const MemorySpace *ub = config.getMemorySpace("ub");
     os << "[" << DEBUG_TYPE << "]     unified buffer: "
-       << estimate.ub.allocations << " allocation(s) totalling "
-       << estimate.ub.bytes << " bytes";
+       << estimate.ub.allocations << " allocation(s), " << estimate.ub.peakBytes
+       << " bytes live at the peak of the schedule, " << estimate.ub.bytes
+       << " summed";
     if (ub && ub->sizeBytes > 0) {
-      os << " against a capacity of " << ub->sizeBytes;
+      os << ", against a capacity of " << ub->sizeBytes;
     }
-    os << ". Summed, not a high-water mark -- buffers that never coexist are"
-          " still both counted -- and the binary compiler multi-buffers on top"
-          " of this, so it is neither an upper nor a lower bound. It is here"
-          " because a finer block partition pays for its overlap in UB, and a"
-          " variant that overruns is rejected outright by that compiler, not"
-          " by anything the estimate can see\n";
+    os << ". The peak is the one to read: sizes are exact and live ranges come"
+          " from the block schedule, so the difference between two variants of"
+          " one kernel is the buffers a finer partition forced into existence."
+          " The absolute value is not what the binary compiler will ask for --"
+          " it multi-buffers again on top, aligns to banks, and adds"
+          " temporaries after this pass -- which is why a search compares"
+          " candidates against the untouched pipeline and not against the"
+          " capacity\n";
   }
   if (scalarOpsCube + scalarOpsVector > 0) {
     const int perInstruction = config.getScalarCyclesPerInstruction();
@@ -3516,6 +3626,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.recurrenceBound));
   module->setAttr(kCVPipelineCostUBBytes,
                   builder.getI64IntegerAttr(estimate.ub.bytes));
+  module->setAttr(kCVPipelineCostUBPeak,
+                  builder.getI64IntegerAttr(estimate.ub.peakBytes));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,

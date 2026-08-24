@@ -96,6 +96,19 @@ inline constexpr llvm::StringLiteral kCVPipelineCostRecurrence =
 inline constexpr llvm::StringLiteral kCVPipelineCostUBBytes =
     "ascend.cv_pipeline_cost_ub_bytes";
 
+/// The most Unified Buffer live at any one point of the block schedule (i64),
+/// as opposed to the sum above.
+///
+/// This is the figure worth comparing. Every allocation's size is exact and its
+/// live range is read off the schedule, so the *difference* between two
+/// variants of one kernel is a computation: it is precisely the buffers that a
+/// finer partition forced into existence. The absolute value still is not what
+/// the binary compiler will ask for -- it multi-buffers again on top, aligns to
+/// banks, and adds temporaries after this pass -- but those all apply equally
+/// to both variants and cancel in the comparison.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
+    "ascend.cv_pipeline_cost_ub_peak";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
