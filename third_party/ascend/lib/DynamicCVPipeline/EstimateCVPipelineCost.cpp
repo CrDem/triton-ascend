@@ -196,6 +196,7 @@ constexpr const char *kFusionVectorEnvVar =
 
 using mlir::ascend::HardwareConfig;
 using mlir::ascend::HWUnit;
+using mlir::ascend::MemorySpace;
 
 //===----------------------------------------------------------------------===//
 // Shape helpers
