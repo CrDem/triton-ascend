@@ -585,6 +585,41 @@ int getReorderVerbosity() {
   return verbosity;
 }
 
+constexpr llvm::StringLiteral kVariantMaxExtraBlocksEnvVar =
+    "TRITON_ASCEND_REORDER_MAX_EXTRA_BLOCKS";
+
+/// How many blocks beyond the input's own count a variant may create.
+///
+/// A finer partition is what the search is for -- it is the only way a variant
+/// differs from the input -- but the rest of the toolchain has limits the
+/// estimate cannot see, and past a point every candidate hits one. Two have
+/// been observed: a ten-way split of a four-block loop body was refused for
+/// 'read before first write', and a six-way split for running out of Unified
+/// Buffer. Both come from the same place, and neither is visible until a full
+/// compilation has been spent on the candidate.
+///
+/// Defaults to `before + 2`, which reproduces the historical `2 * before + 2`
+/// limit exactly. Exposed so the boundary can be bisected on hardware without
+/// a rebuild per attempt: the value that stops producing unbuildable winners
+/// is a measurement, not something to be guessed here.
+size_t getVariantMaxExtraBlocks(size_t before) {
+  static const std::optional<size_t> configured =
+      []() -> std::optional<size_t> {
+    const char *env = std::getenv(kVariantMaxExtraBlocksEnvVar.data());
+    if (!env) {
+      return std::nullopt;
+    }
+    unsigned long long value = 0;
+    if (llvm::StringRef(env).getAsInteger(10, value)) {
+      llvm::errs() << "[reorder-blocks] " << kVariantMaxExtraBlocksEnvVar
+                   << "='" << env << "' is not a number; ignoring\n";
+      return std::nullopt;
+    }
+    return static_cast<size_t>(value);
+  }();
+  return configured ? *configured : before + 2;
+}
+
 llvm::StringRef describeGroupCore(unsigned core) {
   switch (core) {
   case CoreType::CUBE_ONLY:
@@ -1210,7 +1245,7 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
     // Cheaper to notice here and leave this block alone.
     const size_t before = countDistinctBlockIds(allOps, opBlockId);
     const size_t after = countRunsByCore(order);
-    const size_t limit = 2 * before + 2;
+    const size_t limit = before + getVariantMaxExtraBlocks(before);
     if (order.size() != allOps.size()) {
       // A cycle in the dependency graph; the block-level path reports this
       // properly, so fall through to it rather than emitting a partial order.

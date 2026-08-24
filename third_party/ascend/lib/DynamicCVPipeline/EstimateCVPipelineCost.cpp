@@ -981,10 +981,36 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     return cost;
   }
 
-  // Remaining shaped compute. Cube-side non-matmul work (e.g. a fill or
-  // transpose staged for the Cube pipe) is charged to the Cube unit; everything
-  // else is Vector work. Only the latter is spread over the block's vector
-  // cores: the Cube side of a block is one core, so it sees the whole tile.
+  // Cube-side fills and transposes cost nothing of their own, and that is a
+  // measurement rather than an omission.
+  //
+  // The profiler's aic_cube_time is the matmul term and nothing else. At
+  // 128x128 it reads 92 981.68 us, which at 1.65 GHz is 153 420 272 cycles
+  // against the 153 419 776 this model charges for linalg.matmul alone --
+  // 496 cycles apart out of 153 million. At 64x64 the same holds. And there is
+  // no other engine with room for them: MTE1, MTE2 and the two drain engines
+  // are each measured and each already accounted for within a few percent,
+  // while these two would add 59.8M cycles.
+  //
+  // What the hardware does with them follows from that. Zeroing the
+  // accumulator is the matmul's own initialisation -- the first MAC along K
+  // writes instead of accumulating -- and transposing an operand is folded
+  // into the layout conversion that staging it into L0B already performs,
+  // whose cost is inside the MTE1 figure this model now matches to 1.4%.
+  //
+  // Charged as modelled-at-zero rather than dropped, so the report still shows
+  // they were seen: "no cycles" and "not noticed" have to stay distinguishable.
+  if (isCube && isa<linalg::FillOp, linalg::TransposeOp>(op)) {
+    OpCost cost;
+    cost.unit = HWUnit::Cube;
+    cost.confidence = CostConfidence::Modelled;
+    return cost;
+  }
+
+  // Remaining shaped compute. Cube-side non-matmul work is charged to the Cube
+  // unit; everything else is Vector work. Only the latter is spread over the
+  // block's vector cores: the Cube side of a block is one core, so it sees the
+  // whole tile.
   OpCost cost = estimateVectorCompute(
       op, config, isCube ? 1 : config.getVectorCoresPerBlock());
   if (isCube) {
@@ -1881,9 +1907,12 @@ struct CostBreakdown {
   int64_t branchedOps = 0;
   /// Scalar instructions issued over the whole run, loop weights applied and
   /// synchronisation excluded (its stall is the schedule's business, not the
-  /// scalar unit's). Reported so the per-instruction cost can be divided out
-  /// of a profiled aic_scalar_time / aiv_scalar_time rather than guessed.
-  int64_t weightedScalarOps = 0;
+  /// scalar unit's). Split by core, because that is how the profiler reports
+  /// the time they cost: dividing aic_scalar_time by a count that also
+  /// contains the Vector core's instructions gives a number that means
+  /// nothing.
+  int64_t weightedScalarOpsCube = 0;
+  int64_t weightedScalarOpsVector = 0;
   int64_t totalWeightedCycles = 0;
 
   void recordBlock(Operation *op, const OpCost &cost, const LoopWeight &weight,
@@ -1990,7 +2019,8 @@ struct CostBreakdown {
     totalWeightedCycles += weight.weighted(cost.cycles);
     if ((cost.unit == HWUnit::Scalar || cost.unit == HWUnit::ScalarCube) &&
         !isSyncOp(op)) {
-      weightedScalarOps += weight.weighted(1);
+      (isCube ? weightedScalarOpsCube : weightedScalarOpsVector) +=
+          weight.weighted(1);
     }
     if (weight.branchDivisor > 1) {
       ++branchedOps;
@@ -3001,7 +3031,8 @@ void printPipeComparison(llvm::raw_ostream &os,
 /// result so that a surprising total can be attributed to a term.
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                    const FusionFactors &fusion, const HardwareConfig &config,
-                   int64_t branchedOps, int64_t scalarOps) {
+                   int64_t branchedOps, int64_t scalarOpsCube,
+                   int64_t scalarOpsVector) {
   auto line = [&](llvm::StringRef what, int64_t cycles) {
     os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
        << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
@@ -3095,20 +3126,23 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
           " variant that overruns is rejected outright by that compiler, not"
           " by anything the estimate can see\n";
   }
-  if (scalarOps > 0) {
+  if (scalarOpsCube + scalarOpsVector > 0) {
     const int perInstruction = config.getScalarCyclesPerInstruction();
-    os << "[" << DEBUG_TYPE << "]     scalar issue: " << scalarOps
-       << " instruction(s) over the run at " << perInstruction
+    os << "[" << DEBUG_TYPE << "]     scalar issue: " << scalarOpsCube
+       << " instruction(s) on the Cube core and " << scalarOpsVector
+       << " on the Vector core over the run, at " << perInstruction
        << " cycle(s) each";
     if (perInstruction == 0) {
-      // The count is the useful half. One profiled run turns it into the
-      // constant: aic_scalar_time and aiv_scalar_time are what these
-      // instructions cost, so the measured microseconds times the clock and
-      // divided by this count is the figure to set. Guessing it here instead
-      // would put an unmeasured number into every estimate.
-      os << ", so nothing is charged for them. Divide the profiler's"
-            " aic_scalar_time and aiv_scalar_time by this count to get the"
-            " figure for scalar_issue.cycles_per_instruction";
+      // The counts are the useful half. One profiled run turns them into the
+      // constant: aic_scalar_time belongs to the first count and
+      // aiv_scalar_time to the second, so the measured microseconds times the
+      // clock and divided by the matching count is the figure to set. Guessing
+      // it here instead would put an unmeasured number into every estimate.
+      os << ", so nothing is charged for them. aic_scalar_time divided by the"
+            " first count and aiv_scalar_time by the second give the figure"
+            " for scalar_issue.cycles_per_instruction -- if the two disagree,"
+            " the cost is not per instruction and a per-block term is what is"
+            " missing";
     }
     os << "\n";
   }
@@ -3572,7 +3606,8 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
 
   auto reportDetail = [&](llvm::raw_ostream &os) {
     printEstimate(os, estimate, fusion, *config, breakdown.branchedOps,
-                  breakdown.weightedScalarOps);
+                  breakdown.weightedScalarOpsCube,
+                  breakdown.weightedScalarOpsVector);
     printLoops(os, loopReports);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);

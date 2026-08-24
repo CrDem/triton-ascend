@@ -420,14 +420,25 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       // seed and not a re-run. Worth having because a winner can still be
       // refused by the binary compiler for something no pass here models --
       // Unified Buffer capacity being the case that has actually bitten.
+      // One seed per distinct score. Many seeds reach the same pair -- 118 of
+      // 200 tied on one run -- and listing five of those is five names for one
+      // candidate, which is useless precisely when the list is needed: the
+      // winner having been refused downstream, what is wanted is a *different*
+      // candidate to try, not another spelling of the same one.
       llvm::sort(ranked);
-      const size_t shown = std::min<size_t>(ranked.size(), 5);
-      llvm::errs() << "[" << DEBUG_TYPE << "]   best " << shown
-                   << " seed(s), in case the winner is refused downstream:";
-      for (size_t i = 0; i < shown; ++i) {
+      llvm::errs() << "[" << DEBUG_TYPE
+                   << "]   best distinct score(s), in case the winner is"
+                      " refused downstream:";
+      int64_t shown = 0;
+      for (size_t i = 0; i < ranked.size() && shown < 5; ++i) {
+        if (i > 0 && std::get<0>(ranked[i]) == std::get<0>(ranked[i - 1]) &&
+            std::get<1>(ranked[i]) == std::get<1>(ranked[i - 1])) {
+          continue;
+        }
         llvm::errs() << " " << std::get<2>(ranked[i]) << "("
                      << std::get<0>(ranked[i]) << "/" << std::get<1>(ranked[i])
                      << ")";
+        ++shown;
       }
       llvm::errs() << "  [seed(total/second bound)]\n";
     } else {
