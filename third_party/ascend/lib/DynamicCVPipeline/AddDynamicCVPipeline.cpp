@@ -132,6 +132,38 @@ constexpr const char *kUBSlackEnvVar = "TRITON_ASCEND_CV_UB_SLACK_BYTES";
 /// So the value is readable rather than fitted: 0 admits only candidates that
 /// hold no more than the baseline, 65536 lets one more score tile through. It
 /// is unset by default, which filters nothing.
+constexpr const char *kStageSlackEnvVar = "TRITON_ASCEND_CV_STAGE_SLACK";
+
+/// How many more iterations of software-pipeline prologue a candidate may
+/// carry than the untouched pipeline does.
+///
+/// The third and last thing a finer block partition spends. More blocks means
+/// more pipeline stages, and UpdateLoopIterTimes stretches the loop bound to
+/// make room for them: the untouched pipeline stretches by 2 iterations, and
+/// every candidate the binary compiler has refused for 'read before first
+/// write' stretched by more than 130. That error *is* the prologue -- an
+/// iteration in which a stage reads a buffer whose filling stage has not run.
+///
+/// Relative to the baseline for the same reason the Unified Buffer allowance
+/// is: what the toolchain will bear is not a number this model can derive, but
+/// the increment over a partition known to compile is one it can.
+std::optional<int64_t> getStageSlack() {
+  static const std::optional<int64_t> slack = []() -> std::optional<int64_t> {
+    const char *env = std::getenv(kStageSlackEnvVar);
+    if (!env) {
+      return std::nullopt;
+    }
+    int64_t value = 0;
+    if (llvm::StringRef(env).getAsInteger(10, value) || value < 0) {
+      llvm::errs() << "[" << DEBUG_TYPE << "] " << kStageSlackEnvVar << "='"
+                   << env << "' is not a count; ignoring\n";
+      return std::nullopt;
+    }
+    return value;
+  }();
+  return slack;
+}
+
 std::optional<int64_t> getUBSlackBytes() {
   static const std::optional<int64_t> slack = []() -> std::optional<int64_t> {
     const char *env = std::getenv(kUBSlackEnvVar);
@@ -327,9 +359,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // instead of sending the search back to the start.
     SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t>> ranked;
     const std::optional<int64_t> ubSlack = getUBSlackBytes();
+    const std::optional<int64_t> stageSlack = getStageSlack();
     // Set by seed 0, the untouched pipeline, which the loop below reaches
-    // first. Everything after it is judged against this.
+    // first. Everything after it is judged against these.
     std::optional<int64_t> baselineUBPeak;
+    std::optional<int64_t> baselineExtension;
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
@@ -352,6 +386,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       int64_t cost = 0;
       int64_t second = 0;
       int64_t ubBytes = 0;
+      int64_t extension = 0;
       int errCode = 0;
 
       {
@@ -400,9 +435,21 @@ void AddDynamicCVPipelinePass::runOnOperation() {
           // this threw away -- and if that is most of it, the answer for this
           // kernel is that the partition axis has no room, which is worth
           // seeing rather than inferring from a winner that will not build.
+          if (auto extAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                  mlir::triton::kCVPipelineCostLoopExtension)) {
+            extension = extAttr.getInt();
+          }
           if (ubSlack && baselineUBPeak && ubBytes > *baselineUBPeak + *ubSlack) {
             accepted = false;
             errCode = -3;
+          }
+          // -4: the software pipeline was cut into far more stages than the
+          // baseline's, which the binary compiler refuses as a prologue that
+          // reads a buffer before its first write.
+          if (accepted && stageSlack && baselineExtension &&
+              extension > *baselineExtension + *stageSlack) {
+            accepted = false;
+            errCode = -4;
           }
         } else if (!ran) {
           auto codeAttr =
@@ -423,6 +470,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       ++usable;
       if (seed == 0) {
         baselineUBPeak = ubBytes;
+        baselineExtension = extension;
       }
       distinctCosts.insert({cost, second});
       ranked.push_back({cost, second, ubBytes, seed});
@@ -520,6 +568,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         llvm::errs() << "more Unified Buffer live than the baseline's "
                      << baselineUBPeak.value_or(0) << " bytes plus the "
                      << kUBSlackEnvVar << " allowance\n";
+      } else if (entry.first == -4) {
+        llvm::errs() << "a deeper software pipeline than the baseline's "
+                     << baselineExtension.value_or(0)
+                     << " extra iteration(s) plus the " << kStageSlackEnvVar
+                     << " allowance\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }

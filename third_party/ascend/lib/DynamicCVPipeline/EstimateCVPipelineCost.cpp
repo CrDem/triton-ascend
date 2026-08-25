@@ -3628,6 +3628,19 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.ub.bytes));
   module->setAttr(kCVPipelineCostUBPeak,
                   builder.getI64IntegerAttr(estimate.ub.peakBytes));
+  // Deepest software-pipeline stretch, over every loop. Read by the variant
+  // search: this is the third resource a finer partition spends, alongside
+  // barriers and Unified Buffer, and the one that shows up as the binary
+  // compiler refusing to read a buffer before its first write.
+  int64_t loopExtension = 0;
+  for (const LoopReport &loop : loopReports) {
+    if (loop.rewrittenTripCount > loop.tripCount) {
+      loopExtension =
+          std::max(loopExtension, loop.rewrittenTripCount - loop.tripCount);
+    }
+  }
+  module->setAttr(kCVPipelineCostLoopExtension,
+                  builder.getI64IntegerAttr(loopExtension));
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,

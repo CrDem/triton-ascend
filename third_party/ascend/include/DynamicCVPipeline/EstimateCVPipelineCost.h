@@ -109,6 +109,20 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUBBytes =
 inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
     "ascend.cv_pipeline_cost_ub_peak";
 
+/// How far software pipelining stretched the deepest loop past the iterations
+/// that actually do work (i64): the rewritten bound minus the trip count, taken
+/// over every loop and maximised.
+///
+/// A proxy for how many stages the pipeline was cut into, and the third thing
+/// a finer block partition buys its overlap with. The other two -- barriers and
+/// Unified Buffer -- have their own limits; this one shows up as the binary
+/// compiler refusing a module for reading a buffer before its first write,
+/// which is a prologue in which the stage that fills that buffer has not run
+/// yet. Measured: the untouched pipeline stretches by 2 iterations, and every
+/// candidate refused for that reason stretched by more than 130.
+inline constexpr llvm::StringLiteral kCVPipelineCostLoopExtension =
+    "ascend.cv_pipeline_cost_loop_extension";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
