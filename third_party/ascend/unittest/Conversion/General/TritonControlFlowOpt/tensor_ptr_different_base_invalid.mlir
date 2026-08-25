@@ -1,6 +1,6 @@
 // RUN: triton-opt --triton-control-flow-opt %s -verify-each | FileCheck %s --check-prefix=CFO
-// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure %s -verify-each | FileCheck %s --check-prefix=T2U --implicit-check-not='tensor.extract {{.*}} : tensor<4x!tt.ptr<f32>>' --implicit-check-not=PointerDescriptorOffsetForm
-// RUN: triton-opt --triton-control-flow-opt '--triton-to-unstructure=compile-on-910-95=True compile-mode=simd_simt_template' %s -verify-each | FileCheck %s --check-prefix=T2U --implicit-check-not='tensor.extract {{.*}} : tensor<4x!tt.ptr<f32>>' --implicit-check-not=PointerDescriptorOffsetForm
+// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure %s -verify-each | FileCheck %s --check-prefix=T2U --implicit-check-not='tensor.extract {{.*}} : tensor<4x!tt.ptr<f32>>'
+// RUN: triton-opt --triton-control-flow-opt '--triton-to-unstructure=compile-on-910-95=True compile-mode=simd_simt_template' %s -verify-each | FileCheck %s --check-prefix=T2U --implicit-check-not='tensor.extract {{.*}} : tensor<4x!tt.ptr<f32>>'
 // RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure --triton-to-linalg %s -verify-each | FileCheck %s --check-prefix=LINALG --implicit-check-not='!tt.ptr' --implicit-check-not=unrealized_conversion_cast --implicit-check-not=PointerDescriptorBoundary --implicit-check-not=PointerDescriptorRebuild --implicit-check-not=PointerDescriptorOffsetForm
 
 module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
@@ -46,11 +46,18 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 // CFO:       tt.store
 
 // T2U-LABEL: tt.func public @if_tensor_ptr_different_base
-// T2U:       tensor.extract {{.*}} : tensor<4xi64>
-// T2U:       %[[ACCESS_PTR:.*]] = tt.addptr %{{.*}}, %{{.*}} : !tt.ptr<f32>, i64
-// T2U:       tt.load %[[ACCESS_PTR]]
+// T2U-DAG:   %[[BASE0:.*]] = tt.ptr_to_int %{{.*}} : !tt.ptr<f32> -> i64
+// T2U-DAG:   %[[BASE1:.*]] = tt.ptr_to_int %{{.*}} : !tt.ptr<f32> -> i64
+// T2U:       %[[SELECTED_BASE:.*]] = arith.select %{{.*}}, %[[BASE0]], %[[BASE1]] : i64
+// T2U:       %[[SELECTED_OFFSET:.*]] = arith.select %{{.*}}, %{{.*}}, %{{.*}} : i32
+// T2U:       %[[BASE_PTR:.*]] = tt.int_to_ptr %[[SELECTED_BASE]] : i64 -> !tt.ptr<f32>
+// T2U:       tt.addptr
+// T2U:       tt.load
 
 // LINALG-LABEL: func.func @if_tensor_ptr_different_base
 // LINALG:       arith.select
-// LINALG:       memref.load
+// LINALG:       hivm.hir.pointer_cast
+// LINALG:       memref.reinterpret_cast
+// LINALG:       memref.copy
+// LINALG:       bufferization.to_tensor
 // LINALG:       return

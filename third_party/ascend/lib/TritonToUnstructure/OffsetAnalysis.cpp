@@ -419,10 +419,13 @@ void parseLoopRegionIterArg(LoopLikeOpInterface loopOp, const Location &loc,
                             BlockArgument regionIterArg) {
   // This argument is a dynamic relative offset created by T2U.  Do not copy
   // the loop init provenance here: doing so makes every backedge restart from
-  // the initial offset and drops the accumulated delta.  A scalar-like empty
-  // record lets parseAddPtr combine the live argument with the next delta.
+  // the initial offset and drops the accumulated delta.  Record the argument
+  // itself as the offset identity so every later addptr keeps the live carrier
+  // (`offset(region_arg) = region_arg`) when adding its backedge delta.
   if (isScalarPointerOffsetBoundaryRegionArgument(loopOp, regionIterArg)) {
+    offsetMap.erase(regionIterArg);
     offsetMap[regionIterArg] = PtrOffsetInfo();
+    offsetMap[regionIterArg].setOffset(regionIterArg);
     offsetMap[regionIterArg].setScalarLike(true);
     return;
   }
@@ -729,6 +732,20 @@ void parseAddPtr(triton::AddPtrOp op, const Location &loc,
   dstOffsetInfo.setPtr(ptrOffsetInfo.getPtr());
   dstOffsetInfo.setOffset(offset);
   dstOffsetInfo.setPointerDescriptorOwned(isDescriptorOwned);
+  // CFO's strided_1d descriptor is an explicit proof that a scalar pointer
+  // base plus this rank-1 lane offset remains a contiguous SIMD access. The
+  // generic offset join above cannot retain that proof when the lane offset
+  // was built through several arithmetic operations, so restore the marker's
+  // classification after the join. Complete opaque carriers intentionally do
+  // not enter this branch and keep their conservative unstructured state.
+  if (isStridedRankOne) {
+    dstOffsetInfo.setStructured(descriptorAxes);
+    // The descriptor describes a lane-varying, structured offset.  It is
+    // contiguous, but it is not a scalar-like pointer: scalarLike would
+    // route the load/store converter through splatAndLoadScenario(), which
+    // loads lane zero once and fills every lane with that value.
+    dstOffsetInfo.setScalarLike(false);
+  }
   offsetMap[dst] = dstOffsetInfo;
   LLVM_DEBUG({
     auto &os = llvm::dbgs();

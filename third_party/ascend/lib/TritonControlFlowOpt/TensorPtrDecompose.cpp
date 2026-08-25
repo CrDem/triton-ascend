@@ -248,19 +248,6 @@ static std::optional<int64_t> getScalarConstant(Value value) {
   return getConstantIntValue(value);
 }
 
-static ComponentIdentity getScaledIdentity(const ComponentIdentity &input,
-                                           Value scale, Value result,
-                                           unsigned componentIndex) {
-  if (isZeroIdentity(input))
-    return ComponentIdentity::zero(componentIndex);
-  std::optional<int64_t> constant = getScalarConstant(scale);
-  if (constant && *constant == 0)
-    return ComponentIdentity::zero(componentIndex);
-  if (constant && *constant == 1)
-    return input;
-  return ComponentIdentity::fromValue(result, componentIndex);
-}
-
 struct Rank1AnalyzedOffset {
   AnalyzedComponent stride;
   AnalyzedComponent offset;
@@ -286,6 +273,13 @@ struct DenseIntegerSplat {
   APInt value;
 };
 
+static FailureOr<Value> getSplatScalar(Value value) {
+  auto splat = value.getDefiningOp<triton::SplatOp>();
+  if (!splat || !isa<IntegerType>(splat.getSrc().getType()))
+    return failure();
+  return splat.getSrc();
+}
+
 /// Returns the exact scalar bit pattern represented by an integer dense splat.
 /// Lane-varying dense constants deliberately fail this check and remain opaque.
 static FailureOr<DenseIntegerSplat> getDenseIntegerSplat(Value value) {
@@ -305,6 +299,34 @@ static FailureOr<DenseIntegerSplat> getDenseIntegerSplat(Value value) {
   return DenseIntegerSplat{std::move(splatValue)};
 }
 
+/// Returns true when every tensor lane is produced by the same integer scalar.
+/// Both an explicit tt.splat and an integer dense splat carry this guarantee.
+/// Lane-varying tensor constants are intentionally excluded.
+static bool isUniformIntegerScale(Value value) {
+  return succeeded(getSplatScalar(value)) ||
+         succeeded(getDenseIntegerSplat(value));
+}
+
+static bool isUniformIntegerScaleConstant(Value scale, int64_t expected) {
+  if (FailureOr<Value> scalar = getSplatScalar(scale); succeeded(scalar))
+    return getScalarConstant(*scalar) == std::optional<int64_t>(expected);
+  FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(scale);
+  if (failed(dense))
+    return false;
+  return expected == 0 ? dense->value.isZero()
+                       : expected == 1 && dense->value.isOne();
+}
+
+static ComponentIdentity getScaledIdentity(const ComponentIdentity &input,
+                                           Value scale, Value result,
+                                           unsigned componentIndex) {
+  if (isZeroIdentity(input) || isUniformIntegerScaleConstant(scale, 0))
+    return ComponentIdentity::zero(componentIndex);
+  if (isUniformIntegerScaleConstant(scale, 1))
+    return input;
+  return ComponentIdentity::fromValue(result, componentIndex);
+}
+
 static Rank1AnalyzedOffset getFallbackAnalyzedOffset(Value value, Type) {
   auto tensorType = cast<RankedTensorType>(value.getType());
   Type scalarType = tensorType.getElementType();
@@ -312,13 +334,6 @@ static Rank1AnalyzedOffset getFallbackAnalyzedOffset(Value value, Type) {
       {scalarType, ComponentIdentity::zero(kStrideComponent)},
       {scalarType, ComponentIdentity::zero(kOffsetComponent)},
       {tensorType, ComponentIdentity::fromValue(value, kResidualComponent)}};
-}
-
-static FailureOr<Value> getSplatScalar(Value value) {
-  auto splat = value.getDefiningOp<triton::SplatOp>();
-  if (!splat || !isa<IntegerType>(splat.getSrc().getType()))
-    return failure();
-  return splat.getSrc();
 }
 
 static bool isSafeIntegerExtensionLeaf(Value value) {
@@ -442,24 +457,24 @@ static FailureOr<Rank1AnalyzedOffset> analyzeRank1Offset(Value value,
 
   if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
     Value affineOperand = mul.getLhs();
-    FailureOr<Value> scale = getSplatScalar(mul.getRhs());
-    if (failed(scale)) {
+    Value scale = mul.getRhs();
+    if (!isUniformIntegerScale(scale)) {
       affineOperand = mul.getRhs();
-      scale = getSplatScalar(mul.getLhs());
+      scale = mul.getLhs();
     }
-    if (failed(scale))
+    if (!isUniformIntegerScale(scale))
       return getFallbackAnalyzedOffset(value, pointerType);
     FailureOr<Rank1AnalyzedOffset> input =
         analyzeRank1Offset(affineOperand, pointerType);
     if (failed(input) || !isZeroIdentity(input->residual.identity))
       return getFallbackAnalyzedOffset(value, pointerType);
     return Rank1AnalyzedOffset{
-        {input->stride.type, getScaledIdentity(input->stride.identity, *scale,
+        {input->stride.type, getScaledIdentity(input->stride.identity, scale,
                                                value, kStrideComponent)},
-        {input->offset.type, getScaledIdentity(input->offset.identity, *scale,
+        {input->offset.type, getScaledIdentity(input->offset.identity, scale,
                                                value, kOffsetComponent)},
         {input->residual.type,
-         getScaledIdentity(input->residual.identity, *scale, value,
+         getScaledIdentity(input->residual.identity, scale, value,
                            kResidualComponent)}};
   }
 
@@ -497,6 +512,24 @@ static Value createScalarConstant(OpBuilder &builder, Location loc, Type type,
     return nullptr;
   return builder.create<arith::ConstantOp>(loc,
                                            IntegerAttr::get(intType, value));
+}
+
+/// Materializes the scalar represented by an integer-uniform tensor. Dense
+/// splats are recreated with their exact APInt width so affine stride analysis
+/// and concrete descriptor construction observe identical arithmetic.
+static FailureOr<Value>
+materializeUniformIntegerScale(Value value, OpBuilder &builder, Location loc) {
+  if (FailureOr<Value> scalar = getSplatScalar(value); succeeded(scalar))
+    return *scalar;
+  FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(value);
+  if (failed(dense))
+    return failure();
+  auto tensorType = cast<RankedTensorType>(value.getType());
+  Value scalar = createScalarConstant(builder, loc, tensorType.getElementType(),
+                                      dense->value);
+  if (!scalar)
+    return failure();
+  return scalar;
 }
 
 static Value createZeroOffsets(OpBuilder &builder, Location loc,
@@ -697,10 +730,11 @@ static FailureOr<Rank1OffsetValues> materializeRank1Offset(Value value,
 
   if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
     Value affineOperand = mul.getLhs();
-    FailureOr<Value> scale = getSplatScalar(mul.getRhs());
+    FailureOr<Value> scale =
+        materializeUniformIntegerScale(mul.getRhs(), builder, loc);
     if (failed(scale)) {
       affineOperand = mul.getRhs();
-      scale = getSplatScalar(mul.getLhs());
+      scale = materializeUniformIntegerScale(mul.getLhs(), builder, loc);
     }
     if (failed(scale))
       return fallback();
@@ -987,12 +1021,12 @@ static FailureOr<AnalyzedTensorOffset> analyzeTensorOffset(Value value) {
 
   if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
     Value affineOperand = mul.getLhs();
-    FailureOr<Value> scale = getSplatScalar(mul.getRhs());
-    if (failed(scale)) {
+    Value scale = mul.getRhs();
+    if (!isUniformIntegerScale(scale)) {
       affineOperand = mul.getRhs();
-      scale = getSplatScalar(mul.getLhs());
+      scale = mul.getLhs();
     }
-    if (failed(scale))
+    if (!isUniformIntegerScale(scale))
       return getOpaqueAnalyzedOffset(value);
     FailureOr<AnalyzedTensorOffset> input = analyzeTensorOffset(affineOperand);
     if (failed(input) || input->strides.size() != rank)
@@ -1002,7 +1036,7 @@ static FailureOr<AnalyzedTensorOffset> analyzeTensorOffset(Value value) {
     for (unsigned axis = 0; axis < rank; ++axis) {
       if (result.axisKinds[axis] == AxisKind::Structured)
         result.strides[axis].identity =
-            getScaledIdentity(input->strides[axis].identity, *scale, value,
+            getScaledIdentity(input->strides[axis].identity, scale, value,
                               getStrideComponent(axis));
     }
     if (hasAnyOpaqueAxis(result.axisKinds)) {
@@ -1010,7 +1044,7 @@ static FailureOr<AnalyzedTensorOffset> analyzeTensorOffset(Value value) {
           value, getOpaqueContributionComponent(rank));
     } else {
       result.uniformOffset.identity =
-          getScaledIdentity(input->uniformOffset.identity, *scale, value,
+          getScaledIdentity(input->uniformOffset.identity, scale, value,
                             getUniformOffsetComponent(rank));
     }
     return result;
@@ -1255,10 +1289,11 @@ materializeTensorOffsetFields(Value value, OpBuilder &builder, Location loc) {
     result = materializeBinary(sub.getLhs(), sub.getRhs(), true);
   else if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
     Value affineOperand = mul.getLhs();
-    FailureOr<Value> scale = getSplatScalar(mul.getRhs());
+    FailureOr<Value> scale =
+        materializeUniformIntegerScale(mul.getRhs(), builder, loc);
     if (failed(scale)) {
       affineOperand = mul.getRhs();
-      scale = getSplatScalar(mul.getLhs());
+      scale = materializeUniformIntegerScale(mul.getLhs(), builder, loc);
     }
     if (failed(scale))
       return fallback();
@@ -1397,6 +1432,19 @@ static FailureOr<Value> materializeScalarBaseAddress(OpBuilder &builder,
 
   return builder.create<triton::PtrToIntOp>(loc, builder.getI64Type(), base)
       .getResult();
+}
+
+// Recover the original scalar pointer only when the descriptor component is
+// the direct address produced from that pointer.  This preserves native
+// memref provenance for loop-invariant tensor-of-pointer bases while keeping
+// the conservative int-to-ptr fallback for a base that was actually changed
+// by an SCF boundary.
+static Value recoverNativeScalarBase(Value baseAddress,
+                                     triton::PointerType expectedType) {
+  auto ptrToInt = baseAddress.getDefiningOp<triton::PtrToIntOp>();
+  if (!ptrToInt || ptrToInt.getSrc().getType() != expectedType)
+    return nullptr;
+  return ptrToInt.getSrc();
 }
 
 static SmallVector<unsigned>
@@ -2009,7 +2057,11 @@ public:
     if (hasScalarBase(value)) {
       auto scalarPointerType =
           cast<triton::PointerType>(pointerTensor.getElementType());
-      base = builder.create<triton::IntToPtrOp>(loc, scalarPointerType, base);
+      Value nativeBase = recoverNativeScalarBase(base, scalarPointerType);
+      if (!nativeBase)
+        nativeBase =
+            builder.create<triton::IntToPtrOp>(loc, scalarPointerType, base);
+      base = nativeBase;
       base = builder.create<triton::SplatOp>(loc, value.originalType, base);
     }
 

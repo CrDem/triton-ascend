@@ -37,7 +37,7 @@
 
 namespace mlir {
 namespace triton {
-enum class DependencyType { VectorToCube, CubeToVector };
+enum class DependencyType { VectorToCube, CubeToVector, CubeToCube };
 
 struct BlockInfo {
   int blockId;
@@ -85,6 +85,9 @@ public:
   }
   llvm::SmallVector<DependencyInfo> &getC2VDependencies() {
     return c2vDependencies;
+  }
+  llvm::SmallVector<DependencyInfo> &getC2CDependencies() {
+    return c2cDependencies;
   }
   llvm::SmallVector<DependencyInfo> &getMemoryDependencies() {
     return memoryDependencies;

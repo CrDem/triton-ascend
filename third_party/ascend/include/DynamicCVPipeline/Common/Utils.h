@@ -34,6 +34,7 @@
 #include <string_view>
 
 #include "DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
 
 namespace mlir {
 namespace CVPipeline {
@@ -341,6 +342,14 @@ inline bool isTensorComputeOp(Operation *op) {
 
   return false;
 }
+
+// Determine FixpipePreQuantMode from a trunc op.
+// Returns std::nullopt for scalars (non-shaped types) or unrecognized patterns.
+// Supported patterns:
+// - arith.truncf: f32 -> bf16, f32 -> f16
+// - arith.trunci: i32 -> i8
+std::optional<hivm::FixpipePreQuantMode>
+getFixpipePreQuantMode(Operation *truncOp);
 
 } // namespace CVPipeline
 } // namespace mlir

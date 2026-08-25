@@ -310,6 +310,26 @@ static LogicalResult validatePointerDescriptorRebuild(Operation *op) {
                  isa<triton::PointerType>(baseSplat.getSrc().getType()));
 }
 
+// Returns true when a pointer consumer is reached through ordinary addptr
+// operations from a CFO descriptor reconstruction root. The walk is purposely
+// limited to addptr: following arbitrary pointer-producing operations would
+// make the handoff contract retain computations it does not own.
+static bool hasPointerDescriptorRebuildProvenance(Value pointer) {
+  llvm::DenseSet<Value> visited;
+  while (pointer && visited.insert(pointer).second) {
+    Operation *producer = pointer.getDefiningOp();
+    if (!producer)
+      return false;
+    if (producer->hasAttr(controlflow::kPointerDescriptorRebuildAttr))
+      return true;
+    auto addPtr = dyn_cast<triton::AddPtrOp>(producer);
+    if (!addPtr)
+      return false;
+    pointer = addPtr.getPtr();
+  }
+  return false;
+}
+
 // Checks the complete CFO-to-TritonToLinalg handoff before any rewrite can
 // fold away a malformed marker. This function is deliberately read-only so it
 // can run at pass entry, before UseAnalysis has produced MetaUse attributes.
@@ -369,6 +389,31 @@ static LogicalResult preservePointerDescriptorComputations(ModuleOp moduleOp) {
     // closure is still narrower than retaining all loop operands/terminators.
     op->removeAttr("MetaUse");
     producerWorklist.append(op->operand_begin(), op->operand_end());
+  });
+
+  // UseAnalysis classifies load/store masks and load fallback values as
+  // pointer metadata. A descriptor rebuild, however, is converted to a memref
+  // while its consumer still needs those tensor values to form subviews and
+  // padding. Preserve these exact consumer operands when the pointer is owned
+  // by the CFO handoff; otherwise MetaUseEraser can leave an unconvertible
+  // memref-to-pointer materialization at the live memory operation.
+  moduleOp.walk([&](triton::LoadOp load) {
+    if (!hasPointerDescriptorRebuildProvenance(load.getPtr()))
+      return;
+    if (Value mask = load.getMask())
+      producerWorklist.push_back(mask);
+    if (Value other = load.getOther())
+      producerWorklist.push_back(other);
+  });
+  moduleOp.walk([&](triton::StoreOp store) {
+    if (hasPointerDescriptorRebuildProvenance(store.getPtr()) &&
+        store.getMask())
+      producerWorklist.push_back(store.getMask());
+  });
+  moduleOp.walk([&](triton::AtomicRMWOp atomic) {
+    if (hasPointerDescriptorRebuildProvenance(atomic.getPtr()) &&
+        atomic.getMask())
+      producerWorklist.push_back(atomic.getMask());
   });
 
   llvm::DenseSet<Value> visitedValues;

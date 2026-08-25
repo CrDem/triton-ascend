@@ -438,7 +438,8 @@ static bool shouldSplitByOutput(linalg::MatmulOp matmulOp, Value &outerOutValue,
   };
   auto usedByL1 =
       traceChainUser(outerOutValue, false, matchMatmulAB, skipCubeop);
-  if (usedByL1.has_value()) {
+  if (usedByL1.has_value() &&
+      usedByL1.value()->getBlock() != outerOutValue.getParentBlock()) {
     LOG_DEBUG("Split avoid L0C -> L1. " << matmulOp); // S01-S08
     return true;
   }

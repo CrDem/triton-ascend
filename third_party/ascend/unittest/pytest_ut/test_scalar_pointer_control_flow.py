@@ -82,6 +82,17 @@ def scalar_pointer_select_loop_kernel(x0, x1, out, predicate_ptr, steps_ptr):
 
 
 @triton.jit
+def tensor_pointer_loop_kernel(tensor_source, tensor_out, steps_ptr, BLOCK: tl.constexpr):
+    """Exercise one tensor-of-pointers loop carrier across several iterations."""
+    steps = tl.load(steps_ptr)
+    lane = tl.arange(0, BLOCK)
+    tensor_pointer = tensor_source + lane + 6
+    for _ in tl.range(0, steps):
+        tensor_pointer += 2
+    tl.store(tensor_out + lane, tl.load(tensor_pointer))
+
+
+@triton.jit
 def descriptor_boundary_scalar_kernel(x0, x1, out, steps_ptr, switch_at_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
     steps = tl.load(steps_ptr)
     switch_at = tl.load(switch_at_ptr)
@@ -180,6 +191,22 @@ def test_scalar_pointer_select_into_loop(predicate, steps):
     source = x0_cpu if predicate else x1_cpu
     expected_index = (4 if predicate else 7) + 2 * steps
     _assert_output(out, source[expected_index:expected_index + 1])
+
+
+@pytest.mark.parametrize("steps", [0, 1, 3])
+def test_tensor_pointer_loop(steps):
+    """Check a tensor-of-pointers backedge through a real NPU load/store."""
+    block = 8
+    length = 64
+    source_cpu = torch.arange(length, dtype=torch.float32)
+    source = source_cpu.npu()
+    tensor_output = torch.empty(block, dtype=torch.float32, device="npu")
+    steps_device = _device_i32(steps)
+
+    tensor_pointer_loop_kernel[(1, )](source, tensor_output, steps_device, BLOCK=block)
+
+    tensor_start = 6 + 2 * steps
+    _assert_output(tensor_output, source_cpu[tensor_start:tensor_start + block])
 
 
 @pytest.mark.parametrize("steps,switch_at", [(0, -1), (3, -1), (3, 1)])

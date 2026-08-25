@@ -93,36 +93,9 @@ private:
                        CVPipeline::ComputeBlockIdManager &bm);
   bool isSubviewFromGlobalMemory(ViewLikeOpInterface viewOp,
                                  SetVector<Operation *> &matchedOps);
-  bool isValidTrunc(Operation *op);
   bool isValidMul(Operation *op, Value matmulValues,
                   SetVector<Operation *> &matchedOps);
 };
-
-bool FixpipeOptPass::isValidTrunc(Operation *op) {
-  // Just filter: arith.truncf(f32->bf16, f32->f16, i32->i8)
-  if (auto truncFOp = dyn_cast<arith::TruncFOp>(op)) {
-    Type inType = truncFOp.getIn().getType();
-    Type outType = truncFOp.getResult().getType();
-    if (auto shapedType = dyn_cast<ShapedType>(inType))
-      inType = shapedType.getElementType();
-    if (auto shapedType = dyn_cast<ShapedType>(outType))
-      outType = shapedType.getElementType();
-
-    return isa<Float32Type>(inType) &&
-           (isa<BFloat16Type>(outType) || isa<Float16Type>(outType));
-  }
-  if (auto truncIOp = dyn_cast<arith::TruncIOp>(op)) {
-    Type inType = truncIOp.getIn().getType();
-    Type outType = truncIOp.getResult().getType();
-    if (auto shapedType = dyn_cast<ShapedType>(inType))
-      inType = shapedType.getElementType();
-    if (auto shapedType = dyn_cast<ShapedType>(outType))
-      outType = shapedType.getElementType();
-
-    return inType.isInteger(32) && outType.isInteger(8);
-  }
-  return false;
-}
 
 void transSource(Value value, SetVector<Operation *> &matchedOps,
                  Block *block) {
@@ -246,8 +219,18 @@ bool FixpipeOptPass::isFixpipeCastPattern(Operation *truncOp,
   tensor::ExtractSliceOp extractSliceOp = nullptr;
   if (auto extract = dyn_cast<tensor::ExtractSliceOp>(maybeExtract)) {
     extractSliceOp = extract;
+  } else if (auto consumerMatmul = dyn_cast<linalg::MatmulOp>(maybeExtract)) {
+    // matmul -> trunc -> matmul pattern
+    for (Value input : consumerMatmul.getDpsInputs()) {
+      if (input == truncResult) {
+        matchedOps.insert(truncOp);
+        return true;
+      }
+    }
+    LOG_DEBUG("Trunc result is not a DPS input of consumer matmul, NOT match.");
+    return false;
   } else {
-    LOG_DEBUG("Cannot find extract slice op, NOT match");
+    LOG_DEBUG("Cannot find extract slice op or matmul, NOT match");
     return false;
   }
 
@@ -353,7 +336,7 @@ bool FixpipeOptPass::matchFixpipePattern(linalg::MatmulOp matmulOp,
 
   auto matmulUser = *matmulResult.getUsers().begin();
 
-  if (isValidTrunc(matmulUser)) {
+  if (CVPipeline::getFixpipePreQuantMode(matmulUser).has_value()) {
     if (isFixpipeCastPattern(matmulUser, matchedOps)) {
       return true;
     }
