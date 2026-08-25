@@ -585,41 +585,6 @@ int getReorderVerbosity() {
   return verbosity;
 }
 
-constexpr llvm::StringLiteral kVariantMaxExtraBlocksEnvVar =
-    "TRITON_ASCEND_REORDER_MAX_EXTRA_BLOCKS";
-
-/// How many blocks beyond the input's own count a variant may create.
-///
-/// A finer partition is what the search is for -- it is the only way a variant
-/// differs from the input -- but the rest of the toolchain has limits the
-/// estimate cannot see, and past a point every candidate hits one. Two have
-/// been observed: a ten-way split of a four-block loop body was refused for
-/// 'read before first write', and a six-way split for running out of Unified
-/// Buffer. Both come from the same place, and neither is visible until a full
-/// compilation has been spent on the candidate.
-///
-/// Defaults to `before + 2`, which reproduces the historical `2 * before + 2`
-/// limit exactly. Exposed so the boundary can be bisected on hardware without
-/// a rebuild per attempt: the value that stops producing unbuildable winners
-/// is a measurement, not something to be guessed here.
-size_t getVariantMaxExtraBlocks(size_t before) {
-  static const std::optional<size_t> configured =
-      []() -> std::optional<size_t> {
-    const char *env = std::getenv(kVariantMaxExtraBlocksEnvVar.data());
-    if (!env) {
-      return std::nullopt;
-    }
-    unsigned long long value = 0;
-    if (llvm::StringRef(env).getAsInteger(10, value)) {
-      llvm::errs() << "[reorder-blocks] " << kVariantMaxExtraBlocksEnvVar
-                   << "='" << env << "' is not a number; ignoring\n";
-      return std::nullopt;
-    }
-    return static_cast<size_t>(value);
-  }();
-  return configured ? *configured : before + 2;
-}
-
 llvm::StringRef describeGroupCore(unsigned core) {
   switch (core) {
   case CoreType::CUBE_ONLY:
@@ -1134,9 +1099,10 @@ void rederiveBlockIds(ArrayRef<Operation *> order, ComputeBlockIdManager &bm,
   }
 }
 
-/// How many blocks the run-based regrouping above would produce, worked out
-/// without touching the IR so that an order which shreds the module can be
-/// rejected before it is applied rather than after.
+/// How many blocks the run-based regrouping above will produce, worked out
+/// without touching the IR. Reported next to the count that arrived, so a run
+/// shows how far each variant moved the partition -- the quantity the three
+/// resource guards in the search are all spending.
 ///
 /// Must mirror rederiveBlockIds exactly; the two are read together.
 size_t countRunsByCore(ArrayRef<Operation *> order) {
@@ -1238,27 +1204,26 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   // not consulted -- it is the thing being varied.
   if (variantSeed) {
     SmallVector<Operation *> order = sampleOpOrder(graph, *variantSeed);
-    // A block cannot span two cores, so the regrouping can only cut where the
-    // core changes. An order that changes core far more often than the input
-    // did produces blocks of a couple of operations each -- a shape the
-    // pipeline rejects downstream, after a full run has been spent on it.
-    // Cheaper to notice here and leave this block alone.
+    // How far the regrouping moved, for the report. There used to be a limit on
+    // it, and it is gone: what it stood for -- synchronisation flags, Unified
+    // Buffer, software-pipeline depth -- the search now measures directly and
+    // per resource, against the untouched pipeline. A cap on the block count
+    // was a proxy for all three and a poor one: it removed most of the search
+    // space to guard against costs that are now counted, and being decided per
+    // scope it could reject one loop nest while accepting another, leaving a
+    // half-applied variant that nobody designed.
+    //
+    // What still stands guard is rederiveBlockIds below, which is about
+    // correctness rather than aggressiveness: InterCoreTransferAndSync locates
+    // a block by walking from its first operation to the first foreign id, so
+    // a block whose operations are not adjacent puts its flags around the wrong
+    // range and hangs the kernel.
     const size_t before = countDistinctBlockIds(allOps, opBlockId);
     const size_t after = countRunsByCore(order);
-    const size_t limit = before + getVariantMaxExtraBlocks(before);
     if (order.size() != allOps.size()) {
       // A cycle in the dependency graph; the block-level path reports this
       // properly, so fall through to it rather than emitting a partial order.
       LOG_DEBUG("op-level order incomplete, falling back to block order\n");
-    } else if (after > limit) {
-      LOG_DEBUG("variant would split " << before << " block(s) into " << after
-                                       << ", over the limit of " << limit
-                                       << "; keeping the block order\n");
-      if (getReorderVerbosity() >= 1) {
-        llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
-                     << " rejected in " << describeScope(&block) << ": "
-                     << before << " block(s) would become " << after << "\n";
-      }
     } else {
       rederiveBlockIds(order, bm, opBlockId);
       applyReorder(block, order);

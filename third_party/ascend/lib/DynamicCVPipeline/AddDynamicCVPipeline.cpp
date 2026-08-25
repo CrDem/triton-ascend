@@ -129,9 +129,13 @@ constexpr const char *kUBSlackEnvVar = "TRITON_ASCEND_CV_UB_SLACK_BYTES";
 /// The baseline compiles by construction: it is what the pipeline emits with
 /// none of this, and the search spends its first attempt on it.
 ///
-/// So the value is readable rather than fitted: 0 admits only candidates that
-/// hold no more than the baseline, 65536 lets one more score tile through. It
-/// is unset by default, which filters nothing.
+/// Unset, it is derived rather than defaulted: the room a candidate may spend
+/// is exactly what the baseline leaves unused, `capacity - peak(baseline)`,
+/// both halves of which the estimate publishes. That is automatic on any
+/// kernel -- a baseline that already fills the buffer yields zero and admits
+/// nothing, which is the right answer and is what flash attention at 128x128
+/// gives. Set, it overrides: 0 admits only candidates holding no more than the
+/// baseline, 65536 lets one more score tile through.
 constexpr const char *kStageSlackEnvVar = "TRITON_ASCEND_CV_STAGE_SLACK";
 
 /// How many more iterations of software-pipeline prologue a candidate may
@@ -144,9 +148,11 @@ constexpr const char *kStageSlackEnvVar = "TRITON_ASCEND_CV_STAGE_SLACK";
 /// write' stretched by more than 130. That error *is* the prologue -- an
 /// iteration in which a stage reads a buffer whose filling stage has not run.
 ///
-/// Relative to the baseline for the same reason the Unified Buffer allowance
-/// is: what the toolchain will bear is not a number this model can derive, but
-/// the increment over a partition known to compile is one it can.
+/// Defaults to zero, which is not a tuned value but the structural rule: the
+/// depth is a small integer the pipeline chose, and a candidate that needs a
+/// deeper one has asked for a transformation the toolchain then refuses. Unlike
+/// an extension in iterations, nothing here scales with the kernel, so there is
+/// nothing to fit per kernel. The variable only widens it.
 std::optional<int64_t> getStageSlack() {
   static const std::optional<int64_t> slack = []() -> std::optional<int64_t> {
     const char *env = std::getenv(kStageSlackEnvVar);
@@ -363,7 +369,10 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // Set by seed 0, the untouched pipeline, which the loop below reaches
     // first. Everything after it is judged against these.
     std::optional<int64_t> baselineUBPeak;
-    std::optional<int64_t> baselineExtension;
+    std::optional<int64_t> baselineDepth;
+    // Derived from the baseline when TRITON_ASCEND_CV_UB_SLACK_BYTES says
+    // nothing: the room to spend is what the baseline leaves unused.
+    int64_t ubAllowance = 0;
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
@@ -386,7 +395,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       int64_t cost = 0;
       int64_t second = 0;
       int64_t ubBytes = 0;
-      int64_t extension = 0;
+      int64_t ubCapacity = 0;
+      int64_t depth = 0;
       int errCode = 0;
 
       {
@@ -435,19 +445,28 @@ void AddDynamicCVPipelinePass::runOnOperation() {
           // this threw away -- and if that is most of it, the answer for this
           // kernel is that the partition axis has no room, which is worth
           // seeing rather than inferring from a winner that will not build.
-          if (auto extAttr = moduleOp->getAttrOfType<IntegerAttr>(
-                  mlir::triton::kCVPipelineCostLoopExtension)) {
-            extension = extAttr.getInt();
+          if (auto capAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                  mlir::triton::kCVPipelineCostUBCapacity)) {
+            ubCapacity = capAttr.getInt();
           }
-          if (ubSlack && baselineUBPeak && ubBytes > *baselineUBPeak + *ubSlack) {
+          if (auto depthAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                  mlir::triton::kCVPipelineCostPipelineDepth)) {
+            depth = depthAttr.getInt();
+          }
+          // -3: it holds more Unified Buffer live than the baseline plus the
+          // room the baseline left unused. Both guards below run against the
+          // baseline rather than against an absolute, so nothing here is fitted
+          // to a kernel; the baseline itself always passes, having set the
+          // reference, so the worst a wrong estimate can do is return it.
+          if (baselineUBPeak && ubBytes > *baselineUBPeak + ubAllowance) {
             accepted = false;
             errCode = -3;
           }
-          // -4: the software pipeline was cut into far more stages than the
+          // -4: the software pipeline was cut into more stages than the
           // baseline's, which the binary compiler refuses as a prologue that
           // reads a buffer before its first write.
-          if (accepted && stageSlack && baselineExtension &&
-              extension > *baselineExtension + *stageSlack) {
+          if (accepted && baselineDepth &&
+              depth > *baselineDepth + stageSlack.value_or(0)) {
             accepted = false;
             errCode = -4;
           }
@@ -470,7 +489,19 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       ++usable;
       if (seed == 0) {
         baselineUBPeak = ubBytes;
-        baselineExtension = extension;
+        baselineDepth = depth;
+        // What the baseline leaves unused, unless the caller named a figure.
+        // A baseline that already fills the buffer yields zero and admits only
+        // candidates that hold no more than it does -- the right answer, and
+        // the one flash attention gives at 128x128.
+        ubAllowance = ubSlack ? *ubSlack
+                              : std::max<int64_t>(0, ubCapacity - ubBytes);
+        llvm::errs() << "[" << DEBUG_TYPE << "]   baseline: " << ubBytes
+                     << " bytes of unified buffer live against a capacity of "
+                     << ubCapacity << ", pipeline depth " << depth
+                     << "; candidates may spend " << ubAllowance
+                     << " more byte(s) and " << stageSlack.value_or(0)
+                     << " more stage(s)\n";
       }
       distinctCosts.insert({cost, second});
       ranked.push_back({cost, second, ubBytes, seed});
@@ -565,14 +596,13 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       } else if (entry.first == -2) {
         llvm::errs() << "no estimate produced\n";
       } else if (entry.first == -3) {
-        llvm::errs() << "more Unified Buffer live than the baseline's "
-                     << baselineUBPeak.value_or(0) << " bytes plus the "
-                     << kUBSlackEnvVar << " allowance\n";
+        llvm::errs() << "more than the baseline's "
+                     << baselineUBPeak.value_or(0) << " bytes of unified"
+                        " buffer plus its "
+                     << ubAllowance << "-byte allowance\n";
       } else if (entry.first == -4) {
         llvm::errs() << "a deeper software pipeline than the baseline's "
-                     << baselineExtension.value_or(0)
-                     << " extra iteration(s) plus the " << kStageSlackEnvVar
-                     << " allowance\n";
+                     << baselineDepth.value_or(0) << " stage(s)\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }

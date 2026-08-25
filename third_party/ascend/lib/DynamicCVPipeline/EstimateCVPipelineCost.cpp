@@ -3641,6 +3641,29 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   }
   module->setAttr(kCVPipelineCostLoopExtension,
                   builder.getI64IntegerAttr(loopExtension));
+
+  // The same fact as the integer the pipeline decided, which is what a search
+  // compares: a depth either grew or it did not, where an extension in
+  // iterations scales with the trip count and would need a threshold per
+  // kernel.
+  int64_t pipelineDepth = 1;
+  module.walk([&](scf::ForOp forOp) {
+    auto attr = forOp->getAttrOfType<ArrayAttr>(CVPipeline::kIterExtension);
+    if (!attr || attr.size() != 3) {
+      return;
+    }
+    if (auto required = dyn_cast<IntegerAttr>(attr[0])) {
+      pipelineDepth = std::max(pipelineDepth, required.getInt());
+    }
+  });
+  module->setAttr(kCVPipelineCostPipelineDepth,
+                  builder.getI64IntegerAttr(pipelineDepth));
+
+  if (const MemorySpace *ubSpace = config->getMemorySpace("ub")) {
+    module->setAttr(
+        kCVPipelineCostUBCapacity,
+        builder.getI64IntegerAttr(static_cast<int64_t>(ubSpace->sizeBytes)));
+  }
   module->setAttr(kCVPipelineCostHardware,
                   builder.getStringAttr(config->getName()));
   module->setAttr(kCVPipelineCostUnknownOps,

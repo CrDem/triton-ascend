@@ -123,6 +123,27 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
 inline constexpr llvm::StringLiteral kCVPipelineCostLoopExtension =
     "ascend.cv_pipeline_cost_loop_extension";
 
+/// How many stages deep software pipelining cut the deepest loop (i64): the
+/// requiredBuffers field of ssbuffer.iter_extension, maximised over loops.
+///
+/// The same fact as the extension above, but as the integer the pipeline
+/// actually decided rather than as the iterations it turned into. That makes it
+/// the one to compare: depth is a small count that either grew or did not,
+/// where the extension is a number of iterations that scales with the trip
+/// count and would need a threshold per kernel. Measured: the untouched
+/// pipeline runs at depth 1 and every candidate the binary compiler refused for
+/// reading a buffer before its first write had gone to 2.
+inline constexpr llvm::StringLiteral kCVPipelineCostPipelineDepth =
+    "ascend.cv_pipeline_cost_pipeline_depth";
+
+/// Unified Buffer the hardware profile says the part has, in bytes (i64).
+///
+/// Published so a consumer can size an allowance without carrying a copy of the
+/// profile: the room a candidate may spend is what the baseline leaves unused,
+/// and both halves of that subtraction are here.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBCapacity =
+    "ascend.cv_pipeline_cost_ub_capacity";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =
