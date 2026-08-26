@@ -279,9 +279,15 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         # Buffer counts for the dynamic CV pipeline. An explicit option wins;
         # otherwise the environment may override, which is how a run can be
         # made single-buffered (count 1) without touching the caller.
-        for _key, _kind in (("intra_cache_num", "INTRA"), ("inter_cache_num", "INTER"),
-                            ("load_cache_num", "LOAD")):
-            _val = metadata.get(_key)
+        #
+        # The canonical names came first; the legacy spellings are kept because
+        # parse_options only rewrites what a caller passes to it, and metadata
+        # assembled by hand elsewhere may still carry the old key.
+        for _keys, _kind in ((("buf_slot_num_of_veccore", "intra_cache_num"), "INTRA"),
+                             (("buf_slot_num_of_crosscore", "inter_cache_num"), "INTER"),
+                             (("buf_slot_num_of_gm", "load_cache_num"), "LOAD")):
+            _val = next((metadata[_k] for _k in _keys
+                         if metadata.get(_k) is not None), None)
             if _val is None:
                 _val = _get_buffer_count_override(_kind)
             if _val is not None:

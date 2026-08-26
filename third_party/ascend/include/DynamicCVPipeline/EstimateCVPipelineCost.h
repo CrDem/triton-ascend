@@ -79,6 +79,71 @@ inline constexpr llvm::StringLiteral kCVPipelineCostResource =
 inline constexpr llvm::StringLiteral kCVPipelineCostRecurrence =
     "ascend.cv_pipeline_cost_recurrence";
 
+/// Bytes of Unified Buffer the module allocates (i64), summed over every
+/// allocation rather than tracked by liveness.
+///
+/// Recorded because it is the constraint that decides whether a block
+/// partition can be compiled at all, and the only one of that kind the
+/// estimate can see. A finer partition buys overlap with UB -- each new block
+/// boundary materialises the value crossing it -- so the candidates a search
+/// likes best are systematically the ones most likely to be refused by the
+/// binary compiler, which reports the overrun and nothing else.
+///
+/// Not comparable to that compiler's own figure: this counts buffers that
+/// never coexist, and the compiler multi-buffers on top of what it is given.
+/// It is comparable *between candidates of one kernel*, which is what a search
+/// needs.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBBytes =
+    "ascend.cv_pipeline_cost_ub_bytes";
+
+/// The most Unified Buffer live at any one point of the block schedule (i64),
+/// as opposed to the sum above.
+///
+/// This is the figure worth comparing. Every allocation's size is exact and its
+/// live range is read off the schedule, so the *difference* between two
+/// variants of one kernel is a computation: it is precisely the buffers that a
+/// finer partition forced into existence. The absolute value still is not what
+/// the binary compiler will ask for -- it multi-buffers again on top, aligns to
+/// banks, and adds temporaries after this pass -- but those all apply equally
+/// to both variants and cancel in the comparison.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
+    "ascend.cv_pipeline_cost_ub_peak";
+
+/// How far software pipelining stretched the deepest loop past the iterations
+/// that actually do work (i64): the rewritten bound minus the trip count, taken
+/// over every loop and maximised.
+///
+/// A proxy for how many stages the pipeline was cut into, and the third thing
+/// a finer block partition buys its overlap with. The other two -- barriers and
+/// Unified Buffer -- have their own limits; this one shows up as the binary
+/// compiler refusing a module for reading a buffer before its first write,
+/// which is a prologue in which the stage that fills that buffer has not run
+/// yet. Measured: the untouched pipeline stretches by 2 iterations, and every
+/// candidate refused for that reason stretched by more than 130.
+inline constexpr llvm::StringLiteral kCVPipelineCostLoopExtension =
+    "ascend.cv_pipeline_cost_loop_extension";
+
+/// How many stages deep software pipelining cut the deepest loop (i64): the
+/// requiredBuffers field of ssbuffer.iter_extension, maximised over loops.
+///
+/// The same fact as the extension above, but as the integer the pipeline
+/// actually decided rather than as the iterations it turned into. That makes it
+/// the one to compare: depth is a small count that either grew or did not,
+/// where the extension is a number of iterations that scales with the trip
+/// count and would need a threshold per kernel. Measured: the untouched
+/// pipeline runs at depth 1 and every candidate the binary compiler refused for
+/// reading a buffer before its first write had gone to 2.
+inline constexpr llvm::StringLiteral kCVPipelineCostPipelineDepth =
+    "ascend.cv_pipeline_cost_pipeline_depth";
+
+/// Unified Buffer the hardware profile says the part has, in bytes (i64).
+///
+/// Published so a consumer can size an allowance without carrying a copy of the
+/// profile: the room a candidate may spend is what the baseline leaves unused,
+/// and both halves of that subtraction are here.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBCapacity =
+    "ascend.cv_pipeline_cost_ub_capacity";
+
 /// Name of the hardware profile the estimate was produced against (StringAttr).
 /// Estimates are only comparable across modules sharing the same profile.
 inline constexpr llvm::StringLiteral kCVPipelineCostHardware =

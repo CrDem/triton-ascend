@@ -513,12 +513,6 @@
     "l1:l2": {
       "bandwidth_gbps": 221
     },
-    "l1:l0a": {
-      "bandwidth_gbps": 441
-    },
-    "l1:l0b": {
-      "bandwidth_gbps": 220.5
-    },
     "hbm:l0b": {
       "bandwidth_gbps": 104.5
     },
