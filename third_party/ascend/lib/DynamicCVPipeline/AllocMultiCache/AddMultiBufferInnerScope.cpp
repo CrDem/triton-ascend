@@ -478,14 +478,15 @@ SmallVector<Value>
 collectBufferValues(DenseMap<Value, SmallVector<Value>> &depValueMap,
                     const DenseSet<Value> &clonedDepVals) {
   SmallVector<Value> valueList;
-  SmallVector<Operation *> seenOps;
+  llvm::DenseSet<Value> seenVals;
 
   for (auto &p : depValueMap) {
     for (Value depVal : p.second) {
       Operation *op = depVal.getDefiningOp();
-      if (!op || llvm::is_contained(seenOps, op))
+      if (!op)
         continue;
-      seenOps.push_back(op);
+      if (!seenVals.insert(depVal).second)
+        continue;
 
       auto shapedType = dyn_cast<ShapedType>(depVal.getType());
       if (!shapedType)
@@ -1550,7 +1551,7 @@ static int cloneDepsToConsumers(
                              int userBlockId, ArrayRef<Operation *> users)>
         cloneFn,
     DenseSet<Value> *clonedDepVals = nullptr) {
-  SmallVector<Operation *> seenOps;
+  llvm::DenseSet<Value> seenVals;
 
   for (auto &blockPair : blocks) {
     auto depIt = depValueMap.find(blockPair.first);
@@ -1559,7 +1560,9 @@ static int cloneDepsToConsumers(
 
     for (Value depVal : depIt->second) {
       Operation *defOp = depVal.getDefiningOp();
-      if (!defOp || llvm::is_contained(seenOps, defOp))
+      if (!defOp)
+        continue;
+      if (!seenVals.insert(depVal).second)
         continue;
       if (!patternCheck(depVal))
         continue;
@@ -1569,7 +1572,6 @@ static int cloneDepsToConsumers(
       auto producerId = getOpBlockId(defOp);
       if (!producerId.has_value())
         continue;
-      seenOps.push_back(defOp);
 
       auto userIt = depUserMap.find(depVal);
       if (userIt == depUserMap.end())
@@ -1692,7 +1694,8 @@ processTensorDependencies(const MainLoop &loop,
                           DenseMap<Value, SmallVector<Operation *>> &depUserMap,
                           BufferMap &bufferMap, OpBuilder &globalBuilder,
                           int &groupId, const DenseSet<Value> &clonedDepVals) {
-  SmallVector<Operation *> seenOps;
+  // Dedupe by depVal instead of op
+  llvm::DenseSet<Value> seenVals;
 
   for (auto &blockPair : blocks) {
     Value blockKey = blockPair.first;
@@ -1704,9 +1707,8 @@ processTensorDependencies(const MainLoop &loop,
 
     for (Value depVal : depValues) {
       // Skip if already processed
-      if (llvm::is_contained(seenOps, depVal.getDefiningOp()))
+      if (!seenVals.insert(depVal).second)
         continue;
-      seenOps.push_back(depVal.getDefiningOp());
 
       // Validate dependency value (skip BlockArgument, null definingOp,
       // non-ShapedType)
@@ -2107,6 +2109,19 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
 
   OpBuilder builder(module.getContext());
 
+  // Scan existing kIntraDeps to start groupId after the max already used
+  // (e.g. by InterCoreTransferAndSyncPass for C2C fixpipe transfers).
+  int groupId = 0;
+  module.walk([&](Operation *op) {
+    if (auto attr = op->getAttrOfType<ArrayAttr>(CVPipeline::kIntraDeps)) {
+      if (!attr.empty()) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(attr[0])) {
+          groupId = std::max(groupId, static_cast<int>(intAttr.getInt()) + 1);
+        }
+      }
+    }
+  });
+
   LDBG("Enter pass.");
 
   auto walkResult = module.walk([&](scope::ScopeOp scope) -> WalkResult {
@@ -2135,7 +2150,6 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
       return WalkResult::advance();
 
     // Step 4: Process each main_loop
-    int groupId = 0;
     for (Operation *loopOp : mainLoops) {
       MainLoop mainLoop(loopOp);
       if (findNestedMainloop(mainLoop)) {

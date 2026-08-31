@@ -29,7 +29,7 @@ def _make_metadata():
         target=driver.GPUTarget("npu", "Ascend910B3", 0),
         workspace_size=0,
         lock_init_value=0,
-        lock_num=0,
+        sync_block_lock_layout=0,
         bs_task_type=0,
         mix_mode="aiv",
         shared=0,
@@ -98,12 +98,14 @@ def test_make_launcher_resolves_npu_utils_from_active_cache_root(
         return SimpleNamespace(
             get_aivector_core_num=lambda: 40,
             get_aicore_num=lambda: 20,
-            npu_utils_mod=SimpleNamespace(__file__=f"{cache_root}/{cache_key}/npu_utils.so"),
+            get_so_path=lambda: f"{cache_root}/{cache_key}/npu_utils.so",
         )
 
     producer_utils = make_utils("/producer/cache")
     consumer_utils = make_utils("/consumer/cache")
-    mock_npu_utils.side_effect = [producer_utils, consumer_utils]
+    # make_launcher currently reads NPUUtils once for core counts and once for
+    # the shared-object path.
+    mock_npu_utils.side_effect = [producer_utils, producer_utils, consumer_utils, consumer_utils]
 
     producer_src = driver.make_launcher(
         constants={},
@@ -124,6 +126,9 @@ def test_make_launcher_resolves_npu_utils_from_active_cache_root(
     assert f'npu_utils_path = std::string(cache_root) + "/{cache_key}/npu_utils.so";' in producer_src
     assert 'const char* triton_home = std::getenv("TRITON_HOME");' in producer_src
     assert f'npu_utils_path = std::string(base) + "/.triton/cache/{cache_key}/npu_utils.so";' in producer_src
+    module_init = producer_src.split("PyMODINIT_FUNC PyInit___triton_launcher", maxsplit=1)[1]
+    assert "init_npu_utils();" in module_init
+    assert "set_npu_utils_path" not in producer_src
 
 
 @patch.object(driver, "NPUUtils")
@@ -208,9 +213,10 @@ def test_make_launcher_enables_91095_simt_for_sls_mixed_parallel_mode(
         metadata=metadata,
     )
 
-    assert src.count("aclrtLaunchKernelWithHostArgs") == 2
-    assert src.count("aclrtLaunchKernelCfg cfgCfgInfo = {};") == 2
-    assert src.count("attrInfo.id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;") == 2
+    assert src.count("cann_launch_kernel(func, blockNum") == 2
+    assert src.count("cann_get_launch_kernel_cfg(221184)") == 2
+    assert src.count("aclrtLaunchKernelWithHostArgs") == 1
+    assert src.count("attrInfo.id = ACL_RT_LAUNCH_KERNEL_ATTR_DYN_UBUF_SIZE;") == 1
     c_abi_launch, cpp_launch = _split_launch_functions(src)
     assert "static_cast<void*>(launch_args.data())" in c_abi_launch
     assert "&args" in cpp_launch
@@ -299,7 +305,7 @@ def test_merged_code_sync_block_lock_appears_in_both_paths(
     mock_npu_utils.return_value.get_aivector_core_num.return_value = 40
     mock_npu_utils.return_value.get_aicore_num.return_value = 20
     metadata = _make_metadata()
-    metadata.lock_num = 2
+    metadata.sync_block_lock_layout = 2
 
     src = driver.make_launcher(
         constants={},
@@ -372,7 +378,7 @@ def test_merged_code_preamble_shared_variables_present(
         assert "void* workspace_handle = nullptr;" in section, f"{section_name}: missing workspace_handle"
         assert "uint32_t blockNum4Workspace = gridX * gridY * gridZ;" in section, f"{section_name}: missing blockNum4Workspace"
         assert "uint32_t blockNum = gridX * gridY * gridZ;" in section, f"{section_name}: missing blockNum"
-        assert "aclError ret = ACL_SUCCESS;" in section, f"{section_name}: missing ret"
+        assert "cann_error ret = CANN_SUCCESS;" in section, f"{section_name}: missing ret"
 
 
 @patch.object(driver, "NPUUtils")
@@ -398,8 +404,8 @@ def test_merged_code_taskqueue_mode_in_both_paths(
 
     c_abi_launch, cpp_launch = _split_launch_functions(src)
 
-    assert c_abi_launch.count("std::function<aclError()> launch_call") == 1
-    assert cpp_launch.count("std::function<aclError()> launch_call") == 1
+    assert c_abi_launch.count("std::function<cann_error()> launch_call") == 1
+    assert cpp_launch.count("std::function<cann_error()> launch_call") == 1
     # The dlsym helpers in cpp_npu_utils_dlopen reference "async_launch" multiple
     # times (typedef, static decl, dlsym). Use the call site marker returned by
     # the mocked get_backend_func to verify the actual call appears in both paths.

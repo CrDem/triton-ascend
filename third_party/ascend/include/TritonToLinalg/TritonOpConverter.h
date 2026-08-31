@@ -660,12 +660,14 @@ public:
     // CFO-expanded descriptor loops already carry pointer-free policy values
     // and remain structurally unchanged. This legacy BlockData rewrite is only
     // valid for explicitly marked loops.
-    if (!op->hasAttr("UnhandledLoopOp"))
+    SmallVector<unsigned> markedRangeSlots = getMarkedMakeRangeCarrierSlots(op);
+    if (!op->hasAttr("UnhandledLoopOp") && markedRangeSlots.empty())
       return failure();
     llvm::SmallDenseMap<Value, BlockData> known;
 
     rewriter.modifyOpInPlace(op, [&]() { op->removeAttr("UnhandledLoopOp"); });
-    return BlockDataParser::rewriteLoopOp(op, rewriter, known);
+    return BlockDataParser::rewriteLoopOp(op, rewriter, known,
+                                          markedRangeSlots);
   }
 };
 

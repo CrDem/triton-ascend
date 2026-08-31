@@ -407,8 +407,9 @@ def test_sls_91095_native_ir_metadata_and_mixed_simt_launcher(monkeypatch):
     assert "parallel_mode = \"mix_simd_simt\"" in sls_ir
 
     launcher = observer.launcher_with("rtKernelLaunchWithFlagV2")
-    assert launcher.count("rtKernelLaunchWithFlagV2") == 2
-    assert launcher.count("rtArgsEx_t argsInfo") == 2
-    # The same historical value must reach cfgInfo in both generated launcher
+    # cfg setup is shared via the cann shim (once); both launch paths call it.
+    assert launcher.count("rtKernelLaunchWithFlagV2") == 1
+    assert launcher.count("rtArgsEx_t argsInfo") == 1
+    # The same historical value must reach cfgInfo via both generated launcher
     # paths; the target is not allowed to silently pick a different ABI value.
-    assert launcher.count("cfgInfo.localMemorySize = 221184;") == 2
+    assert launcher.count("cann_get_launch_kernel_cfg(221184)") == 2

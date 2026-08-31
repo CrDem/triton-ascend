@@ -102,6 +102,7 @@ private:
   mlir::ModuleOp module;
   int transferIndex = 0;
   int markAllocIndex = 0;
+  int intraDepsGroupId = 0;
 
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
   SSBufferManager ssbufferManager;
@@ -162,6 +163,8 @@ private:
   mlir::Operation *analyzeConsumerReadInsertPoint(Value srcValue,
                                                   int iniConsumerId);
   mlir::Operation *getConsumerWaitPoint(int transferIndex);
+  mlir::Operation *getFixpipePointAfterProducer(Value depValue,
+                                                int iniProducerBlockId);
   mlir::Operation *getCopyPointBeforeStore(Value depValue,
                                            Operation *vectorEndOp,
                                            int iniProducerBlockId);
@@ -187,8 +190,11 @@ private:
                            FlagIdReuseManager &flagIdReuseManager,
                            mlir::Operation *consumedDataOp = nullptr,
                            bool isStoreDirectly = false);
-  void insertMemDepSync(mlir::OpBuilder &builder, mlir::Operation *producerOp,
-                        mlir::Operation *consumerOp, int flag,
+  void insertMemDepSync(mlir::OpBuilder &builder,
+                        mlir::Operation *producerStartOp,
+                        mlir::Operation *producerEndOp,
+                        mlir::Operation *consumerStartOp,
+                        mlir::Operation *consumerEndOp, int flag,
                         mlir::Location loc, bool isCubeToVector,
                         FlagIdReuseManager &flagIdReuseManager);
   // Match the CUBE -> VECTOR direct-store pattern inside the given SCF op:
