@@ -478,7 +478,6 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     }
   }
 
-  PassManager pm(&getContext(), moduleOp.getOperationName());
   buildPipeline(pm);
 
   if (failed(runPipeline(pm, moduleOp)) ||
