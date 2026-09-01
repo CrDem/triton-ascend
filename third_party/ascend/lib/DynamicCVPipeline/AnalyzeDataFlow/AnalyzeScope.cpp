@@ -173,7 +173,7 @@ static bool checkVecScopeMainLoop(ModuleOp module) {
 //   - hivm::FixpipeOp typically appears in CUBE scope main_loops
 //
 // Counting operation kinds is only a proxy for "does this loop exchange data in
-// both directions", and it is wrong in three ways, so isEveryMainLoopOneWay
+// both directions", and it is wrong in three ways, so noMainLoopCanBePipelined
 // below reads the exchange ledger instead and this is kept only for IR that has
 // no ledger at all. The three:
 //   - a V->C exchange carried by a *buffer* has no data operation of its own
@@ -266,6 +266,20 @@ struct GroupRoles {
   bool hasConsumer = false;
   bool producerIsVector = false;
   bool directionKnown = false;
+  // Which machinery carries this exchange, which is what decides whether it can
+  // survive having its two ends put in different pipeline stages:
+  //
+  //   - a *transfer* group (ssbuffer.transfer_id) gets the full handshake from
+  //     insertInterCoreSync -- "data ready" forward and "buffer free" back, plus
+  //     a credit before the loop and a drain after it -- and a rotatable buffer
+  //     from AllocMultiCache. Overlapping iterations is safe.
+  //   - a *buffer-carried* group (ssbuffer.memCrossDeps) gets only the forward
+  //     half from insertMemDepSync: one set, one wait, no back-signal, and the
+  //     buffer is the kernel's own memory, so nothing rotates it. Correct while
+  //     the two ends stay in lockstep, and a write-after-read race the moment
+  //     they do not.
+  bool viaTransfer = false;
+  bool viaMemDep = false;
 
   bool isComplete() const { return hasProducer && hasConsumer; }
 };
@@ -302,6 +316,12 @@ static LedgerByMainLoop collectLedgerByMainLoop(ModuleOp module) {
         return;
       }
       GroupRoles &roles = groups[static_cast<int>(groupAttr.getInt())];
+      if (op->hasAttr(CVPipeline::kTransferId)) {
+        roles.viaTransfer = true;
+      }
+      if (op->hasAttr(CVPipeline::kMemCrossDeps)) {
+        roles.viaMemDep = true;
+      }
       if (roleAttr.getInt() == CVPipeline::crossCoreProducerId) {
         roles.hasProducer = true;
         if (std::optional<bool> onVector = runsOnVectorCore(op)) {
@@ -317,14 +337,65 @@ static LedgerByMainLoop collectLedgerByMainLoop(ModuleOp module) {
   return ledger;
 }
 
-/// True when no main_loop id exchanges data in both directions, which is when
-/// the dynamic CV pipeline gives up and the original workflow is used.
+/// What one main_loop id offers the pipeline, and what it costs.
+struct MainLoopVerdict {
+  /// At least one complete handoff carried by real transfer machinery, so there
+  /// is something to overlap across iterations.
+  bool worthwhile = false;
+  /// No buffer-carried dependency has both of its ends inside this loop.
+  bool safe = true;
+
+  bool applicable() const { return worthwhile && safe; }
+};
+
+static MainLoopVerdict
+judgeMainLoop(const llvm::DenseMap<int, GroupRoles> &groups) {
+  MainLoopVerdict verdict;
+  for (const auto &entry : groups) {
+    const GroupRoles &roles = entry.second;
+    // Half a handoff has nothing to rotate across iterations, and it is also
+    // not a hazard: the other end is outside, in lockstep with the loop.
+    if (!roles.isComplete()) {
+      continue;
+    }
+    if (roles.viaTransfer) {
+      verdict.worthwhile = true;
+    }
+    if (roles.viaMemDep && !roles.viaTransfer) {
+      verdict.safe = false;
+    }
+  }
+  return verdict;
+}
+
+/// True when no main_loop id can be pipelined, which is when the dynamic CV
+/// pipeline gives up and the original workflow is used.
 ///
-/// Same policy as before -- a main loop has to carry a round trip -- read from
-/// the ledger instead of from operation kinds. A group only counts when both of
-/// its ends are inside the loops of that id: half a handoff has nothing to
-/// rotate across iterations.
-static bool isEveryMainLoopOneWay(ModuleOp module) {
+/// This replaces the older "a main loop must carry a round trip" rule, which
+/// asked the wrong question in both directions.
+///
+/// It was too strict about *direction*. A one-way CUBE->VECTOR loop -- cube
+/// computes, vector post-processes and writes out -- is the plain epilogue
+/// overlap, and the machinery that makes it safe is per transfer and blind to
+/// direction: AllocMultiCache rotates the buffer, insertInterCoreSync guards it
+/// with a handshake in both directions regardless of which way the data flows.
+/// Nothing about a second direction is load-bearing. Requiring one rejected
+/// every kernel whose vector side is a pure epilogue.
+///
+/// It was too lax about *machinery*. Counting operation kinds happened to count
+/// exactly the exchanges that have the full handshake, so the old rule was
+/// accidentally safe; reading the ledger instead admits buffer-carried
+/// dependencies, and those have only a forward signal and an unrotated buffer.
+/// Put their two ends in different pipeline stages and the producer of
+/// iteration i+1 overwrites what the consumer of iteration i is still reading --
+/// a write-after-read race with no flag to catch it, deterministic, and
+/// invisible to a flag-pairing check because both sides are perfectly balanced.
+///
+/// So the two questions are asked separately: is there a transfer-carried
+/// handoff to overlap, and is there a buffer-carried one that would be torn
+/// apart. Once insertMemDepSync emits the back-signal that insertInterCoreSync
+/// already does, the safety half of this can go away.
+static bool noMainLoopCanBePipelined(ModuleOp module) {
   LedgerByMainLoop ledger = collectLedgerByMainLoop(module);
 
   // No main loop at all: preserve the previous answer, which left the decision
@@ -347,20 +418,7 @@ static bool isEveryMainLoopOneWay(ModuleOp module) {
   }
 
   for (const auto &entry : ledger) {
-    bool v2c = false;
-    bool c2v = false;
-    for (const auto &groupEntry : entry.second) {
-      const GroupRoles &roles = groupEntry.second;
-      if (!roles.isComplete() || !roles.directionKnown) {
-        continue;
-      }
-      if (roles.producerIsVector) {
-        v2c = true;
-      } else {
-        c2v = true;
-      }
-    }
-    if (v2c && c2v) {
+    if (judgeMainLoop(entry.second).applicable()) {
       return false;
     }
   }
@@ -454,10 +512,9 @@ static void reportMainLoopFacts(ModuleOp module) {
   }
 
   llvm::DenseMap<int, MainLoopFacts> byId;
-  // (main_loop id, crossCoreDeps group) -> (saw producer, saw consumer)
-  llvm::DenseMap<std::pair<int, int>, std::pair<bool, bool>> groupRoles;
-  // (main_loop id, crossCoreDeps group) -> core type that produced the group
-  llvm::DenseMap<std::pair<int, int>, llvm::StringRef> groupProducerCore;
+  // The same ledger the decision reads, so the report and the verdict can never
+  // disagree about what is inside the loop.
+  LedgerByMainLoop ledger = collectLedgerByMainLoop(module);
 
   module.walk([&](Operation *loopOp) {
     if (!isa<scf::ForOp, scf::WhileOp>(loopOp)) {
@@ -505,33 +562,6 @@ static void reportMainLoopFacts(ModuleOp module) {
       }
       if (op->hasAttr(CVPipeline::kMemCrossDeps)) {
         ++facts.memDepOps;
-      }
-
-      // Read the ledger unconditionally, NOT only for transfer_id-tagged ops:
-      // handleMemoryDependency tags its producer/consumer with crossCoreDeps
-      // and memCrossDeps but gives them no transfer_id, so gating on
-      // transfer_id here would hide exactly the memory-carried exchanges this
-      // report exists to surface.
-      auto depsAttr = op->getAttrOfType<ArrayAttr>(CVPipeline::kCrossCoreDeps);
-      if (!depsAttr || depsAttr.size() < 2) {
-        return;
-      }
-      auto groupAttr = dyn_cast<IntegerAttr>(depsAttr[0]);
-      auto roleAttr = dyn_cast<IntegerAttr>(depsAttr[1]);
-      if (!groupAttr || !roleAttr) {
-        return;
-      }
-      auto key =
-          std::make_pair(id, static_cast<int>(groupAttr.getInt()));
-      auto &roles = groupRoles[key];
-      if (roleAttr.getInt() == CVPipeline::crossCoreProducerId) {
-        roles.first = true;
-        if (std::optional<bool> onVector = runsOnVectorCore(op)) {
-          groupProducerCore[key] = *onVector ? CVPipeline::kCoreTypeVector
-                                             : CVPipeline::kCoreTypeCube;
-        }
-      } else {
-        roles.second = true;
       }
     });
   });
@@ -599,56 +629,71 @@ static void reportMainLoopFacts(ModuleOp module) {
                  << "[cv-mainloop]   transfer-tagged ops="
                  << facts.transferTaggedOps << "\n";
 
+    const llvm::DenseMap<int, GroupRoles> &idGroups = ledger[id];
     int complete = 0, incomplete = 0, v2c = 0, c2v = 0, unknownDir = 0;
     SmallVector<int> groups;
-    for (const auto &entry : groupRoles) {
-      if (entry.first.first == id) {
-        groups.push_back(entry.first.second);
-      }
+    for (const auto &entry : idGroups) {
+      groups.push_back(entry.first);
     }
     llvm::sort(groups);
     for (int group : groups) {
-      auto key = std::make_pair(id, group);
-      const auto roles = groupRoles.lookup(key);
-      llvm::StringRef producerCore = groupProducerCore.lookup(key);
-      if (roles.first && roles.second) {
+      const GroupRoles roles = idGroups.lookup(group);
+      if (roles.isComplete()) {
         ++complete;
       } else {
         ++incomplete;
       }
-      if (producerCore == CVPipeline::kCoreTypeVector) {
-        ++v2c;
-      } else if (producerCore == CVPipeline::kCoreTypeCube) {
-        ++c2v;
-      } else {
+      if (!roles.directionKnown) {
         ++unknownDir;
+      } else if (roles.producerIsVector) {
+        ++v2c;
+      } else {
+        ++c2v;
       }
       llvm::errs() << "[cv-mainloop]     group " << group << ": producer="
-                   << (roles.first ? "yes" : "no ") << " consumer="
-                   << (roles.second ? "yes" : "no ") << " producerCore="
-                   << (producerCore.empty() ? llvm::StringRef("?")
-                                            : producerCore)
-                   << (roles.first && roles.second ? "  [complete handoff]"
-                                                   : "  [INCOMPLETE]")
+                   << (roles.hasProducer ? "yes" : "no ") << " consumer="
+                   << (roles.hasConsumer ? "yes" : "no ") << " direction="
+                   << (!roles.directionKnown
+                           ? llvm::StringRef("?")
+                           : (roles.producerIsVector ? llvm::StringRef("V->C")
+                                                     : llvm::StringRef("C->V")))
+                   << " via="
+                   << (roles.viaTransfer ? "transfer"
+                                         : (roles.viaMemDep ? "memdep" : "?"))
+                   << (roles.isComplete() ? "  [complete handoff]"
+                                          : "  [INCOMPLETE]")
                    << "\n";
     }
+
+    const MainLoopVerdict verdict = judgeMainLoop(idGroups);
     llvm::errs() << "[cv-mainloop]   ledger view     : " << complete
                  << " complete handoff(s), " << incomplete
                  << " incomplete; directions V->C=" << v2c << " C->V=" << c2v
-                 << " unknown=" << unknownDir << "\n";
-    if (!twoWayByCounters && complete > 0) {
-      llvm::errs() << "[cv-mainloop]   note: the old op-kind counters would"
-                      " have called this id one-way; the ledger disagrees."
-                      " A V->C group with copy=0 went through a channel the"
-                      " counters cannot see: the scalar SSBuffer path, or a"
-                      " buffer-carried memCrossDeps dependency.\n";
+                 << " unknown=" << unknownDir << "\n"
+                 << "[cv-mainloop]   verdict         : "
+                 << (verdict.worthwhile ? "worthwhile (a transfer handoff to"
+                                          " overlap)"
+                                        : "NOT worthwhile (no complete"
+                                          " transfer handoff)")
+                 << ", "
+                 << (verdict.safe
+                         ? "safe"
+                         : "UNSAFE (a buffer-carried handoff would be split"
+                           " across stages; insertMemDepSync emits no"
+                           " back-signal, so that is a write-after-read race)")
+                 << "\n";
+    if (verdict.applicable() && !twoWayByCounters) {
+      llvm::errs() << "[cv-mainloop]   note: the old op-kind rule would have"
+                      " rejected this id as one-way. A one-way transfer handoff"
+                      " is the plain epilogue overlap and is rotated by the"
+                      " same machinery as a round trip.\n";
     }
   }
 
-  const bool oneWay = isEveryMainLoopOneWay(module);
+  const bool blocked = noMainLoopCanBePipelined(module);
   llvm::errs() << "[cv-mainloop] applicability: "
-               << (oneWay ? "no id exchanges both ways -> FALLBACK"
-                          : "at least one id carries a round trip -> proceed")
+               << (blocked ? "no id is both worthwhile and safe -> FALLBACK"
+                           : "at least one id can be pipelined -> proceed")
                << " (op-kind counters alone would have said "
                << (anyIdTwoWayByCounters ? "proceed" : "FALLBACK") << ")\n";
 }
@@ -678,9 +723,9 @@ static LogicalResult verifyMainLoop(ModuleOp module) {
     return failure();
   };
 
-  if (isEveryMainLoopOneWay(module)) {
-    LDBG("[INFO]: One-way CV interaction for fallback.");
-    std::cout << "[VDV DEBUG] AnalyzeScope - no main_loop exchanges data in both directions. - FALLBACK" << std::endl;
+  if (noMainLoopCanBePipelined(module)) {
+    LDBG("[INFO]: No main loop carries a pipelineable CV exchange.");
+    std::cout << "[VDV DEBUG] AnalyzeScope - no main_loop carries a transfer handoff that is safe to pipeline. - FALLBACK" << std::endl;
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
     return failure();
   }
