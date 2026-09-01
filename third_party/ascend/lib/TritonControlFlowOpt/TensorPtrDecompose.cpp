@@ -102,6 +102,24 @@ static bool isTensorPointerType(Type type) {
   return tensorType && isa<triton::PointerType>(tensorType.getElementType());
 }
 
+static bool isCompatiblePointerBroadcast(Type sourceType, Type resultType) {
+  auto sourceTensor = dyn_cast<RankedTensorType>(sourceType);
+  auto resultTensor = dyn_cast<RankedTensorType>(resultType);
+  if (!sourceTensor || !resultTensor || !isTensorPointerType(sourceType) ||
+      !isTensorPointerType(resultType) ||
+      sourceTensor.getRank() != resultTensor.getRank() ||
+      sourceTensor.getElementType() != resultTensor.getElementType() ||
+      sourceTensor.getEncoding() != resultTensor.getEncoding())
+    return false;
+
+  for (auto [sourceExtent, resultExtent] :
+       llvm::zip(sourceTensor.getShape(), resultTensor.getShape())) {
+    if (sourceExtent != resultExtent && sourceExtent != 1)
+      return false;
+  }
+  return true;
+}
+
 static bool isRankOneTensorPointer(Type type) {
   auto tensorType = dyn_cast<RankedTensorType>(type);
   return tensorType && tensorType.getRank() == 1 &&
@@ -833,6 +851,23 @@ static FailureOr<RankedTensorType> getIntegerTensorType(Value value) {
   return type;
 }
 
+// Sign-extension preserves the affine provenance of a tensor offset when it
+// only changes the integer element width.  Keep this check shared by
+// analysis and materialization so an extension is never classified as
+// Structured in one phase and rebuilt as Opaque in the other.
+static bool isCompatibleIntegerExtension(Value source,
+                                         RankedTensorType resultType) {
+  auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+  if (!sourceType || sourceType.getRank() != resultType.getRank() ||
+      sourceType.getShape() != resultType.getShape() ||
+      sourceType.getEncoding() != resultType.getEncoding())
+    return false;
+  auto sourceElement = dyn_cast<IntegerType>(sourceType.getElementType());
+  auto resultElement = dyn_cast<IntegerType>(resultType.getElementType());
+  return sourceElement && resultElement &&
+         sourceElement.getWidth() < resultElement.getWidth();
+}
+
 static bool hasAnyOpaqueAxis(ArrayRef<AxisKind> kinds) {
   return llvm::is_contained(kinds, AxisKind::Opaque);
 }
@@ -920,6 +955,30 @@ static FailureOr<AnalyzedTensorOffset> analyzeTensorOffset(Value value) {
     if (!dense->value.isZero())
       result.uniformOffset.identity =
           ComponentIdentity::fromValue(value, getUniformOffsetComponent(rank));
+    return result;
+  }
+
+  if (auto extension = value.getDefiningOp<arith::ExtSIOp>()) {
+    Value source = extension.getIn();
+    if (!isCompatibleIntegerExtension(source, *tensorType))
+      return getOpaqueAnalyzedOffset(value);
+    FailureOr<AnalyzedTensorOffset> sourceInfo = analyzeTensorOffset(source);
+    if (failed(sourceInfo) || sourceInfo->strides.size() != rank)
+      return getOpaqueAnalyzedOffset(value);
+
+    AnalyzedTensorOffset result = makeStructuredZero();
+    result.axisKinds = sourceInfo->axisKinds;
+    for (unsigned axis = 0; axis < rank; ++axis) {
+      if (!isZeroIdentity(sourceInfo->strides[axis].identity))
+        result.strides[axis].identity =
+            ComponentIdentity::fromValue(value, getStrideComponent(axis));
+    }
+    if (!isZeroIdentity(sourceInfo->uniformOffset.identity))
+      result.uniformOffset.identity =
+          ComponentIdentity::fromValue(value, getUniformOffsetComponent(rank));
+    if (!isZeroIdentity(sourceInfo->opaqueContribution.identity))
+      result.opaqueContribution.identity = ComponentIdentity::fromValue(
+          value, getOpaqueContributionComponent(rank));
     return result;
   }
 
@@ -1197,6 +1256,37 @@ materializeTensorOffsetFields(Value value, OpBuilder &builder, Location loc) {
     if (!uniform)
       return failure();
     result->uniformOffset = uniform;
+    return result;
+  }
+
+  if (auto extension = value.getDefiningOp<arith::ExtSIOp>()) {
+    if (!isCompatibleIntegerExtension(extension.getIn(), *tensorType))
+      return fallback();
+    FailureOr<TensorOffsetValues> source =
+        materializeTensorOffsetFields(extension.getIn(), builder, loc);
+    if (failed(source) || source->strides.size() != rank)
+      return fallback();
+
+    FailureOr<TensorOffsetValues> result = makeZero(AxisKind::Structured);
+    if (failed(result))
+      return failure();
+    result->axisKinds = source->axisKinds;
+    for (unsigned axis = 0; axis < rank; ++axis) {
+      FailureOr<Value> stride =
+          castIntegerLike(builder, loc, source->strides[axis], scalarType);
+      if (failed(stride))
+        return fallback();
+      result->strides[axis] = *stride;
+    }
+    FailureOr<Value> uniform =
+        castIntegerLike(builder, loc, source->uniformOffset, scalarType);
+    if (failed(uniform))
+      return fallback();
+    result->uniformOffset = *uniform;
+    if (!isConstantZero(source->opaqueContribution)) {
+      result->opaqueContribution = builder.create<arith::ExtSIOp>(
+          loc, *tensorType, source->opaqueContribution);
+    }
     return result;
   }
 
@@ -1647,6 +1737,49 @@ public:
       return *known;
     }
 
+    // Broadcasting an already-structured pointer tensor only changes the
+    // descriptor shape. An expanded unit dimension repeats the same pointer,
+    // so that dimension has stride zero in the result descriptor. Restrict the
+    // propagation to scalar-base descriptors with no opaque contribution;
+    // unknown or partially opaque pointer tensors retain the established
+    // complete-pointer fallback below.
+    if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
+      FailureOr<AnalyzedValue> result =
+          context.analyzeValue(broadcast.getSrc());
+      if (succeeded(result) && hasValidLayout(*result) &&
+          hasScalarBase(*result) &&
+          isCompatiblePointerBroadcast(broadcast.getSrc().getType(),
+                                       value.getType())) {
+        FailureOr<SmallVector<AxisKind>> kinds = getAxisKinds(*result);
+        auto sourceType = cast<RankedTensorType>(broadcast.getSrc().getType());
+        auto resultType = cast<RankedTensorType>(value.getType());
+        unsigned rank = resultType.getRank();
+        if (succeeded(kinds) && !llvm::is_contained(*kinds, AxisKind::Opaque) &&
+            isZeroIdentity(
+                result->components[getOpaqueContributionComponent(rank)]
+                    .identity)) {
+          for (unsigned axis = 0; axis < rank; ++axis) {
+            if (sourceType.getShape()[axis] == 1 &&
+                resultType.getShape()[axis] != 1) {
+              result->components[getStrideComponent(axis)].identity =
+                  ComponentIdentity::zero(getStrideComponent(axis));
+            }
+          }
+          Type scalarType =
+              result->components[getUniformOffsetComponent(rank)].type;
+          auto resultOffsetsType = RankedTensorType::get(
+              resultType.getShape(), scalarType, resultType.getEncoding());
+          result->components[getOpaqueContributionComponent(rank)] = {
+              resultOffsetsType,
+              ComponentIdentity::zero(getOpaqueContributionComponent(rank))};
+          result->originalType = value.getType();
+          result->attributes[kAxisKindsAttribute] =
+              getAxisKindsAttr(value.getContext(), *kinds);
+          return *result;
+        }
+      }
+    }
+
     if (auto addPtr = value.getDefiningOp<triton::AddPtrOp>()) {
       FailureOr<AnalyzedValue> result = context.analyzeValue(addPtr.getPtr());
       FailureOr<AnalyzedTensorOffset> delta =
@@ -1907,6 +2040,52 @@ public:
     }
 
     value = context.remap(value);
+    if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
+      FailureOr<DecomposedValue> result =
+          decompose(broadcast.getSrc(), context, builder, loc);
+      if (succeeded(result) && hasValidLayout(*result) &&
+          hasScalarBase(*result) &&
+          isCompatiblePointerBroadcast(broadcast.getSrc().getType(),
+                                       value.getType())) {
+        FailureOr<SmallVector<AxisKind>> kinds = getAxisKinds(*result);
+        auto sourceType = cast<RankedTensorType>(broadcast.getSrc().getType());
+        auto resultType = cast<RankedTensorType>(value.getType());
+        unsigned rank = resultType.getRank();
+        if (succeeded(kinds) && !llvm::is_contained(*kinds, AxisKind::Opaque) &&
+            isConstantZero(
+                result->components[getOpaqueContributionComponent(rank)])) {
+          OpBuilder::InsertionGuard guard(builder);
+          builder.setInsertionPoint(broadcast);
+          for (unsigned axis = 0; axis < rank; ++axis) {
+            if (sourceType.getShape()[axis] == 1 &&
+                resultType.getShape()[axis] != 1) {
+              Type strideType =
+                  result->components[getStrideComponent(axis)].getType();
+              result->components[getStrideComponent(axis)] =
+                  createScalarConstant(builder, broadcast.getLoc(), strideType,
+                                       0);
+              if (!result->components[getStrideComponent(axis)])
+                return failure();
+            }
+          }
+          Type scalarType =
+              result->components[getUniformOffsetComponent(rank)].getType();
+          auto resultOffsetsType = RankedTensorType::get(
+              resultType.getShape(), scalarType, resultType.getEncoding());
+          Value zeroOffsets =
+              createZeroOffsets(builder, broadcast.getLoc(), resultOffsetsType);
+          if (!zeroOffsets)
+            return failure();
+          result->components[getOpaqueContributionComponent(rank)] =
+              zeroOffsets;
+          result->originalType = value.getType();
+          result->attributes[kAxisKindsAttribute] =
+              getAxisKindsAttr(value.getContext(), *kinds);
+          return *result;
+        }
+      }
+    }
+
     if (auto addPtr = value.getDefiningOp<triton::AddPtrOp>()) {
       FailureOr<DecomposedValue> result =
           decompose(addPtr.getPtr(), context, builder, loc);

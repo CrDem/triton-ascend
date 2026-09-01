@@ -56,6 +56,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#include "DynamicCVPipeline/Common/FallbackHelper.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -298,6 +299,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   }
 
   ModuleOp moduleBackup(moduleOp->clone());
+  CVPipeline::FallbackHelper fallback(moduleOp);
+  PassManager pm(&getContext(), moduleOp.getOperationName());
 
   auto buildPipeline = [&](PassManager &pm) {
     // Unroll the main loop once the compute blocks are planned but before the
@@ -627,7 +630,6 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     }
   }
 
-  PassManager pm(&getContext(), moduleOp.getOperationName());
   buildPipeline(pm);
 
   if (failed(runPipeline(pm, moduleOp)) ||
@@ -651,12 +653,12 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     restoreModuleFromBackup(moduleOp, moduleBackup);
     moduleBackup->destroy();
+    fallback.restore();
     moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,
                       builder.getI32IntegerAttr(errCode));
     return;
   }
 
-  moduleBackup->destroy();
   LDBG("Process successfully");
 }
 

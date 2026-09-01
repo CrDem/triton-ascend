@@ -454,7 +454,7 @@ def _make_metadata(*, factor, axis, ceil_div, blacklisted, row_applied):
         target=SimpleNamespace(arch="Ascend910B"),
         workspace_size=0,
         lock_init_value=0,
-        lock_num=0,
+        sync_block_lock_layout=0,
         bs_task_type=0,
         mix_mode="aiv",
         shared=0,
@@ -661,13 +661,25 @@ def test_895_launcher_keeps_mixed_simt_sls_marker_in_both_paths(source_pairs):
         metadata=metadata,
     )
 
-    for baseline_path, target_path in zip(_launcher_paths(baseline_src), _launcher_paths(target_src)):
+    baseline_paths = _launcher_paths(baseline_src)
+    target_paths = _launcher_paths(target_src)
+
+    for baseline_path, target_path in zip(baseline_paths, target_paths):
+        # Baseline keeps the inlined RT launch ABI in each launch path.
         assert baseline_path.count("rtKernelLaunchWithFlagV2") == 1
-        assert target_path.count("aclrtLaunchKernelWithHostArgs") == 1
         assert baseline_path.count("rtArgsEx_t argsInfo") == 1
-        assert target_path.count("aclrtLaunchKernelAttr attrInfo") == 1
         assert "cfgInfo.localMemorySize = 221184;" in baseline_path
-        assert "value.localMemorySize = 221184;" in target_path
+        # Target routes both paths through the shared shim entry points; the
+        # 221184 literal is carried at the cfg acquisition call site.
+        assert target_path.count("cann_get_launch_kernel_cfg(221184)") == 1
+        assert "cann_launch_kernel(func, blockNum" in target_path
+
+    # The shim lives once in the header (first path) and carries both the
+    # ACL (9.1.0+) and RT (<9.1.0) launch implementations.
+    assert target_src.count("aclrtLaunchKernelWithHostArgs") == 1
+    assert target_src.count("rtKernelLaunchWithFlagV2") == 1
+    assert target_src.count("aclrtLaunchKernelAttr attrInfo") == 1
+    assert target_src.count("rtArgsEx_t argsInfo") == 1
 
 
 def _load_inject_grid_num_tiles(source):

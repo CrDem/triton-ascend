@@ -589,6 +589,20 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
   return success();
 }
 
+static bool isScalarI1ToI8PointerBitcast(Operation *op) {
+  auto bitcast = dyn_cast<triton::BitcastOp>(op);
+  if (!bitcast)
+    return false;
+
+  auto sourceType = dyn_cast<triton::PointerType>(bitcast.getSrc().getType());
+  auto resultType = dyn_cast<triton::PointerType>(bitcast.getType());
+  if (!sourceType || !resultType)
+    return false;
+
+  return sourceType.getPointeeType().isInteger(1) &&
+         resultType.getPointeeType().isInteger(8);
+}
+
 MetaUseEraser::MetaUseEraser(MLIRContext *context)
     : RewritePattern(MatchAnyOpTypeTag(), /*benefit=*/10, context) {}
 
@@ -605,6 +619,9 @@ LogicalResult MetaUseEraser::matchAndRewrite(Operation *op,
     return rewriter.notifyMatchFailure(op,
                                        "AddPtrOp will be handled separately");
   }
+  if (isScalarI1ToI8PointerBitcast(op))
+    return rewriter.notifyMatchFailure(
+        op, "scalar i1-to-i8 pointer bitcast requires conversion");
   if (isMetaUse(op)) {
     rewriter.eraseOp(op);
     return success();
