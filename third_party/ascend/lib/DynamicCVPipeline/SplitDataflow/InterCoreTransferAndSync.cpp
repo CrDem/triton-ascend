@@ -1775,7 +1775,16 @@ LogicalResult InterCoreTransferAndSyncPass::handleMemoryDependency(
   // which is exactly what the four signals need to bracket. Upstream narrows
   // the producer side this way already, but only when the block ids were left
   // untouched -- a condition the requirement does not depend on.
-  if (hasMemDepSyncWhitelistKernel(module)) {
+  //
+  // Only narrow when a main loop was found, which is the same thing as saying
+  // that both ends sit in one loop body. Otherwise they are at different
+  // nesting depths, and the block boundary is the *right* anchor: the gather in
+  // sparse_flash_attention_prefill_kernel writes its buffer from inside a
+  // 1024-iteration loop and CUBE reads it once per tile, so the write to
+  // announce is the whole loop, not one of its iterations. Narrowing that one
+  // to dep.predOp moves the signal inside the loop and raises it from one set
+  // per tile to 1024 against a single wait.
+  if (mainLoopOp) {
     prodStart = dep.predOp;
     prodEnd = dep.predOp;
     consStart = dep.nextOp;
