@@ -1039,6 +1039,15 @@ bool hasMemDepSyncWhitelistKernel(ModuleOp module) {
   std::vector<std::string> whitelist{
       "_hstu_attn_fwd",
       "parallel_path_fwd_kernel",
+      // Same failure as the two above: the softmax result travels VECTOR->CUBE
+      // through a workspace buffer, both ends land inside the software-
+      // pipelined loop, and without the guard below the producer of iteration
+      // i+1 overwrites what the consumer of iteration i is still reading. The
+      // whole list wants to go away -- the guard is correct for any
+      // buffer-carried dependency -- but it is widened one kernel at a time
+      // because a mistake here hangs the device rather than returning a wrong
+      // number.
+      "sparse_flash_attention_prefill_kernel",
   };
 
   // Check if any func name matches the whitelist
@@ -1052,7 +1061,7 @@ bool hasMemDepSyncWhitelistKernel(ModuleOp module) {
   return hasWhitelistedKernel;
 }
 
-void InterCoreTransferAndSyncPass::insertMemDepSync(
+bool InterCoreTransferAndSyncPass::insertMemDepSync(
     OpBuilder &builder, Operation *producerStartOp, Operation *producerEndOp,
     Operation *consumerStartOp, Operation *consumerEndOp, int flag,
     Location loc, bool isCubeToVector, FlagIdReuseManager &flagIdReuseManager) {
@@ -1102,7 +1111,30 @@ void InterCoreTransferAndSyncPass::insertMemDepSync(
   attachAnalyzeFlagIdTag(setOp);
   attachAnalyzeFlagIdTag(waitOp);
   flagIdReuseManager.insertRelationBetweenSetAndWait(setOp, waitOp);
-  if (hasMemDepSyncWhitelistKernel(module)) {
+  // The forward signal above is all a buffer-carried dependency gets by
+  // default, and it is only enough while producer and consumer stay in
+  // lockstep. Once AddControlFlowCondition puts them in different pipeline
+  // stages, the producer of iteration i+1 can overwrite the buffer the
+  // consumer of iteration i is still reading -- a write-after-read race, with
+  // no second flag to catch it and no rotation, because the buffer belongs to
+  // the kernel rather than to this pass.
+  //
+  // The guard below closes it the same way insertInterCoreSync does for value
+  // transfers: a credit before the loop, "buffer free" back from the consumer,
+  // a wait before the producer, and a drain after the loop. One credit, so the
+  // producer may run at most one iteration ahead -- correct, but not
+  // overlapped; overlap would additionally need the buffer rotated.
+  bool guarded = false;
+  // findMainLoopforTransfer sets the module-wide fallback attribute when its
+  // two arguments do not share a parent block, which for a memory dependency
+  // is an ordinary situation rather than an error: the producer can sit in a
+  // sibling loop of the consumer. Ask only when the question is well posed.
+  // Such a dependency also needs no guard, since the two ends are not both
+  // inside one loop body and so cannot be split across its iterations.
+  const bool sameParent = producerEndOp && consumerStartOp &&
+                          producerEndOp->getParentOp() ==
+                              consumerStartOp->getParentOp();
+  if (hasMemDepSyncWhitelistKernel(module) && sameParent) {
     Operation *mainLoopOp =
         findMainLoopforTransfer(producerEndOp, consumerStartOp);
     if (mainLoopOp) {
@@ -1135,10 +1167,12 @@ void InterCoreTransferAndSyncPass::insertMemDepSync(
                                                          waitOpForWrite);
       flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart,
                                                          waitOpForEnd);
+      guarded = true;
     }
   }
   LOG_DEBUG("[PIPE_MTE2 setOp]: " << *setOp << "\n");
   LOG_DEBUG("[PIPE_MTE2 waitOp]: " << *waitOp << "\n");
+  return guarded;
 }
 
 namespace {
@@ -1731,8 +1765,17 @@ LogicalResult InterCoreTransferAndSyncPass::handleMemoryDependency(
     prodStart = dep.predOp;
   }
 
-  insertMemDepSync(builder, prodStart, prodEnd, consStart, consEnd, flagId, loc,
-                   isCubeToVector, flagIdReuseManager);
+  const bool guarded =
+      insertMemDepSync(builder, prodStart, prodEnd, consStart, consEnd, flagId,
+                       loc, isCubeToVector, flagIdReuseManager);
+  if (guarded) {
+    // Record it on the two ends, next to the crossCoreDeps that identify them,
+    // so AnalyzeScope can tell a guarded dependency from an unguarded one when
+    // it decides whether the enclosing loop may be pipelined.
+    auto guardedAttr = UnitAttr::get(builder.getContext());
+    dep.predOp->setAttr(CVPipeline::kMemDepGuarded, guardedAttr);
+    dep.nextOp->setAttr(CVPipeline::kMemDepGuarded, guardedAttr);
+  }
 
   transferIndex++;
 

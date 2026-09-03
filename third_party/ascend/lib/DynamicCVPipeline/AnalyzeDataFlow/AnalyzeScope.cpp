@@ -280,8 +280,18 @@ struct GroupRoles {
   //     they do not.
   bool viaTransfer = false;
   bool viaMemDep = false;
+  // Set when insertMemDepSync did build the write-after-read guard for this
+  // buffer-carried group (ssbuffer.mem_dep_guarded), which makes it as safe to
+  // split across stages as a transfer -- correct, though still unrotated and
+  // therefore not overlapped.
+  bool memDepGuarded = false;
 
   bool isComplete() const { return hasProducer && hasConsumer; }
+  /// A complete buffer-carried group that never got its back-signal. Splitting
+  /// this one across pipeline stages is a write-after-read race.
+  bool isUnguardedMemDep() const {
+    return isComplete() && viaMemDep && !viaTransfer && !memDepGuarded;
+  }
 };
 
 /// main_loop id -> exchange group -> roles seen inside that id's loops.
@@ -322,6 +332,9 @@ static LedgerByMainLoop collectLedgerByMainLoop(ModuleOp module) {
       if (op->hasAttr(CVPipeline::kMemCrossDeps)) {
         roles.viaMemDep = true;
       }
+      if (op->hasAttr(CVPipeline::kMemDepGuarded)) {
+        roles.memDepGuarded = true;
+      }
       if (roleAttr.getInt() == CVPipeline::crossCoreProducerId) {
         roles.hasProducer = true;
         if (std::optional<bool> onVector = runsOnVectorCore(op)) {
@@ -361,7 +374,7 @@ judgeMainLoop(const llvm::DenseMap<int, GroupRoles> &groups) {
     if (roles.viaTransfer) {
       verdict.worthwhile = true;
     }
-    if (roles.viaMemDep && !roles.viaTransfer) {
+    if (roles.isUnguardedMemDep()) {
       verdict.safe = false;
     }
   }
@@ -393,8 +406,10 @@ judgeMainLoop(const llvm::DenseMap<int, GroupRoles> &groups) {
 ///
 /// So the two questions are asked separately: is there a transfer-carried
 /// handoff to overlap, and is there a buffer-carried one that would be torn
-/// apart. Once insertMemDepSync emits the back-signal that insertInterCoreSync
-/// already does, the safety half of this can go away.
+/// apart. The second only counts the *unguarded* ones -- insertMemDepSync does
+/// build the same back-signal insertInterCoreSync builds, and marks what it
+/// guarded with ssbuffer.mem_dep_guarded -- so this half shrinks as that guard
+/// is enabled for more kernels, and disappears when it is unconditional.
 static bool noMainLoopCanBePipelined(ModuleOp module) {
   LedgerByMainLoop ledger = collectLedgerByMainLoop(module);
 
@@ -658,8 +673,12 @@ static void reportMainLoopFacts(ModuleOp module) {
                            : (roles.producerIsVector ? llvm::StringRef("V->C")
                                                      : llvm::StringRef("C->V")))
                    << " via="
-                   << (roles.viaTransfer ? "transfer"
-                                         : (roles.viaMemDep ? "memdep" : "?"))
+                   << (roles.viaTransfer
+                           ? "transfer"
+                           : (roles.viaMemDep
+                                  ? (roles.memDepGuarded ? "memdep(guarded)"
+                                                         : "memdep(UNGUARDED)")
+                                  : "?"))
                    << (roles.isComplete() ? "  [complete handoff]"
                                           : "  [INCOMPLETE]")
                    << "\n";
@@ -678,9 +697,10 @@ static void reportMainLoopFacts(ModuleOp module) {
                  << ", "
                  << (verdict.safe
                          ? "safe"
-                         : "UNSAFE (a buffer-carried handoff would be split"
-                           " across stages; insertMemDepSync emits no"
-                           " back-signal, so that is a write-after-read race)")
+                         : "UNSAFE (an unguarded buffer-carried handoff would"
+                           " be split across stages -- a write-after-read"
+                           " race; insertMemDepSync built no back-signal for"
+                           " it)")
                  << "\n";
     if (verdict.applicable() && !twoWayByCounters) {
       llvm::errs() << "[cv-mainloop]   note: the old op-kind rule would have"

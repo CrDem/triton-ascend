@@ -190,7 +190,11 @@ private:
                            FlagIdReuseManager &flagIdReuseManager,
                            mlir::Operation *consumedDataOp = nullptr,
                            bool isStoreDirectly = false);
-  void insertMemDepSync(mlir::OpBuilder &builder,
+  // Returns true when the write-after-read guard was built as well as the
+  // forward signal, i.e. when this dependency is safe to have its two ends
+  // placed in different software-pipeline stages. See the comment on the
+  // guard in insertMemDepSync.
+  bool insertMemDepSync(mlir::OpBuilder &builder,
                         mlir::Operation *producerStartOp,
                         mlir::Operation *producerEndOp,
                         mlir::Operation *consumerStartOp,

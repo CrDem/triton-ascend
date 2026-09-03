@@ -72,6 +72,20 @@ inline constexpr llvm::StringLiteral kLoopCarriedL0C =
 inline constexpr llvm::StringLiteral kCrossCoreDeps = "ssbuffer.crossCoreDeps";
 inline constexpr llvm::StringLiteral kIntraDeps = "ssbuffer.intraDeps";
 inline constexpr llvm::StringLiteral kMemCrossDeps = "ssbuffer.memCrossDeps";
+/// Set on both ends of a buffer-carried cross-core dependency when
+/// insertMemDepSync managed to build the write-after-read guard around it -- a
+/// credit before the loop, "buffer free" back from the consumer, a wait before
+/// the producer, a drain after the loop -- and not only the forward "data
+/// ready" signal.
+///
+/// Without it such a dependency cannot survive having its two ends put in
+/// different software-pipeline stages: the buffer belongs to the kernel, so
+/// nothing rotates it, and the producer of iteration i+1 would overwrite what
+/// the consumer of iteration i is still reading. AnalyzeScope reads this to
+/// decide whether a main loop is safe to pipeline at all, so anything that
+/// stops emitting the guard has to stop setting this too.
+inline constexpr llvm::StringLiteral kMemDepGuarded =
+    "ssbuffer.mem_dep_guarded";
 /// Block-level dependency edges found by DataDependencyAnalysis, recorded on
 /// the module so they outlive the pass that computed them. An ArrayAttr of
 /// dictionaries {producer, consumer, kind}, where producer and consumer are
