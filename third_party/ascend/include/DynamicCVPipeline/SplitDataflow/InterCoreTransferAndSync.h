@@ -194,11 +194,19 @@ private:
   // forward signal, i.e. when this dependency is safe to have its two ends
   // placed in different software-pipeline stages. See the comment on the
   // guard in insertMemDepSync.
+  // The four insertion points are the writing and reading operations
+  // themselves, not the boundaries of the blocks they sit in: the forward
+  // signal has to be emitted *after* the write and awaited *before* the read,
+  // and a compute block can hold neither end at its edge. `mainLoopOp` is the
+  // loop the guard is built around, or null for no guard; the caller works it
+  // out, because it is the one holding the block boundaries that question is
+  // well posed for.
   bool insertMemDepSync(mlir::OpBuilder &builder,
                         mlir::Operation *producerStartOp,
                         mlir::Operation *producerEndOp,
                         mlir::Operation *consumerStartOp,
-                        mlir::Operation *consumerEndOp, int flag,
+                        mlir::Operation *consumerEndOp,
+                        mlir::Operation *mainLoopOp, int flag,
                         mlir::Location loc, bool isCubeToVector,
                         FlagIdReuseManager &flagIdReuseManager);
   // Match the CUBE -> VECTOR direct-store pattern inside the given SCF op:

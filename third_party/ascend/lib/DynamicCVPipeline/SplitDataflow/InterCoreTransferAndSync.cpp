@@ -1063,8 +1063,9 @@ bool hasMemDepSyncWhitelistKernel(ModuleOp module) {
 
 bool InterCoreTransferAndSyncPass::insertMemDepSync(
     OpBuilder &builder, Operation *producerStartOp, Operation *producerEndOp,
-    Operation *consumerStartOp, Operation *consumerEndOp, int flag,
-    Location loc, bool isCubeToVector, FlagIdReuseManager &flagIdReuseManager) {
+    Operation *consumerStartOp, Operation *consumerEndOp,
+    Operation *mainLoopOp, int flag, Location loc, bool isCubeToVector,
+    FlagIdReuseManager &flagIdReuseManager) {
   LOG_DEBUG("Inserting Memdep sync: "
             << (isCubeToVector ? "CUBE->VECTOR" : "VECTOR->CUBE")
             << ", flag = " << flag << "\n");
@@ -1125,50 +1126,37 @@ bool InterCoreTransferAndSyncPass::insertMemDepSync(
   // producer may run at most one iteration ahead -- correct, but not
   // overlapped; overlap would additionally need the buffer rotated.
   bool guarded = false;
-  // findMainLoopforTransfer sets the module-wide fallback attribute when its
-  // two arguments do not share a parent block, which for a memory dependency
-  // is an ordinary situation rather than an error: the producer can sit in a
-  // sibling loop of the consumer. Ask only when the question is well posed.
-  // Such a dependency also needs no guard, since the two ends are not both
-  // inside one loop body and so cannot be split across its iterations.
-  const bool sameParent = producerEndOp && consumerStartOp &&
-                          producerEndOp->getParentOp() ==
-                              consumerStartOp->getParentOp();
-  if (hasMemDepSyncWhitelistKernel(module) && sameParent) {
-    Operation *mainLoopOp =
-        findMainLoopforTransfer(producerEndOp, consumerStartOp);
-    if (mainLoopOp) {
-      builder.setInsertionPoint(producerStartOp);
-      auto waitOpForWrite = builder.create<SyncBlockWaitOp>(
-          loc, srcCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
-      attachCommonTags(waitOpForWrite, *prodBlockIdOpt, prodCoreType);
+  if (mainLoopOp) {
+    builder.setInsertionPoint(producerStartOp);
+    auto waitOpForWrite = builder.create<SyncBlockWaitOp>(
+        loc, srcCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
+    attachCommonTags(waitOpForWrite, prodBlockIdOpt.value_or(-1), prodCoreType);
 
-      builder.setInsertionPointAfter(consumerEndOp);
-      auto setOpForWrite = builder.create<SyncBlockSetOp>(
-          loc, dstCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
-      attachCommonTags(setOpForWrite, *consBlockIdOpt, consCoreType);
+    builder.setInsertionPointAfter(consumerEndOp);
+    auto setOpForWrite = builder.create<SyncBlockSetOp>(
+        loc, dstCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
+    attachCommonTags(setOpForWrite, consBlockIdOpt.value_or(-1), consCoreType);
 
-      builder.setInsertionPoint(mainLoopOp);
-      auto setOpForStart = builder.create<SyncBlockSetOp>(
-          loc, dstCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
-      builder.setInsertionPointAfter(mainLoopOp);
-      auto waitOpForEnd = builder.create<SyncBlockWaitOp>(
-          loc, srcCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
+    builder.setInsertionPoint(mainLoopOp);
+    auto setOpForStart = builder.create<SyncBlockSetOp>(
+        loc, dstCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
+    builder.setInsertionPointAfter(mainLoopOp);
+    auto waitOpForEnd = builder.create<SyncBlockWaitOp>(
+        loc, srcCoreAttr, dstPipeAttr, srcPipeAttr, flagId);
 
-      int startEndBlockId = CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
-      attachCommonTags(setOpForStart, startEndBlockId, consCoreType);
-      attachCommonTags(waitOpForEnd, startEndBlockId, prodCoreType);
+    int startEndBlockId = CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
+    attachCommonTags(setOpForStart, startEndBlockId, consCoreType);
+    attachCommonTags(waitOpForEnd, startEndBlockId, prodCoreType);
 
-      attachAnalyzeFlagIdTag(waitOpForWrite);
-      attachAnalyzeFlagIdTag(setOpForWrite);
-      attachAnalyzeFlagIdTag(setOpForStart);
-      attachAnalyzeFlagIdTag(waitOpForEnd);
-      flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForWrite,
-                                                         waitOpForWrite);
-      flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart,
-                                                         waitOpForEnd);
-      guarded = true;
-    }
+    attachAnalyzeFlagIdTag(waitOpForWrite);
+    attachAnalyzeFlagIdTag(setOpForWrite);
+    attachAnalyzeFlagIdTag(setOpForStart);
+    attachAnalyzeFlagIdTag(waitOpForEnd);
+    flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForWrite,
+                                                       waitOpForWrite);
+    flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart,
+                                                       waitOpForEnd);
+    guarded = true;
   }
   LOG_DEBUG("[PIPE_MTE2 setOp]: " << *setOp << "\n");
   LOG_DEBUG("[PIPE_MTE2 waitOp]: " << *waitOp << "\n");
@@ -1758,16 +1746,46 @@ LogicalResult InterCoreTransferAndSyncPass::handleMemoryDependency(
 
   // Get location info
   Location loc = prodEnd->getLoc();
-  if (dep.iniProducerBlockId == dep.producerBlockId &&
-      dep.iniConsumerBlockId == dep.consumerBlockId &&
-      hasMemDepSyncWhitelistKernel(module)) {
-    prodEnd = dep.predOp;
+  // Which loop, if any, the write-after-read guard is built around. Asked of
+  // the *block boundaries*, because findMainLoopforTransfer sets the
+  // module-wide fallback attribute when its two arguments do not share a
+  // parent block -- for a memory dependency that is an ordinary situation
+  // rather than an error, since the producer can sit in a sibling loop of the
+  // consumer, so the question is only put when it is well posed. Such a
+  // dependency needs no guard either: its two ends are not both inside one
+  // loop body and so cannot be split across its iterations.
+  Operation *mainLoopOp = nullptr;
+  if (hasMemDepSyncWhitelistKernel(module) && prodEnd && consStart &&
+      prodEnd->getParentOp() == consStart->getParentOp()) {
+    mainLoopOp = findMainLoopforTransfer(prodEnd, consStart);
+  }
+
+  // Anchor the synchronisation on the operations that actually touch the
+  // buffer, not on the boundaries of the compute blocks holding them.
+  //
+  // "Data ready" means *after the write* and "wait" means *before the read*;
+  // a block boundary satisfies neither in general, because block ids get
+  // remapped (UBUsageOpt, MergeSmallBlock and friends) and the write can end
+  // up in a different block from the one the dependency named. Observed on
+  // sparse_flash_attention_prefill_kernel: the forward set landed *before* the
+  // materialize_in_destination it was supposed to announce, so CUBE was told
+  // the scores were ready and copied the previous iteration's values.
+  //
+  // dep.predOp and dep.nextOp are the writer and the reader by construction,
+  // which is exactly what the four signals need to bracket. Upstream narrows
+  // the producer side this way already, but only when the block ids were left
+  // untouched -- a condition the requirement does not depend on.
+  if (hasMemDepSyncWhitelistKernel(module)) {
     prodStart = dep.predOp;
+    prodEnd = dep.predOp;
+    consStart = dep.nextOp;
+    consEnd = dep.nextOp;
   }
 
   const bool guarded =
-      insertMemDepSync(builder, prodStart, prodEnd, consStart, consEnd, flagId,
-                       loc, isCubeToVector, flagIdReuseManager);
+      insertMemDepSync(builder, prodStart, prodEnd, consStart, consEnd,
+                       mainLoopOp, flagId, loc, isCubeToVector,
+                       flagIdReuseManager);
   if (guarded) {
     // Record it on the two ends, next to the crossCoreDeps that identify them,
     // so AnalyzeScope can tell a guarded dependency from an unguarded one when
