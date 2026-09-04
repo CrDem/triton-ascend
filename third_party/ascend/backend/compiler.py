@@ -170,7 +170,9 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_inliner(pm)
     # passes.ttir.add_rewrite_tensor_pointer(pm)
     passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
-    passes.ttir.add_combine(pm)
+    diasbaled_opt = os.environ.get('VDV_DISABLE_ADD_COMBINE', '0').lower() in ('1', 'true', 'yes')
+    if not diasbaled_opt:
+        passes.ttir.add_combine(pm)
     passes.common.add_canonicalizer(pm)
     passes.ttir.add_reorder_broadcast(pm)
     passes.common.add_cse(pm)
