@@ -980,6 +980,16 @@ bool HardwareConfig::parseJSON(const llvm::json::Value &json,
       scalarCyclesPerInstruction = *v >= 0 ? static_cast<int>(*v) : 0;
   }
 
+  // What a pipeline fill/drain iteration costs relative to a full one.
+  // Optional; the default is the ramp's own geometry (see the header), so a
+  // profile that says nothing still charges the ramp. Clamped to [0, 1]: below
+  // zero is meaningless and above one would make the ramp cost more than the
+  // steady state it is ramping into.
+  if (const auto *pipeline = root->getObject("software_pipeline")) {
+    if (auto v = pipeline->getNumber("prologue_work_fraction"))
+      prologueWorkFraction = std::min(1.0, std::max(0.0, *v));
+  }
+
   return true;
 }
 

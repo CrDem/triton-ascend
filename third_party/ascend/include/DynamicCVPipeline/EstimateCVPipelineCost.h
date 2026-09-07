@@ -113,28 +113,45 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
 /// that actually do work (i64): the rewritten bound minus the trip count, taken
 /// over every loop and maximised.
 ///
-/// A proxy for how many stages the pipeline was cut into, and the third thing
-/// a finer block partition buys its overlap with. The other two -- barriers and
-/// Unified Buffer -- have their own limits; this one shows up as the binary
-/// compiler refusing a module for reading a buffer before its first write,
-/// which is a prologue in which the stage that fills that buffer has not run
-/// yet. Measured: the untouched pipeline stretches by 2 iterations, and every
-/// candidate refused for that reason stretched by more than 130.
+/// Diagnostic only, and it mixes two causes that behave oppositely -- see the
+/// two attributes below, which separate them. Kept because it is the one number
+/// directly comparable with the loop bound a reader sees in the IR.
 inline constexpr llvm::StringLiteral kCVPipelineCostLoopExtension =
     "ascend.cv_pipeline_cost_loop_extension";
 
-/// How many stages deep software pipelining cut the deepest loop (i64): the
+/// The buffer rescaling factor software pipelining applied (i64): the
 /// requiredBuffers field of ssbuffer.iter_extension, maximised over loops.
 ///
-/// The same fact as the extension above, but as the integer the pipeline
-/// actually decided rather than as the iterations it turned into. That makes it
-/// the one to compare: depth is a small count that either grew or did not,
-/// where the extension is a number of iterations that scales with the trip
-/// count and would need a threshold per kernel. Measured: the untouched
-/// pipeline runs at depth 1 and every candidate the binary compiler refused for
-/// reading a buffer before its first write had gone to 2.
+/// NOT the stage count, despite the name this attribute has carried since it
+/// was introduced -- the stage count is the attribute below. requiredBuffers is
+/// how many buffers a producer/consumer pair separated by stages needs, and the
+/// bound is multiplied by it so the same work is spread over proportionally
+/// more iterations. Work is conserved across that rescaling, which is
+/// measurable: two configurations differing only in this factor, with ramps of
+/// 68 and 4 iterations, run within 2.4% of each other.
+///
+/// What it is good for is predicting a compile failure. The binary compiler
+/// refuses a module for reading a buffer before its first write when the
+/// prologue outruns the buffers backing it, and measured, the untouched
+/// pipeline runs at 1 while every candidate refused for that reason had gone
+/// to 2. That is why a search guards on it: guards are for modules that will
+/// not build.
 inline constexpr llvm::StringLiteral kCVPipelineCostPipelineDepth =
     "ascend.cv_pipeline_cost_pipeline_depth";
+
+/// How many predicated stages the deepest loop's software pipeline has (i64):
+/// the ifCount field of ssbuffer.iter_extension, maximised over loops.
+///
+/// This is the real depth, and unlike the factor above it is a cost rather than
+/// a correctness limit: a pipeline of N stages spends N iterations filling and
+/// draining, and those iterations run. The estimate charges them at the
+/// profile's prologue fraction, so nothing here needs a guard -- a variant that
+/// buys short dependency chains by adding stages now pays for them in its own
+/// score. Published for diagnosis, because when a variant is expensive this is
+/// usually why. Measured on flash attention: the untouched pipeline has 3, and
+/// a search that could not see this cost picked one with 138.
+inline constexpr llvm::StringLiteral kCVPipelineCostPipelineStages =
+    "ascend.cv_pipeline_cost_pipeline_stages";
 
 /// Unified Buffer the hardware profile says the part has, in bytes (i64).
 ///
