@@ -41,6 +41,7 @@ namespace CVPipeline {
 
 inline constexpr llvm::StringLiteral kCoreType = "ssbuffer.core_type";
 inline constexpr llvm::StringLiteral kBlockId = "ssbuffer.block_id";
+inline constexpr llvm::StringLiteral kExternalSync = "ssbuffer.external_sync";
 inline constexpr llvm::StringLiteral kTransferId = "ssbuffer.transfer_id";
 inline constexpr llvm::StringLiteral kCubeFirst = "ssbuffer.cube_first";
 inline constexpr llvm::StringLiteral kVectorFirst = "ssbuffer.vector_first";
@@ -96,6 +97,7 @@ inline constexpr llvm::StringLiteral kIterExtension =
 /// path, which is what an ordinary compilation takes.
 inline constexpr llvm::StringLiteral kReorderSeed = "ssbuffer.reorder_seed";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
+inline constexpr llvm::StringLiteral kMayNotExecNPU = "may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kForMayNotExec =
     "ssbuffer.for_may_not_exec";
@@ -115,6 +117,9 @@ inline constexpr llvm::StringLiteral kTightlyCoupledBufferAttr =
 inline constexpr llvm::StringLiteral kCoreTypeCube = "CUBE";
 inline constexpr llvm::StringLiteral kCoreTypeVector = "VECTOR";
 inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
+inline constexpr llvm::StringLiteral kSubBlock = "ssbuffer.subBlock";
+inline constexpr llvm::StringLiteral kMergeComputeBlockApplied =
+    "ssbuffer.merge_compute_block_applied";
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
@@ -159,6 +164,8 @@ bool hasFallbackAttr(ModuleOp module);
 bool isScfOp(Operation *op);
 bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
                        const CVPipeline::MemoryDependenceGraph &memGraph);
+bool isSyncOp(Operation *op);
+bool isExternalSyncOp(Operation *op);
 
 // Wrapper around a "main loop" — either scf.for or scf.while carrying the
 // ssbuffer.main_loop attribute. Lets downstream code treat both uniformly.
@@ -199,10 +206,6 @@ inline bool isMainLoopOp(Operation *op) {
 }
 
 CoreType getCoreTypeOfSimpleOpOrCf(Operation *op);
-
-inline bool isCubeSimpleOpOrCf(Operation *op) {
-  return getCoreTypeOfSimpleOpOrCf(op) == CoreType::CUBE_ONLY;
-}
 
 inline bool isVectorSimpleOpOrCf(Operation *op) {
   return getCoreTypeOfSimpleOpOrCf(op) == CoreType::VECTOR_ONLY;

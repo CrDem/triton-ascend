@@ -27,12 +27,13 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import warnings
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from .debug_line_rewriter import rewrite_debug_line
 
 from triton._C.libtriton import ir, passes, ascend, buffer_ir
@@ -159,6 +160,308 @@ def _with_debug_line(npubin_stage, options):
         return rewrite_debug_line(artifact, metadata=metadata, options=options)
 
     return stage
+
+
+# ==============================================================================
+# Variant Search Helper: Reproduces C++ AddDynamicCVPipeline in Python
+# ==============================================================================
+
+_K_TIE_RELATIVE_DENOMINATOR = 10000
+
+
+def _totals_are_tied(a: int, b: int) -> bool:
+    diff = abs(a - b)
+    scale = max(a, b)
+    return diff * _K_TIE_RELATIVE_DENOMINATOR <= scale
+
+
+def _get_env_int(var_name: str) -> Optional[int]:
+    val = os.environ.get(var_name)
+    if val is None:
+        return None
+    try:
+        res = int(val)
+        return res if res >= 0 else None
+    except ValueError:
+        return None
+
+
+def _parse_cv_pipeline_output(log_text: str, mlir_text: str) -> Dict[str, Any]:
+    metrics = {
+        "cost": None,
+        "resource": None,
+        "recurrence": None,
+        "ub_bytes": 0,
+        "ub_capacity": 0,
+        "depth": 1,
+        "has_fallback": False,
+        "err_code": 0,
+    }
+
+    if mlir_text:
+        if "triton_ascend.cv_pipeline.fallback" in mlir_text:
+            metrics["has_fallback"] = True
+
+        m_rc = re.search(r'triton_ascend\.dynamic_cv_pipeline\.rc\s*=\s*(-?\d+)', mlir_text)
+        if m_rc:
+            metrics["err_code"] = int(m_rc.group(1))
+            if metrics["err_code"] > 0:
+                metrics["has_fallback"] = True
+
+        m_cost = re.search(r'triton_ascend\.cv_pipeline\.estimated_cycles\s*=\s*(\d+)', mlir_text)
+        if m_cost:
+            metrics["cost"] = int(m_cost.group(1))
+
+        m_res = re.search(r'triton_ascend\.cv_pipeline\.cost_resource\s*=\s*(\d+)', mlir_text)
+        if m_res:
+            metrics["resource"] = int(m_res.group(1))
+
+        m_rec = re.search(r'triton_ascend\.cv_pipeline\.cost_recurrence\s*=\s*(\d+)', mlir_text)
+        if m_rec:
+            metrics["recurrence"] = int(m_rec.group(1))
+
+        m_ub = re.search(r'triton_ascend\.cv_pipeline\.cost_ub_peak\s*=\s*(\d+)', mlir_text)
+        if m_ub:
+            metrics["ub_bytes"] = int(m_ub.group(1))
+
+        m_cap = re.search(r'triton_ascend\.cv_pipeline\.cost_ub_capacity\s*=\s*(\d+)', mlir_text)
+        if m_cap:
+            metrics["ub_capacity"] = int(m_cap.group(1))
+
+        m_depth = re.search(r'triton_ascend\.cv_pipeline\.cost_pipeline_depth\s*=\s*(\d+)', mlir_text)
+        if m_depth:
+            metrics["depth"] = int(m_depth.group(1))
+
+    if log_text:
+        if "DynamicCVPipeline failed errCode=" in log_text:
+            m_err = re.search(r"DynamicCVPipeline failed errCode=(-?\d+)", log_text)
+            if m_err:
+                metrics["err_code"] = int(m_err.group(1))
+                metrics["has_fallback"] = True
+
+        if metrics["cost"] is None:
+            m_tot = re.search(r"TOTAL\s+(\d+)\s+cycles", log_text)
+            if m_tot:
+                metrics["cost"] = int(m_tot.group(1))
+            else:
+                m_est = re.search(r"\[estimate-cv-pipeline-cost\].*?:\s*(\d+)\s+cycles", log_text)
+                if m_est:
+                    metrics["cost"] = int(m_est.group(1))
+
+        if metrics["resource"] is None:
+            m_res = re.search(r"resource bound:\s*busiest pipe\s+(\d+)\s+cycles", log_text)
+            if m_res:
+                metrics["resource"] = int(m_res.group(1))
+
+        if metrics["recurrence"] is None:
+            m_rec = re.search(r"recurrence bound:\s*buffer reuse\s+(\d+)\s+cycles", log_text)
+            if m_rec:
+                metrics["recurrence"] = int(m_rec.group(1))
+
+        if metrics["ub_bytes"] == 0:
+            m_ub = re.search(r"unified buffer:.*?(\d+)\s+bytes live at the peak", log_text)
+            if m_ub:
+                metrics["ub_bytes"] = int(m_ub.group(1))
+
+        if metrics["ub_capacity"] == 0:
+            m_cap = re.search(r"capacity of\s+(\d+)", log_text)
+            if m_cap:
+                metrics["ub_capacity"] = int(m_cap.group(1))
+
+    return metrics
+
+
+def _run_dynamic_cv_variant_search(src_path: str, pipeline_str: str, variant_count: int,
+                                   metadata: dict) -> Optional[int]:
+    triton_opt = _get_triton_opt_path()
+    if not os.path.isfile(triton_opt) or not os.access(triton_opt, os.X_OK):
+        print(f"[AddDynamicCVPipeline] triton-opt not found at {triton_opt}; skipping variant search.")
+        return None
+
+    log_dir = os.environ.get("TRITON_ASCEND_CV_LOG_DIR")
+    if not log_dir:
+        hash_prefix = metadata.get("hash", "cv_search")[:8]
+        log_dir = os.path.join(tempfile.gettempdir(), f"triton_cv_logs_{hash_prefix}")
+    os.makedirs(log_dir, exist_ok=True)
+
+    print(f"[AddDynamicCVPipeline] variant search: trying {variant_count} operation orderings")
+    sys.stdout.flush()
+
+    ub_slack = _get_env_int("TRITON_ASCEND_CV_UB_SLACK_BYTES")
+    stage_slack = _get_env_int("TRITON_ASCEND_CV_STAGE_SLACK")
+    stage_slack_val = stage_slack if stage_slack is not None else 0
+
+    # Default timeout: 30 seconds per seed. Can be overridden by TRITON_ASCEND_CV_SEED_TIMEOUT.
+    seed_timeout = _get_env_int("TRITON_ASCEND_CV_SEED_TIMEOUT") or 30
+
+    best_seed = -1
+    best_cost = 0
+    best_second = 0
+    worst_cost = 0
+    usable = 0
+    tie_breaks = 0
+    tied_candidates = 0
+    distinct_costs = set()
+    ranked: List[Tuple[int, int, int, int]] = []
+    failures: Dict[int, int] = {}
+
+    baseline_ub_peak: Optional[int] = None
+    baseline_depth: Optional[int] = None
+    ub_allowance = 0
+
+    with tempfile.TemporaryDirectory() as trial_tmpdir:
+        for seed in range(variant_count):
+            log_file = os.path.join(log_dir, f"seed_{seed}.log")
+            trial_out = os.path.join(trial_tmpdir, f"out_seed_{seed}.mlir")
+
+            cmd = [
+                triton_opt,
+                src_path,
+                f"--pass-pipeline={pipeline_str}",
+                "--mlir-print-debuginfo",
+                "-o",
+                trial_out,
+            ]
+
+            trial_env = os.environ.copy()
+            trial_env["TRITON_ASCEND_CV_VARIANTS"] = "1"
+            trial_env["TRITON_ASCEND_REORDER_SEED"] = str(seed)
+            trial_env["TRITON_ASCEND_CV_COST_VERBOSE"] = "2"
+
+            timed_out = False
+            with open(log_file, "w", encoding="utf-8") as lf:
+                try:
+                    ret = subprocess.run(cmd, env=trial_env, stdout=lf, stderr=subprocess.STDOUT, timeout=seed_timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    lf.write(f"\n[AddDynamicCVPipeline] ERROR: Seed {seed} timed out after {seed_timeout} seconds.\n")
+                    lf.flush()
+
+            if timed_out:
+                print(f"[AddDynamicCVPipeline]   seed {seed}: TIMED OUT (hung for >{seed_timeout}s, skipping)")
+                sys.stdout.flush()
+                failures[-5] = failures.get(-5, 0) + 1
+                continue
+
+            log_text = Path(log_file).read_text(encoding="utf-8", errors="replace")
+            mlir_text = Path(trial_out).read_text(encoding="utf-8", errors="replace") if os.path.exists(trial_out) else ""
+
+            metrics = _parse_cv_pipeline_output(log_text, mlir_text)
+            err_code = 0
+            accepted = True
+
+            if ret.returncode != 0 or metrics["has_fallback"] or metrics["cost"] is None:
+                accepted = False
+                err_code = metrics["err_code"] if metrics["err_code"] != 0 else (-1 if ret.returncode != 0 else -2)
+            else:
+                cost = metrics["cost"]
+                res = metrics["resource"]
+                rec = metrics["recurrence"]
+                second = min(res, rec) if (res is not None and rec is not None) else cost
+                ub_bytes = metrics["ub_bytes"]
+                ub_capacity = metrics["ub_capacity"]
+                depth = metrics["depth"]
+
+                if baseline_ub_peak is not None and ub_bytes > (baseline_ub_peak + ub_allowance):
+                    accepted = False
+                    err_code = -3
+
+                if accepted and baseline_depth is not None and depth > (baseline_depth + stage_slack_val):
+                    accepted = False
+                    err_code = -4
+
+            if not accepted:
+                failures[err_code] = failures.get(err_code, 0) + 1
+                continue
+
+            usable += 1
+            if seed == 0:
+                baseline_ub_peak = ub_bytes
+                baseline_depth = depth
+                ub_allowance = ub_slack if ub_slack is not None else max(0, ub_capacity - ub_bytes)
+                print(f"[AddDynamicCVPipeline]   baseline: {ub_bytes} bytes of unified buffer live against a "
+                      f"capacity of {ub_capacity}, pipeline depth {depth}; candidates may spend "
+                      f"{ub_allowance} more byte(s) and {stage_slack_val} more stage(s)")
+                sys.stdout.flush()
+
+            distinct_costs.add((cost, second))
+            ranked.append((cost, second, ub_bytes, seed))
+            if cost > worst_cost:
+                worst_cost = cost
+
+            improves = (best_seed < 0)
+            by_tie_break = False
+            if not improves:
+                if _totals_are_tied(cost, best_cost):
+                    tied_candidates += 1
+                    improves = (second < best_second)
+                    by_tie_break = improves
+                else:
+                    improves = (cost < best_cost)
+
+            if improves:
+                best_seed = seed
+                best_cost = cost
+                best_second = second
+                if by_tie_break:
+                    tie_breaks += 1
+                print(f"[AddDynamicCVPipeline]   seed {seed}: {cost} cycles", end="")
+                if by_tie_break:
+                    print(f" (tied on the total; won on the other bound at {second})", end="")
+                print(" (best so far)")
+                sys.stdout.flush()
+
+    print(f"[AddDynamicCVPipeline] variant search: {usable} of {variant_count} ordering(s) compiled", end="")
+    if best_seed >= 0:
+        print(f", keeping seed {best_seed} at {best_cost} cycles")
+        print(f"[AddDynamicCVPipeline]   {len(distinct_costs)} distinct estimate(s), worst {worst_cost} cycles; "
+              f"seed 0 is the untouched pipeline")
+        if tied_candidates > 0:
+            print(f"[AddDynamicCVPipeline]   {tied_candidates} candidate(s) tied with the best on the total, "
+                  f"{tie_breaks} of which won on the second bound", end="")
+            if tie_breaks == 0:
+                print(" -- so the ties were real and none of them had more room than the incumbent, which is what "
+                      "to expect when the best candidate already has the shortest dependency chain", end="")
+            print()
+
+        ranked.sort()
+        print("[AddDynamicCVPipeline]   best distinct score(s), in case the winner is refused downstream:", end="")
+        shown = 0
+        prev_pair = None
+        for r_cost, r_second, r_ub, r_seed in ranked:
+            if shown >= 5:
+                break
+            if prev_pair == (r_cost, r_second):
+                continue
+            prev_pair = (r_cost, r_second)
+            print(f" {r_seed}({r_cost}/{r_second}/{r_ub}B)", end="")
+            shown += 1
+        print("  [seed(total/second bound/unified buffer)]")
+    else:
+        print(", none usable; compiling without a variant")
+
+    for err, count in failures.items():
+        print(f"[AddDynamicCVPipeline]   rejected {count} with ", end="")
+        if err == -1:
+            print("a pipeline failure and no error code")
+        elif err == -2:
+            print("no estimate produced")
+        elif err == -3:
+            print(f"more than the baseline's {baseline_ub_peak or 0} bytes of unified buffer plus its "
+                  f"{ub_allowance}-byte allowance")
+        elif err == -4:
+            print(f"a deeper software pipeline than the baseline's {baseline_depth or 0} stage(s)")
+        elif err == -5:
+            print(f"a timeout (hung for more than {seed_timeout} seconds)")
+        else:
+            print(f"error code {err}")
+
+    if best_seed < 0:
+        print("[AddDynamicCVPipeline]   reproduce one of them with TRITON_ASCEND_REORDER_SEED=0 and no "
+              "TRITON_ASCEND_CV_VARIANTS to see the failure itself")
+
+    sys.stdout.flush()
+    return best_seed if best_seed >= 0 else None
 
 
 def make_ttir(mod, metadata, opt):
@@ -295,6 +598,25 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             if _val is not None:
                 ascend.passes.ttir.set_buffer_count(mod, _kind, _val)
 
+        # Write TTIR to disk after setting all module attributes so subprocess sees exact state
+        Path(src_path).write_text(str(mod))
+
+        # Check if Python-level variant exploration is requested
+        variant_count = _get_env_int("TRITON_ASCEND_CV_VARIANTS") or 1
+        orig_cv_variants = os.environ.get("TRITON_ASCEND_CV_VARIANTS")
+
+        if variant_count > 1 and metadata.get("enable_dynamic_cv_pipeline"):
+            best_seed = _run_dynamic_cv_variant_search(
+                src_path=src_path,
+                pipeline_str=pm.get_pipeline_str(),
+                variant_count=variant_count,
+                metadata=metadata,
+            )
+            if best_seed is not None:
+                os.environ["TRITON_ASCEND_REORDER_SEED"] = str(best_seed)
+            else:
+                os.environ.pop("TRITON_ASCEND_REORDER_SEED", None)
+
         if opt.debug:
             # Print the equivalent triton-opt command line so the pass
             # pipeline can be reproduced and debugged outside of Python.
@@ -309,7 +631,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             ]
             print(f"[DEBUG] cmd list: {shlex.join(cmd)}")
 
-        pm.run(mod, 'ttir_to_linalg')
+        # Ensure C++ dynamic CV pipeline pass only compiles the selected single seed in this process
+        os.environ["TRITON_ASCEND_CV_VARIANTS"] = "1"
+        try:
+            pm.run(mod, 'ttir_to_linalg')
+        finally:
+            if orig_cv_variants is not None:
+                os.environ["TRITON_ASCEND_CV_VARIANTS"] = orig_cv_variants
+            else:
+                os.environ.pop("TRITON_ASCEND_CV_VARIANTS", None)
+
         _adjust_metadata_by_module_result(mod, metadata, opt, enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
@@ -517,23 +848,6 @@ def get_common_bishengir_compile_options(metadata):
     return [bishengir_target_opt]
 
 
-def _needs_lib_call_no_inline(metadata):
-    """Return whether the target needs the CANN 9.1 hacc.noinline workaround."""
-    arch = metadata['target'].arch
-    return arch.startswith("Ascend950")
-
-
-@functools.lru_cache()
-def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
-    """Check an optional BiShengIR flag instead of assuming toolchain parity."""
-    try:
-        result = subprocess.run([compiler_path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return option in result.stdout
-
-
 def get_auto_bind_sub_block_option(metadata):
     # auto_tile_and_bind_subblock is read from the module.
     # enable_auto_bind_sub_block is set by the user and has a higher priority.
@@ -710,6 +1024,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += \
                 [f"--enable-vf-fusion={enable_vf_fusion}"]
 
+        enable_dynamic_cv_pipeline = metadata["enable_dynamic_cv_pipeline"]
+        if enable_dynamic_cv_pipeline == True:
+            _compile_option_list += [f"--enable-vf-operand-substitution=True"]
+
         enable_flatten = metadata["enable_flatten"]
         if enable_flatten is not None:
             _compile_option_list += \
@@ -747,9 +1065,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
         bisheng_options = metadata["bisheng_options"]
         if bisheng_options is not None:
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
@@ -763,7 +1078,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [f"--enable-vf-merge-level={vf_merge_level}"]
 
         hfusion_enable_multiple_consumer_fusion = metadata["hfusion_enable_multiple_consumer_fusion"]
-        if hfusion_enable_multiple_consumer_fusion:
+        if hfusion_enable_multiple_consumer_fusion is not None:
             _compile_option_list += [
                 f"--hfusion-enable-multiple-consumer-fusion={hfusion_enable_multiple_consumer_fusion}"
             ]
@@ -960,9 +1275,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
 
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
@@ -1119,7 +1431,7 @@ class NPUOptions:
     # with enable_dynamic_cv_pipeline; 1 (default) leaves the loop untouched.
     main_loop_unroll_factor: int = 1
     enable_cube_block_merge: bool = False
-    hfusion_enable_multiple_consumer_fusion: bool = False
+    hfusion_enable_multiple_consumer_fusion: bool = None
     buf_slot_num_of_veccore: int = None
     buf_slot_num_of_crosscore: int = None
     buf_slot_num_of_gm: int = None
