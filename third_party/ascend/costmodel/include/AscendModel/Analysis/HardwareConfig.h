@@ -394,6 +394,28 @@ public:
     return scalarCyclesPerInstruction;
   }
 
+  /// Fraction of a steady-state iteration that one prologue or epilogue
+  /// iteration of a software-pipelined loop costs.
+  ///
+  /// AddControlFlowCondition turns a loop body into a chain of predicated
+  /// stages and extends the bound by one iteration per stage, so the pipeline
+  /// can fill and drain. Those iterations run on the hardware; they simply do
+  /// less than a full one, because during the fill only the leading stages are
+  /// enabled and during the drain only the trailing ones.
+  ///
+  /// The default is a derivation, not a fit. Filling a pipeline of S stages
+  /// takes S-1 iterations in which 1, 2, ... S-1 stages are live, so the mean
+  /// occupancy over the ramp is (S-1)/2S, which tends to one half; draining is
+  /// the mirror image. Half is therefore what the geometry gives for any stage
+  /// count, on any part, without reference to a kernel.
+  ///
+  /// Unlike the fields above this one does NOT default to the old behaviour.
+  /// The old behaviour was to charge nothing, which makes a deeper pipeline
+  /// free and lets a search buy overlap it never pays for: measured on flash
+  /// attention, a variant that grew the ramp from 3 iterations to 138 scored
+  /// 10% better here and ran 70% slower.
+  double getPrologueWorkFraction() const { return prologueWorkFraction; }
+
   // Cube (GEMM) micro-architecture: migrated from tilesim cube_config.
   void getCubeModelThroughput(int elementBits, int &basicM, int &basicK,
                               int &basicN) const;
@@ -462,6 +484,10 @@ private:
   // Cycles per scalar instruction. Zero means "not modelled", which is what
   // every profile says until the number is measured.
   int scalarCyclesPerInstruction = 0;
+  // What one pipeline fill/drain iteration costs relative to a full one. Half
+  // comes from the ramp's geometry rather than from a profile, so a config
+  // that says nothing still charges the ramp.
+  double prologueWorkFraction = 0.5;
 };
 
 //===----------------------------------------------------------------------===//

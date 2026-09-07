@@ -137,6 +137,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -349,6 +350,39 @@ bool isSyncOp(Operation *op) {
   return isa<hivm::SyncBlockSetOp, hivm::SyncBlockWaitOp, hivm::SyncBlockOp,
              hivm::SyncBlockLockOp, hivm::SyncBlockUnlockOp,
              hivm::CreateSyncBlockLockOp>(op);
+}
+
+/// Address arithmetic and single-element memory access: the scalar half of a
+/// kernel, which runs on its core's scalar unit rather than on a compute pipe.
+///
+/// Recognised by operation, not by dialect. It used to be by dialect -- these
+/// were llvm.load / llvm.store / llvm.inttoptr and testing for LLVMDialect
+/// caught all of them -- until the CV pipeline stopped emitting LLVM here and
+/// started emitting the MLIR equivalents. The dialect test then matched
+/// nothing, and because a memref.load names a memref, the generic path charged
+/// it for every element of the buffer it indexes: 18 of them came to 94 million
+/// cycles on flash attention, on the Cube pipe, where the profiler measures the
+/// matmul term alone to five figures. A memref.load reads one element by
+/// definition, so its cost cannot scale with the shape it is addressing.
+///
+/// The old spelling stays recognised: other paths into this pass still produce
+/// it, and a dialect that is simply absent costs nothing to keep testing for.
+bool isScalarMemoryOp(Operation *op) {
+  if (isa<LLVM::LLVMDialect>(op->getDialect())) {
+    return true;
+  }
+  // memref.load / memref.store address one element; the surrounding loop is
+  // what makes them numerous, and the loop multiplier already counts that.
+  // Bulk movement is memref.copy and the hivm transfers, handled elsewhere.
+  if (isa<memref::LoadOp, memref::StoreOp>(op)) {
+    return true;
+  }
+  // hivm.hir.pointer_cast is the replacement for llvm.inttoptr: it reinterprets
+  // an address and moves nothing.
+  if (isa<hivm::PointerCastOp>(op)) {
+    return true;
+  }
+  return false;
 }
 
 
@@ -831,13 +865,13 @@ std::optional<OpCost> estimateOpCost(Operation *op,
     return cost;
   }
 
-  // Pointer arithmetic and scalar loads/stores emitted by the LLVM lowering.
-  // They run on their core's scalar unit, which the profiler measures at a
-  // fifth to a quarter of that core's active time -- so not free, and worth
-  // charging as soon as the per-instruction figure is known. Until then the
-  // profile leaves it at zero and the cost is recognised but not counted,
-  // which at least keeps it from masquerading as compute of unknown size.
-  if (isa<LLVM::LLVMDialect>(op->getDialect())) {
+  // Pointer arithmetic and single-element loads and stores. They run on their
+  // core's scalar unit, which the profiler measures at a fifth to a quarter of
+  // that core's active time -- so not free, and worth charging as soon as the
+  // per-instruction figure is known. Until then the profile leaves it at zero
+  // and the cost is recognised but not counted, which at least keeps it from
+  // masquerading as compute of unknown size.
+  if (isScalarMemoryOp(op)) {
     OpCost cost;
     cost.unit = HWUnit::Scalar;
     cost.cycles = config.getScalarCyclesPerInstruction();
@@ -1040,6 +1074,10 @@ struct TripCountOptions {
   /// Iteration count assumed for loops that remain unresolved. One reproduces
   /// the behaviour of not assuming anything.
   int64_t defaultTripCount = 1;
+  /// What one pipeline fill/drain iteration costs relative to a full one,
+  /// copied from the hardware profile so the loop weighting does not have to
+  /// carry the whole config around. See HardwareConfig for why it is a half.
+  double prologueWorkFraction = 0.5;
 };
 
 /// TritonToLinalg does not lower tl.program_id to an operation: it appends the
@@ -1330,25 +1368,55 @@ llvm::StringRef stringifyTripCountSource(TripCountSource source) {
 }
 
 struct ResolvedTripCount {
+  /// Iterations that carry the body's work. This is what the kernel's author
+  /// wrote, and what the report calls "trip".
   int64_t count = 1;
   TripCountSource source = TripCountSource::Assumed;
   /// What the loop bound in the IR says, when that differs from `count`
   /// because the bound was extended for pipelining. Zero when it does not.
   int64_t rewrittenCount = 0;
+  /// Software-pipeline stages, one predicated scf.if each, from
+  /// ssbuffer.iter_extension[2]. Also the number of iterations spent filling
+  /// and draining the pipeline, since a stage costs one iteration to reach.
+  int64_t stages = 0;
+  /// The buffer rescaling factors, ssbuffer.iter_extension[0] and [1]. Kept
+  /// for the report: without them the gap between `count` and `rewrittenCount`
+  /// cannot be split into the part that conserves work and the part that does
+  /// not, and those two behave completely differently.
+  int64_t requiredBuffers = 1;
+  int64_t divisor = 1;
+  /// Iterations the estimate actually multiplies the body by: `count` plus the
+  /// fill and drain, discounted by the profile's prologue fraction. Equals
+  /// `count` on a loop that was never pipelined.
+  int64_t chargedCount = 1;
 };
 
-/// Undo the loop extension AddControlFlowCondition applied for pipelining.
+/// Split the loop extension AddControlFlowCondition applied for pipelining into
+/// the part that conserves work and the part that does not.
 ///
 /// It rewrites a pipelined loop's bound to
 ///     ceildiv(originalIterations * requiredBuffers, x) + ifCount
-/// and fills the extra iterations with prologue and epilogue in which most
-/// stages are switched off by their predicates. The bound is therefore not the
-/// number of times the body's work runs, and taking it at face value charges
-/// the whole body for iterations where nearly all of it is disabled.
+/// and the two terms mean different things.
 ///
-/// On a loop that is not unrolled the inflation is a couple of percent and
-/// invisible. With the main loop unrolled it was observed at 3x, which is
-/// enough to make the model rank an unrolled variant far worse than it is.
+/// `ceildiv(originalIterations * requiredBuffers, x)` is a rescaling: the same
+/// work spread over a different number of iterations, each doing a fraction of
+/// what it used to. Taking it at face value charges the whole body for
+/// iterations where most of it is disabled. On a loop that is not unrolled the
+/// inflation is a couple of percent and invisible; with the main loop unrolled
+/// it was observed at 3x, which is enough to rank an unrolled variant far worse
+/// than it is. So this term is divided back out, and that is measurable: two
+/// configurations differing only in this factor -- ramps of 68 and 4 iterations
+/// -- run within 2.4% of each other on the hardware.
+///
+/// `+ ifCount` is not a rescaling. It is one iteration per predicated stage,
+/// spent filling the pipeline at the start and draining it at the end, and
+/// those iterations run. Dividing them out too, which is what this used to do,
+/// makes a deeper pipeline free of charge -- and a deeper pipeline is exactly
+/// what buys the shorter dependency chains the recurrence bound rewards. A
+/// search let loose on that combination goes looking for depth: on flash
+/// attention it moved the ramp from 3 iterations to 138, scored the result 10%
+/// better, and lost 70% on the hardware. So the fill and drain are charged,
+/// at the fraction of a full iteration the profile gives.
 ///
 /// The three factors are read from ssbuffer.iter_extension rather than
 /// pattern-matched out of the bound expression: the pass that applied them
@@ -1358,8 +1426,15 @@ struct ResolvedTripCount {
 /// The inversion is exact whenever the ceildiv divided evenly, and off by at
 /// most one iteration otherwise -- against a trip count in the hundreds that
 /// is noise, and it is always closer than not inverting at all.
-std::optional<int64_t> removeLoopExtension(scf::ForOp forOp,
-                                           int64_t rewrittenCount) {
+struct LoopExtension {
+  int64_t workIterations = 0;
+  int64_t stages = 0;
+  int64_t requiredBuffers = 1;
+  int64_t divisor = 1;
+};
+
+std::optional<LoopExtension> splitLoopExtension(scf::ForOp forOp,
+                                                int64_t rewrittenCount) {
   auto attr = forOp->getAttrOfType<ArrayAttr>(CVPipeline::kIterExtension);
   if (!attr || attr.size() != 3) {
     return std::nullopt;
@@ -1368,7 +1443,8 @@ std::optional<int64_t> removeLoopExtension(scf::ForOp forOp,
   auto divisor = dyn_cast<IntegerAttr>(attr[1]);
   auto ifCount = dyn_cast<IntegerAttr>(attr[2]);
   if (!requiredBuffers || !divisor || !ifCount ||
-      requiredBuffers.getInt() <= 0) {
+      requiredBuffers.getInt() <= 0 || divisor.getInt() <= 0 ||
+      ifCount.getInt() < 0) {
     return std::nullopt;
   }
 
@@ -1377,7 +1453,15 @@ std::optional<int64_t> removeLoopExtension(scf::ForOp forOp,
     return std::nullopt; // nothing but prologue; leave the bound alone
   }
   const int64_t original = scaled * divisor.getInt() / requiredBuffers.getInt();
-  return original > 0 ? std::optional<int64_t>(original) : std::nullopt;
+  if (original <= 0) {
+    return std::nullopt;
+  }
+  LoopExtension split;
+  split.workIterations = original;
+  split.stages = ifCount.getInt();
+  split.requiredBuffers = requiredBuffers.getInt();
+  split.divisor = divisor.getInt();
+  return split;
 }
 
 /// The three-step resolution, in one place so the number the estimate uses and
@@ -1387,19 +1471,35 @@ ResolvedTripCount resolveLoopTripCount(scf::ForOp forOp,
   ResolvedTripCount resolved;
   auto tripCount = mlir::ascend::utils::analyzeScfForTripCount(forOp);
   if (tripCount.isStatic) {
-    resolved = {tripCount.staticTripCount, TripCountSource::Static, 0};
+    resolved.count = tripCount.staticTripCount;
+    resolved.source = TripCountSource::Static;
   } else if (auto bound = resolveTripCount(forOp, options)) {
-    resolved = {*bound, TripCountSource::Bindings, 0};
+    resolved.count = *bound;
+    resolved.source = TripCountSource::Bindings;
   } else {
     // Nothing resolved the bound, so there is no extension to undo either.
-    return {options.defaultTripCount, TripCountSource::Assumed, 0};
+    resolved.count = options.defaultTripCount;
+    resolved.source = TripCountSource::Assumed;
+    resolved.chargedCount = resolved.count;
+    return resolved;
   }
 
-  // What was read is the rewritten bound; the body runs fewer times than that.
-  if (auto original = removeLoopExtension(forOp, resolved.count)) {
+  // What was read is the rewritten bound. Part of the difference is a rescaling
+  // that conserves work and comes back out; the rest is the pipeline's fill and
+  // drain, which runs and is charged.
+  if (auto split = splitLoopExtension(forOp, resolved.count)) {
     resolved.rewrittenCount = resolved.count;
-    resolved.count = *original;
+    resolved.count = split->workIterations;
+    resolved.stages = split->stages;
+    resolved.requiredBuffers = split->requiredBuffers;
+    resolved.divisor = split->divisor;
   }
+
+  // Rounded up: a ramp that exists costs at least one iteration, and rounding
+  // it away is how it became free in the first place.
+  const int64_t ramp = static_cast<int64_t>(
+      std::ceil(resolved.stages * options.prologueWorkFraction));
+  resolved.chargedCount = resolved.count + ramp;
   return resolved;
 }
 
@@ -1424,7 +1524,10 @@ getLoopWeight(Operation *op, const TripCountOptions &options,
     }
 
     const ResolvedTripCount resolved = resolveLoopTripCount(forOp, options);
-    weight.multiplier *= resolved.count;
+    // The charged count, not the work count: an operation inside a pipelined
+    // loop is issued during the fill and drain too, just alongside fewer of its
+    // neighbours, and that discount is already inside chargedCount.
+    weight.multiplier *= resolved.chargedCount;
     if (resolved.source == TripCountSource::Assumed && !weight.dynamicLoop) {
       weight.dynamicLoop = forOp;
       weight.assumedTripCount = resolved.count;
@@ -1442,8 +1545,17 @@ struct LoopReport {
   /// The bound as written in the IR, when pipelining extended it past the
   /// number of iterations that actually do the body's work. Zero otherwise.
   int64_t rewrittenTripCount = 0;
+  /// Software-pipeline stages, and the two buffer rescaling factors. Reported
+  /// because the gap between `tripCount` and `rewrittenTripCount` has two
+  /// causes that behave oppositely -- one conserves work, one adds it -- and
+  /// no amount of staring at the two totals separates them.
+  int64_t stages = 0;
+  int64_t requiredBuffers = 1;
+  int64_t divisor = 1;
+  /// Iterations actually charged: `tripCount` plus the discounted ramp.
+  int64_t chargedTripCount = 1;
   /// What an operation directly in this loop's body gets multiplied by: this
-  /// loop's trip count times every enclosing loop's.
+  /// loop's charged count times every enclosing loop's.
   int64_t bodyMultiplier = 1;
   /// Exclusive branches the loop itself sits in, which divide that again.
   int64_t branchDivisor = 1;
@@ -1468,13 +1580,18 @@ collectLoopReports(ModuleOp module, const TripCountOptions &options,
     report.tripCount = resolved.count;
     report.source = resolved.source;
     report.rewrittenTripCount = resolved.rewrittenCount;
+    report.stages = resolved.stages;
+    report.requiredBuffers = resolved.requiredBuffers;
+    report.divisor = resolved.divisor;
+    report.chargedTripCount = resolved.chargedCount;
 
     // The loop's own position: enclosing loops multiply, enclosing branches
     // divide. getLoopWeight looks at parents only, which is what is wanted
-    // here -- this loop's own trip count is applied on top.
+    // here -- this loop's own charged count is applied on top, and it has to be
+    // the charged one so the printed multiplier is the one the estimate used.
     const LoopWeight enclosing =
         getLoopWeight(forOp.getOperation(), options, branchDivisors);
-    report.bodyMultiplier = enclosing.multiplier * resolved.count;
+    report.bodyMultiplier = enclosing.multiplier * resolved.chargedCount;
     report.branchDivisor = enclosing.branchDivisor;
 
     for (Operation *parent = forOp->getParentOp(); parent;
@@ -3139,7 +3256,7 @@ void printPipeComparison(llvm::raw_ostream &os,
 void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
                    const FusionFactors &fusion, const HardwareConfig &config,
                    int64_t branchedOps, int64_t scalarOpsCube,
-                   int64_t scalarOpsVector) {
+                   int64_t scalarOpsVector, int64_t pipelineStages) {
   auto line = [&](llvm::StringRef what, int64_t cycles) {
     os << "[" << DEBUG_TYPE << "]     " << llvm::left_justify(what, 42)
        << llvm::format("%14lld", static_cast<long long>(cycles)) << " cycles ("
@@ -3284,6 +3401,23 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
      << " operation(s) in mutually exclusive branches, charged at a fraction"
         " of their cost because only one branch runs per iteration\n";
 
+  // What the software pipeline's ramp costs. Unlike a barrier this is
+  // occupancy, not latency: the fill and drain are extra iterations of the
+  // loop, so they scale every operation inside it and move both bounds. Worth
+  // saying next to the barrier line, because these are the two things a finer
+  // block partition buys its overlap with, and this is the larger of the two.
+  if (pipelineStages > 0) {
+    const double fraction = config.getPrologueWorkFraction();
+    os << "[" << DEBUG_TYPE << "]     software pipeline: " << pipelineStages
+       << " stage(s) in the deepest loop, so "
+       << static_cast<long long>(std::ceil(pipelineStages * fraction))
+       << " extra iteration(s) charged for filling and draining it"
+       << llvm::format(" (at %.2f of a full iteration each, from"
+                       " software_pipeline.prologue_work_fraction)",
+                       fraction)
+       << "\n";
+  }
+
   // What each barrier costs, and what that came to. A barrier is latency, not
   // occupancy: it stops the core from issuing rather than keeping an engine
   // busy, so it moves the schedule and through it the recurrence bound, and
@@ -3353,26 +3487,46 @@ void printLoops(llvm::raw_ostream &os,
 
   os << "[" << DEBUG_TYPE
      << "] loops, and what each multiplies its body by. 'trip' is how many"
-        " times this loop's body does its work, 'body x' includes the loops"
-        " around it; 'source' is how the count was obtained -- static means the"
-        " IR said so, bindings means an argument value supplied by the caller"
-        " resolved it, assumed means nothing did and the default was used."
-        " 'ir bound' appears when pipelining extended the loop past that, the"
-        " extra iterations being prologue and epilogue with most stages"
-        " switched off:\n";
+        " times this loop's body does its work and 'source' is how that was"
+        " obtained -- static means the IR said so, bindings means an argument"
+        " value supplied by the caller resolved it, assumed means nothing did"
+        " and the default was used.\n";
   os << "[" << DEBUG_TYPE
-     << "]    depth        trip    ir bound  source       body x  location\n";
+     << "]   The remaining columns appear when AddControlFlowCondition"
+        " pipelined the loop and rewrote its bound to"
+        " ceildiv(trip * rb, x) + stages. 'buf' is that rb/x: a rescaling that"
+        " spreads the same work over more iterations, so it is divided back out"
+        " and costs nothing. 'stages' is the predicated scf.if count, and it is"
+        " also the iterations spent filling and draining the pipeline -- those"
+        " do run, so 'charged' is trip plus that ramp at the profile's prologue"
+        " fraction, and 'charged' is what 'body x' and the whole estimate are"
+        " built on. 'ir bound' is the bound as actually written in the IR.\n";
+  os << "[" << DEBUG_TYPE
+     << "]    depth        trip    buf  stages     charged    ir bound"
+        "  source       body x  location\n";
 
   for (const LoopReport &loop : loops) {
     os << "[" << DEBUG_TYPE << "] "
        << llvm::format("%8lld", static_cast<long long>(loop.depth))
        << llvm::format("%12lld", static_cast<long long>(loop.tripCount));
-    if (loop.rewrittenTripCount > 0) {
-      os << llvm::format("%12lld",
+
+    const bool pipelined = loop.rewrittenTripCount > 0;
+    if (pipelined) {
+      const std::string buf = std::to_string(loop.requiredBuffers) + "/" +
+                              std::to_string(loop.divisor);
+      os << llvm::right_justify(buf, 7)
+         << llvm::format("%8lld", static_cast<long long>(loop.stages))
+         << llvm::format("%12lld",
+                         static_cast<long long>(loop.chargedTripCount))
+         << llvm::format("%12lld",
                          static_cast<long long>(loop.rewrittenTripCount));
     } else {
-      os << llvm::right_justify("-", 12);
+      os << llvm::right_justify("-", 7) << llvm::right_justify("-", 8)
+         << llvm::format("%12lld",
+                         static_cast<long long>(loop.chargedTripCount))
+         << llvm::right_justify("-", 12);
     }
+
     os << "  " << llvm::left_justify(stringifyTripCountSource(loop.source), 11)
        << llvm::format("%11lld", static_cast<long long>(loop.bodyMultiplier));
     if (loop.branchDivisor > 1) {
@@ -3553,7 +3707,10 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
     return;
   }
 
-  const TripCountOptions tripCountOptions = readTripCountOptions();
+  TripCountOptions tripCountOptions = readTripCountOptions();
+  // The one loop-weighting input that is a property of the part rather than of
+  // the caller, so it comes from the profile and not from the environment.
+  tripCountOptions.prologueWorkFraction = config->getPrologueWorkFraction();
   const FusionFactors fusion = readFusionFactors();
   // Worked out once up front: deciding whether an scf.if is a real either/or
   // means looking at both its arms, which cannot be done while walking a
@@ -3628,24 +3785,30 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.ub.bytes));
   module->setAttr(kCVPipelineCostUBPeak,
                   builder.getI64IntegerAttr(estimate.ub.peakBytes));
-  // Deepest software-pipeline stretch, over every loop. Read by the variant
-  // search: this is the third resource a finer partition spends, alongside
-  // barriers and Unified Buffer, and the one that shows up as the binary
-  // compiler refusing to read a buffer before its first write.
+  // Deepest software-pipeline stretch, over every loop. Diagnostic: it is the
+  // one number directly comparable with the bound written in the IR, but it
+  // mixes the rescaling with the ramp, so the two below separate them.
   int64_t loopExtension = 0;
+  int64_t pipelineStages = 0;
   for (const LoopReport &loop : loopReports) {
     if (loop.rewrittenTripCount > loop.tripCount) {
       loopExtension =
           std::max(loopExtension, loop.rewrittenTripCount - loop.tripCount);
     }
+    pipelineStages = std::max(pipelineStages, loop.stages);
   }
   module->setAttr(kCVPipelineCostLoopExtension,
                   builder.getI64IntegerAttr(loopExtension));
+  // Stage count: a cost, already inside the estimate, published so a consumer
+  // that sees an expensive variant can tell at a glance whether depth is why.
+  module->setAttr(kCVPipelineCostPipelineStages,
+                  builder.getI64IntegerAttr(pipelineStages));
 
-  // The same fact as the integer the pipeline decided, which is what a search
-  // compares: a depth either grew or it did not, where an extension in
-  // iterations scales with the trip count and would need a threshold per
-  // kernel.
+  // The buffer rescaling factor, which is a correctness limit rather than a
+  // cost: the binary compiler refuses a module whose prologue outruns the
+  // buffers behind it, and that shows up here as a step from 1 to 2. A search
+  // guards on this one; it does not guard on the stage count above, which is
+  // paid for in the score instead.
   int64_t pipelineDepth = 1;
   module.walk([&](scf::ForOp forOp) {
     auto attr = forOp->getAttrOfType<ArrayAttr>(CVPipeline::kIterExtension);
@@ -3757,7 +3920,7 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   auto reportDetail = [&](llvm::raw_ostream &os) {
     printEstimate(os, estimate, fusion, *config, breakdown.branchedOps,
                   breakdown.weightedScalarOpsCube,
-                  breakdown.weightedScalarOpsVector);
+                  breakdown.weightedScalarOpsVector, pipelineStages);
     printLoops(os, loopReports);
     printBlocks(os, breakdown, estimate);
     printBreakdown(os, breakdown);

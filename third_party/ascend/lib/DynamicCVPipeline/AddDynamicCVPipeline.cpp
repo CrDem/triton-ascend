@@ -140,21 +140,29 @@ constexpr const char *kUBSlackEnvVar = "TRITON_ASCEND_CV_UB_SLACK_BYTES";
 /// baseline, 65536 lets one more score tile through.
 constexpr const char *kStageSlackEnvVar = "TRITON_ASCEND_CV_STAGE_SLACK";
 
-/// How many more iterations of software-pipeline prologue a candidate may
-/// carry than the untouched pipeline does.
+/// How much larger a software-pipeline buffer factor a candidate may carry than
+/// the untouched pipeline does.
 ///
-/// The third and last thing a finer block partition spends. More blocks means
-/// more pipeline stages, and UpdateLoopIterTimes stretches the loop bound to
-/// make room for them: the untouched pipeline stretches by 2 iterations, and
-/// every candidate the binary compiler has refused for 'read before first
-/// write' stretched by more than 130. That error *is* the prologue -- an
-/// iteration in which a stage reads a buffer whose filling stage has not run.
+/// This guards the requiredBuffers factor of ssbuffer.iter_extension, not the
+/// stage count -- the two are different numbers and only this one predicts a
+/// module that will not build. When a producer and its consumer sit more stages
+/// apart than there are buffers between them, the binary compiler refuses the
+/// module for reading a buffer before its first write, and measured, the
+/// untouched pipeline runs at 1 while every candidate refused for that reason
+/// had gone to 2.
+///
+/// The stage count is deliberately NOT guarded. It costs time rather than
+/// correctness -- a pipeline of N stages spends N iterations filling and
+/// draining -- and the estimate charges that directly, so a candidate that buys
+/// shorter dependency chains by adding stages pays for them in its own score.
+/// Forbidding depth outright would also forbid the case where a long enough
+/// loop amortises it, which is a real one on other kernels.
 ///
 /// Defaults to zero, which is not a tuned value but the structural rule: the
-/// depth is a small integer the pipeline chose, and a candidate that needs a
-/// deeper one has asked for a transformation the toolchain then refuses. Unlike
-/// an extension in iterations, nothing here scales with the kernel, so there is
-/// nothing to fit per kernel. The variable only widens it.
+/// factor is a small integer the pipeline chose, and a candidate that needs a
+/// larger one has asked for a transformation the toolchain then refuses.
+/// Nothing here scales with the kernel, so there is nothing to fit per kernel.
+/// The variable only widens it.
 std::optional<int64_t> getStageSlack() {
   static const std::optional<int64_t> slack = []() -> std::optional<int64_t> {
     const char *env = std::getenv(kStageSlackEnvVar);
@@ -367,7 +375,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // toolchain -- by the binary compiler running out of Unified Buffer, say,
     // which no pass here can foresee -- leaves the next choices on record
     // instead of sending the search back to the start.
-    SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t>> ranked;
+    // Ordered by the first two, so the trailing fields are carried along rather
+    // than compared: seed is unique and stages is a diagnostic.
+    SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> ranked;
     const std::optional<int64_t> ubSlack = getUBSlackBytes();
     const std::optional<int64_t> stageSlack = getStageSlack();
     // Set by seed 0, the untouched pipeline, which the loop below reaches
@@ -401,6 +411,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       int64_t ubBytes = 0;
       int64_t ubCapacity = 0;
       int64_t depth = 0;
+      // Reported, not guarded: the estimate already charges the fill and drain
+      // these stages cost, so a deep candidate pays in its own score. Carried
+      // here because when a candidate is expensive this is usually the reason,
+      // and the summary is the only place showing several candidates at once.
+      int64_t stages = 0;
       int errCode = 0;
 
       {
@@ -442,6 +457,10 @@ void AddDynamicCVPipelinePass::runOnOperation() {
           if (auto ubAttr = moduleOp->getAttrOfType<IntegerAttr>(
                   mlir::triton::kCVPipelineCostUBPeak)) {
             ubBytes = ubAttr.getInt();
+          }
+          if (auto stageAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                  mlir::triton::kCVPipelineCostPipelineStages)) {
+            stages = stageAttr.getInt();
           }
           // -3: it compiled and scored, but holds more Unified Buffer live than
           // the baseline plus what the caller allowed. Counted as a rejection
@@ -502,13 +521,16 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                               : std::max<int64_t>(0, ubCapacity - ubBytes);
         llvm::errs() << "[" << DEBUG_TYPE << "]   baseline: " << ubBytes
                      << " bytes of unified buffer live against a capacity of "
-                     << ubCapacity << ", pipeline depth " << depth
+                     << ubCapacity << ", buffer factor " << depth << ", "
+                     << stages << " pipeline stage(s)"
                      << "; candidates may spend " << ubAllowance
                      << " more byte(s) and " << stageSlack.value_or(0)
-                     << " more stage(s)\n";
+                     << " more buffer factor(s). Stage count is not guarded:"
+                     << " the fill and drain it costs are charged in the"
+                     << " estimate, so a deeper candidate has to earn it\n";
       }
       distinctCosts.insert({cost, second});
-      ranked.push_back({cost, second, ubBytes, seed});
+      ranked.push_back({cost, second, ubBytes, seed, stages});
       if (worstCost < cost) {
         worstCost = cost;
       }
@@ -585,10 +607,12 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         }
         llvm::errs() << " " << std::get<3>(ranked[i]) << "("
                      << std::get<0>(ranked[i]) << "/" << std::get<1>(ranked[i])
-                     << "/" << std::get<2>(ranked[i]) << "B)";
+                     << "/" << std::get<2>(ranked[i]) << "B/"
+                     << std::get<4>(ranked[i]) << "st)";
         ++shown;
       }
-      llvm::errs() << "  [seed(total/second bound/unified buffer)]\n";
+      llvm::errs() << "  [seed(total/second bound/unified buffer/pipeline"
+                      " stages)]\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }
@@ -605,8 +629,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                         " buffer plus its "
                      << ubAllowance << "-byte allowance\n";
       } else if (entry.first == -4) {
-        llvm::errs() << "a deeper software pipeline than the baseline's "
-                     << baselineDepth.value_or(0) << " stage(s)\n";
+        llvm::errs() << "a larger software-pipeline buffer factor than the"
+                        " baseline's "
+                     << baselineDepth.value_or(0)
+                     << ", which the binary compiler refuses as a prologue that"
+                        " reads a buffer before its first write\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }
