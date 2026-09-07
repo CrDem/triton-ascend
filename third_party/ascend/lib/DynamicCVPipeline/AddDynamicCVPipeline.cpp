@@ -665,6 +665,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
     int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
                               : CVPipeline::ERRCODE_FAILED;
+    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     if (!errCodeAttr) {
       moduleOp->emitWarning() << "[" << DEBUG_TYPE << "] "
                               << "Unexpected pass failure (no fallback attr "
@@ -692,9 +693,6 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       }
     }
 
-    int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
-                              : CVPipeline::ERRCODE_FAILED;
-    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     restoreModuleFromBackup(moduleOp, moduleBackup);
     moduleBackup->destroy();
     fallback.restore();
