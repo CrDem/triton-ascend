@@ -30,6 +30,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -43,23 +44,40 @@ static constexpr const char *DEBUG_TYPE = "refine-args-block-id";
 
 using namespace mlir::triton;
 
+// Erase `op` and, transitively, every upstream producer that becomes dead as a
+// result. Only operations inside `loopBlock` are touched, and nothing is erased
+// unless it is trivially dead at the moment of erasure: an operation is removed
+// only after its uses have actually been dropped, never on a prediction that
+// they are about to be.
 static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock) {
-  llvm::SetVector<Operation *> toErase;
-  llvm::SetVector<Operation *> visited;
-  SmallVector<Operation *> worklist;
+  llvm::SetVector<Operation *> worklist;
 
-  worklist.push_back(op);
+  worklist.insert(op);
 
   while (!worklist.empty()) {
     Operation *cur = worklist.pop_back_val();
+    // Stay inside the loop body the caller handed us.
+    if (cur->getBlock() != loopBlock) {
+      continue;
+    }
+    // No users left and no side effects to lose: the only condition under which
+    // erasing is legal.
+    if (!isOpTriviallyDead(cur)) {
+      continue;
+    }
+
+    // Operands have to be collected before erase(): afterwards `cur` is gone.
+    SmallVector<Operation *> producers;
     for (Value operand : cur->getOperands()) {
       if (Operation *defOp = operand.getDefiningOp()) {
-        if (defOp->getResult(0).getNumUses() == 1) {
-          worklist.push_back(defOp);
-        }
+        producers.push_back(defOp);
       }
     }
+
     cur->erase();
+
+    // Re-examine the producers now that their uses have been dropped.
+    worklist.insert(producers.begin(), producers.end());
   }
 }
 
