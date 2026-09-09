@@ -24,8 +24,11 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
@@ -51,6 +54,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <string>
 #include <tuple>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -212,28 +216,67 @@ int getVariantCount() {
   return value;
 }
 
-/// Swallows everything written to stdout and stderr while it is alive.
+/// Directory to keep one log per attempted variant in, or empty for none.
+///
+/// Without it a trial's output goes to /dev/null, which is right up until an
+/// attempt dies: a crash inside the pipeline takes its last words with it, the
+/// destructor below never runs to restore the descriptors, and the search
+/// leaves nothing behind but the seeds it had already reported. That is not
+/// hypothetical -- one candidate segfaulted inside a sub-pass and the only way
+/// to find out which was to bisect the seed range by hand.
+constexpr const char *kVariantLogDirEnvVar = "TRITON_ASCEND_CV_LOG_DIR";
+
+std::string getVariantLogDir() {
+  const char *env = std::getenv(kVariantLogDirEnvVar);
+  if (!env || !*env) {
+    return {};
+  }
+  std::string dir(env);
+  // Best effort: a directory that cannot be created leaves the search silent
+  // rather than broken, which is the same behaviour as not asking for logs.
+  if (auto err = llvm::sys::fs::create_directories(dir)) {
+    llvm::errs() << "[" << DEBUG_TYPE << "] " << kVariantLogDirEnvVar << "='"
+                 << dir << "' is not usable (" << err.message()
+                 << "); variant output will be discarded instead\n";
+    return {};
+  }
+  return dir;
+}
+
+/// Redirects everything written to stdout and stderr while it is alive.
 ///
 /// A trial run drives the whole pipeline, and the pipeline is talkative: debug
 /// prints from several passes, MLIR diagnostics from the ones that decline a
 /// candidate, and the estimate's own report. Multiplied by the number of
 /// candidates that is thousands of lines describing IR that is about to be
-/// thrown away. Silencing at the file descriptor rather than by asking each
+/// thrown away. Redirecting at the file descriptor rather than by asking each
 /// pass to be quiet is the only thing that covers all of them, including
 /// prints this pass does not own.
+///
+/// Where it goes depends on whether a log directory was named: a file keeps the
+/// output for later, /dev/null throws it away. The file matters for the case
+/// the destructor cannot help with, which is an attempt that never returns.
 class OutputSilencer {
 public:
-  OutputSilencer() {
+  explicit OutputSilencer(llvm::StringRef path = {}) {
+    (void)path; // the redirection below is POSIX-only
 #ifndef _WIN32
     flushAll();
-    devNull = ::open("/dev/null", O_WRONLY);
-    if (devNull < 0) {
-      return; // cannot silence; noisy is better than broken
+    if (path.empty()) {
+      sink = ::open("/dev/null", O_WRONLY);
+    } else {
+      sink = ::open(path.str().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (sink < 0) {
+        sink = ::open("/dev/null", O_WRONLY); // logging is not worth failing
+      }
+    }
+    if (sink < 0) {
+      return; // cannot redirect; noisy is better than broken
     }
     savedOut = ::dup(STDOUT_FILENO);
     savedErr = ::dup(STDERR_FILENO);
-    ::dup2(devNull, STDOUT_FILENO);
-    ::dup2(devNull, STDERR_FILENO);
+    ::dup2(sink, STDOUT_FILENO);
+    ::dup2(sink, STDERR_FILENO);
 #endif
   }
 
@@ -248,8 +291,8 @@ public:
       ::dup2(savedErr, STDERR_FILENO);
       ::close(savedErr);
     }
-    if (devNull >= 0) {
-      ::close(devNull);
+    if (sink >= 0) {
+      ::close(sink);
     }
 #endif
   }
@@ -269,7 +312,7 @@ private:
     std::fflush(stderr);
   }
 
-  int devNull = -1;
+  int sink = -1;
   int savedOut = -1;
   int savedErr = -1;
 };
@@ -387,6 +430,20 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
                  << variantCount << " operation orderings\n";
 
+    // Where each attempt's output goes. Named once here rather than per seed so
+    // the advice below is printed once too.
+    const std::string logDir = getVariantLogDir();
+    if (logDir.empty()) {
+      llvm::errs() << "[" << DEBUG_TYPE << "]   attempt output is discarded;"
+                      " set " << kVariantLogDirEnvVar << " to keep one log per"
+                      " seed, which is also what names the culprit if an"
+                      " attempt dies without returning\n";
+    } else {
+      llvm::errs() << "[" << DEBUG_TYPE << "]   attempt output goes to "
+                   << logDir << "/seed_<n>.log; the last file written is the"
+                      " seed being tried\n";
+    }
+
     // Why the rejected candidates were rejected, counted by error code. A
     // search that keeps nothing is otherwise indistinguishable from one that
     // was never asked to do anything.
@@ -416,10 +473,21 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       int errCode = 0;
 
       {
-        // Nothing the trial prints is worth reading: it describes IR that is
-        // about to be discarded. The estimate is asked to stay quiet, and the
-        // rest of the pipeline is silenced at the descriptor.
-        OutputSilencer hush;
+        // Nothing the trial prints is worth reading while it succeeds: it
+        // describes IR that is about to be discarded. The estimate is asked to
+        // stay quiet, and the rest of the pipeline is redirected at the
+        // descriptor -- to a per-seed file when one was asked for, so that the
+        // output of an attempt that never returns is still on disk afterwards.
+        std::string logPath;
+        if (!logDir.empty()) {
+          llvm::SmallString<128> path(logDir);
+          llvm::sys::path::append(path,
+                                  "seed_" + std::to_string(seed) + ".log");
+          // assign from the raw characters: SmallString::str() has returned
+          // different types across LLVM versions.
+          logPath.assign(path.begin(), path.end());
+        }
+        OutputSilencer hush(logPath);
 
         // Every attempt starts from the untouched input: the pipeline rewrites
         // the module in place, so a candidate must not be built on the

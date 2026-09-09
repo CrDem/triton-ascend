@@ -51,6 +51,22 @@ public:
   llvm::LogicalResult markOpsWithNewId(llvm::SmallVectorImpl<Operation *> &ops);
   void updateBlockId(Operation *op, int blockId);
 
+  /// Drop every record of `op`, to be called immediately BEFORE erasing it.
+  ///
+  /// This class caches raw Operation pointers in both directions and nothing
+  /// else removes them, so an operation erased from the IR stays in the maps as
+  /// a dangling pointer. That is not theoretical: getOpsByBlockId hands the
+  /// vector straight to callers who dereference it -- cloneDepSubgraph in
+  /// RefineArgsBlockId walks it calling getBlock() and isBeforeInBlock(), and
+  /// willCreateCycle seeds its "ok" set from it -- which segfaults on a freed
+  /// operation. The manager also outlives a single loop, so an erase in one
+  /// main loop crashes the next one.
+  ///
+  /// Removing the key from opToBlockId matters as much as removing it from the
+  /// vector: MLIR allocates operations from a pool, so a later operation can
+  /// land on the same address and silently inherit the dead one's block id.
+  void forgetOp(Operation *op);
+
   bool shouldInheritFromParent(Block *block, CoreType requiredCoreType) const;
   llvm::LogicalResult inheritFromParent(Block *block);
 

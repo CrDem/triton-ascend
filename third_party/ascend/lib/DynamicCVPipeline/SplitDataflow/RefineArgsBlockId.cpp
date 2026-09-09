@@ -49,7 +49,15 @@ using namespace mlir::triton;
 // unless it is trivially dead at the moment of erasure: an operation is removed
 // only after its uses have actually been dropped, never on a prediction that
 // they are about to be.
-static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock) {
+//
+// `bm` is taken because erasing an operation from the IR is only half of the
+// job: the block-id manager caches raw pointers to it and hands them back to
+// callers that dereference them, so an operation must be withdrawn from the
+// manager before it stops existing. Leaving it there segfaults the next
+// iter_arg -- or, since the manager is built once for the whole module, the
+// next main loop.
+static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock,
+                                    CVPipeline::ComputeBlockIdManager &bm) {
   llvm::SetVector<Operation *> worklist;
 
   worklist.insert(op);
@@ -74,6 +82,7 @@ static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock) {
       }
     }
 
+    bm.forgetOp(cur);
     cur->erase();
 
     // Re-examine the producers now that their uses have been dropped.
@@ -308,7 +317,7 @@ static void processOneLoop(Operation *loopOp,
     yieldOp.setOperand(i, mapping.lookup(yieldDefOp->getResult(0)));
 
     // Erase original yieldDefOp and its upstream ops that have no more users
-    eraseOpsWithUnusedUsers(yieldDefOp, loopBlock);
+    eraseOpsWithUnusedUsers(yieldDefOp, loopBlock, bm);
     LOG_DEBUG("Successfully moved iter_arg " << i << " from block "
                                              << updateBlockId << " to block "
                                              << firstUserBlockId << "\n");
