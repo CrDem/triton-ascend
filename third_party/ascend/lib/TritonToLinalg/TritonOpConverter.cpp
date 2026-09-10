@@ -33,6 +33,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -105,6 +106,65 @@ generateUniqueFuncName(ModuleOp moduleOp, llvm::StringRef funcNameBase) {
     funcName += ("_" + std::to_string(uniqueId++));
   }
   return funcName;
+}
+
+// Indirect load/store conversion normally consumes the already-converted
+// memref adaptor directly. That is correct for ordinary pointer bases, but it
+// skips BlockDataParser::materializePointer for an int_to_ptr base and loses
+// the required one-element identity view. Only scalar pointer-preserving
+// producers are followed here; tensor-of-pointers and arbitrary pointer
+// arithmetic retain their established conversion path.
+static bool isIntToPtrBasedScalarPointer(Value value) {
+  auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
+    return false;
+
+  SmallPtrSet<Value, 8> visited;
+  while (value && visited.insert(value).second) {
+    if (value.getDefiningOp<triton::IntToPtrOp>())
+      return true;
+
+    Operation *producer = value.getDefiningOp();
+    if (!producer)
+      return false;
+    if (auto addPtr = dyn_cast<triton::AddPtrOp>(producer)) {
+      value = addPtr.getPtr();
+      continue;
+    }
+    if (auto bitcast = dyn_cast<triton::BitcastOp>(producer)) {
+      value = bitcast.getSrc();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+// A volatile indirect load whose scalar source is obtained through a Triton
+// pointer bitcast needs the same one-element identity descriptor as the
+// scalar-pointer path. Restrict this provenance check to scalar pointers and
+// a pointer-preserving bitcast/addptr chain so ordinary dynamic memrefs and
+// tensor-of-pointers keep their established ABI.
+static bool isVolatileBitcastScalarPointer(Value value) {
+  auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
+    return false;
+
+  SmallPtrSet<Value, 8> visited;
+  bool sawBitcast = false;
+  while (value && visited.insert(value).second) {
+    if (auto bitcast = value.getDefiningOp<triton::BitcastOp>()) {
+      sawBitcast = true;
+      value = bitcast.getSrc();
+      continue;
+    }
+    if (auto addPtr = value.getDefiningOp<triton::AddPtrOp>()) {
+      value = addPtr.getPtr();
+      continue;
+    }
+    break;
+  }
+  return sawBitcast;
 }
 
 LogicalResult
@@ -3604,7 +3664,20 @@ LogicalResult IndirectLoadConverter::matchAndRewrite(
   auto res = op.getResult();
   auto resTy = res.getType();
 
-  if (!isa<MemRefType>(src.getType())) {
+  // The adaptor may already expose the dynamic carrier created by
+  // IntToPtrConverter.  Re-materialize that narrow provenance before the
+  // MemRefType fast path, otherwise the indirect helper receives memref<?xT>
+  // instead of the required one-element identity descriptor.
+  if (isIntToPtrBasedScalarPointer(op.getSrc()) ||
+      (op.getIsVolatile() && isVolatileBitcastScalarPointer(op.getSrc()))) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getSrc(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize int_to_ptr indirect-load source");
+    src = *materialized;
+  } else if (!isa<MemRefType>(src.getType())) {
     llvm::SmallDenseMap<Value, BlockData> known;
     FailureOr<Value> materialized =
         BlockDataParser::materializePointer(op.getSrc(), rewriter, known);
@@ -3747,7 +3820,18 @@ LogicalResult IndirectStoreConverter::matchAndRewrite(
   auto value = op.getValue();
   auto mask = op.getMask();
 
-  if (!isa<MemRefType>(src.getType())) {
+  // Keep the indirect-store ABI consistent with indirect-load for a scalar
+  // address reconstructed by tt.int_to_ptr.  Ordinary dynamic memrefs retain
+  // the existing direct path.
+  if (isIntToPtrBasedScalarPointer(op.getSrc())) {
+    llvm::SmallDenseMap<Value, BlockData> known;
+    FailureOr<Value> materialized =
+        BlockDataParser::materializePointer(op.getSrc(), rewriter, known);
+    if (failed(materialized))
+      return rewriter.notifyMatchFailure(
+          op, "unable to materialize int_to_ptr indirect-store source");
+    src = *materialized;
+  } else if (!isa<MemRefType>(src.getType())) {
     llvm::SmallDenseMap<Value, BlockData> known;
     FailureOr<Value> materialized =
         BlockDataParser::materializePointer(op.getSrc(), rewriter, known);

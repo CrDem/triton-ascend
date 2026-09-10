@@ -15,9 +15,11 @@ from triton.language.core import (
 from typing import Optional, Tuple, List, overload, Union
 from triton._C.libtriton import ir
 
+from ..utils import _deprecated
 from ._utils import _convert_elem_to_ir_value
 
 
+@_deprecated()
 @_tensor_member_fn
 @builtin
 def index_put(ptr: tensor, index: tensor, value: tensor, dim: int, index_boundary: int, end_offset: tuple,
@@ -101,6 +103,7 @@ def index_put(ptr: tensor, index: tensor, value: tensor, dim: int, index_boundar
                           _semantic.builder)
 
 
+@_deprecated()
 @_tensor_member_fn
 @builtin
 def gather_out_to_ub(src: tensor, index: tensor, index_boundary: int, dim: int, src_stride: tuple, end_offset: tuple,
@@ -189,6 +192,7 @@ def gather_out_to_ub(src: tensor, index: tensor, index_boundary: int, dim: int, 
                                  _semantic.builder)
 
 
+@_deprecated()
 @_tensor_member_fn
 @builtin
 def scatter_ub_to_out(ptr: tensor, value: tensor, index: tensor, index_boundary: int, dim: int, dst_stride: tuple,

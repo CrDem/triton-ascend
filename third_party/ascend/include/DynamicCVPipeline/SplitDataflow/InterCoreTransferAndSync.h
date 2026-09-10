@@ -102,6 +102,7 @@ private:
   mlir::ModuleOp module;
   int transferIndex = 0;
   int markAllocIndex = 0;
+  int intraDepsGroupId = 0;
 
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
   SSBufferManager ssbufferManager;
@@ -126,6 +127,7 @@ private:
 
   std::pair<mlir::Operation *, mlir::Operation *>
   getBlockStartEnd(int blockId, mlir::ModuleOp module);
+  mlir::Operation *getSubBlockEnd(mlir::Operation *defOp);
   bool
   isOuterLayerDependency(size_t depIndex, mlir::Operation *currProdEnd,
                          mlir::Operation *currConsStart,
@@ -187,8 +189,11 @@ private:
                            FlagIdReuseManager &flagIdReuseManager,
                            mlir::Operation *consumedDataOp = nullptr,
                            bool isStoreDirectly = false);
-  void insertMemDepSync(mlir::OpBuilder &builder, mlir::Operation *producerOp,
-                        mlir::Operation *consumerOp, int flag,
+  void insertMemDepSync(mlir::OpBuilder &builder,
+                        mlir::Operation *producerStartOp,
+                        mlir::Operation *producerEndOp,
+                        mlir::Operation *consumerStartOp,
+                        mlir::Operation *consumerEndOp, int flag,
                         mlir::Location loc, bool isCubeToVector,
                         FlagIdReuseManager &flagIdReuseManager);
   // Match the CUBE -> VECTOR direct-store pattern inside the given SCF op:

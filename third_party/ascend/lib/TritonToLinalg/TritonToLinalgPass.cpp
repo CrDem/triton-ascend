@@ -51,6 +51,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -482,6 +483,147 @@ static bool containsPointerDescriptorHandoff(ModuleOp moduleOp) {
   return found;
 }
 
+// A converted make_range may leave a tensor-valued SCF state behind even
+// though no loop result or loop-body operation observes it. Keep this cleanup
+// deliberately narrow: it recognizes only statically shaped integer tensors
+// whose entire loop-carried use chain consists of uniform integer updates.
+static bool isDeadRangeUpdate(Value value, scf::ForOp loop, unsigned slot,
+                              llvm::SmallPtrSetImpl<Value> &visited) {
+  if (!visited.insert(value).second)
+    return false;
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  bool sawYield = false;
+  for (OpOperand &use : value.getUses()) {
+    Operation *user = use.getOwner();
+    if (user == yield) {
+      if (use.getOperandNumber() != slot)
+        return false;
+      sawYield = true;
+      continue;
+    }
+
+    Value updateResult;
+    Value lhs;
+    Value rhs;
+    if (auto add = dyn_cast<arith::AddIOp>(user)) {
+      updateResult = add.getResult();
+      lhs = add.getLhs();
+      rhs = add.getRhs();
+    } else if (auto sub = dyn_cast<arith::SubIOp>(user)) {
+      updateResult = sub.getResult();
+      lhs = sub.getLhs();
+      rhs = sub.getRhs();
+    } else {
+      return false;
+    }
+    if (updateResult.getType() != value.getType())
+      return false;
+
+    bool usesValueAsLhs = lhs == value;
+    bool usesValueAsRhs = rhs == value;
+    if (usesValueAsLhs == usesValueAsRhs)
+      return false;
+    Value delta = usesValueAsLhs ? rhs : lhs;
+    auto deltaType = dyn_cast<RankedTensorType>(delta.getType());
+    if (!deltaType || deltaType != value.getType())
+      return false;
+
+    Operation *deltaProducer = delta.getDefiningOp();
+    bool isUniformDelta = false;
+    if (auto constant = dyn_cast_or_null<arith::ConstantOp>(deltaProducer)) {
+      if (auto dense = dyn_cast<DenseIntElementsAttr>(constant.getValue()))
+        isUniformDelta = dense.isSplat();
+    }
+    if (auto fill = dyn_cast_or_null<linalg::FillOp>(deltaProducer))
+      isUniformDelta = fill.getInputs().size() == 1 &&
+                       fill.getOutputs().size() == 1 &&
+                       fill.getOutputs().front().getType() == value.getType();
+    if (!isUniformDelta)
+      return false;
+
+    if (!isDeadRangeUpdate(updateResult, loop, slot, visited))
+      return false;
+  }
+  return sawYield;
+}
+
+static bool isDeadRangeCarrier(scf::ForOp loop, unsigned slot) {
+  if (slot >= loop.getInitArgs().size() ||
+      slot >= loop.getRegionIterArgs().size() ||
+      slot >= loop.getResults().size() ||
+      slot >= loop.getYieldedValues().size() ||
+      !loop.getResult(slot).use_empty())
+    return false;
+
+  auto type = dyn_cast<RankedTensorType>(loop.getInitArgs()[slot].getType());
+  auto iterType =
+      dyn_cast<RankedTensorType>(loop.getRegionIterArgs()[slot].getType());
+  if (!type || !iterType || type != iterType || !type.hasStaticShape() ||
+      !isa<IntegerType>(type.getElementType()))
+    return false;
+
+  Operation *producer = loop.getInitArgs()[slot].getDefiningOp();
+  if (!producer ||
+      (!isa<linalg::GenericOp, linalg::FillOp, tensor::CastOp>(producer) &&
+       !producer->hasAttr("tt.from_make_range") &&
+       !producer->hasAttr("tt.make_range_offset") &&
+       !producer->hasAttr("tt.make_range_size")))
+    return false;
+
+  llvm::SmallPtrSet<Value, 8> visited;
+  return isDeadRangeUpdate(loop.getRegionIterArgs()[slot], loop, slot, visited);
+}
+
+// Remove only fully dead range-like SCF state. Body arguments and yield
+// operands are removed first, then the loop is rebuilt with surviving values.
+static void eraseDeadRangeCarriers(ModuleOp moduleOp) {
+  SmallVector<scf::ForOp> loops;
+  moduleOp.walk([&](scf::ForOp loop) { loops.push_back(loop); });
+
+  for (scf::ForOp loop : loops) {
+    if (!loop || loop->getParentOp() == nullptr)
+      continue;
+    llvm::BitVector dead(loop.getInitArgs().size());
+    for (unsigned i = 0; i < dead.size(); ++i) {
+      if (isDeadRangeCarrier(loop, i))
+        dead.set(i);
+    }
+    if (dead.none())
+      continue;
+
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    yield->eraseOperands(dead);
+    loop.getBody()->eraseArguments([&](BlockArgument arg) {
+      unsigned argNumber = arg.getArgNumber();
+      return argNumber != 0 && dead.test(argNumber - 1);
+    });
+
+    llvm::BitVector operandIndices(loop->getNumOperands());
+    for (auto [i, init] : llvm::enumerate(loop.getInitArgsMutable())) {
+      if (dead.test(i))
+        operandIndices.set(init.getOperandNumber());
+    }
+    loop->eraseOperands(operandIndices);
+
+    OperationState state(loop.getLoc(), loop->getName(), loop->getOperands(),
+                         loop.getInitArgs().getTypes(), loop->getAttrs());
+    state.addRegion()->takeBody(loop.getBodyRegion());
+    OpBuilder builder(loop);
+    auto newLoop = cast<scf::ForOp>(builder.create(state));
+
+    unsigned newResultIndex = 0;
+    for (auto [i, result] : llvm::enumerate(loop.getResults())) {
+      if (dead.test(i)) {
+        assert(result.use_empty() && "dead range result still has uses");
+        continue;
+      }
+      result.replaceAllUsesWith(newLoop.getResult(newResultIndex++));
+    }
+    loop.erase();
+  }
+}
+
 static LogicalResult preCleanBeforeUseAnalysis(ModuleOp moduleOp) {
   bool hasPointerDescriptorHandoff = containsPointerDescriptorHandoff(moduleOp);
 
@@ -666,6 +808,19 @@ static bool isSIMTOp(Operation *op) {
       return isSimt1DCumsum(scan);
     }
   }
+
+  // math.sin / math.cos on f16/f32 inputs: downstream (A5 RegBase normalize,
+  // enable-high-precision defaults to true) rewrites them into a Payne-Hanek
+  // range reduction that looks up a 320xi32 2/pi limbs table with two
+  // hfusion.gather ops per collapsed region.  Match that scenario here and
+  // route it to the SIMT template so the table gathers run in SIMT.
+  if (compileOn91095Flag && (isa<math::SinOp>(op) || isa<math::CosOp>(op))) {
+    Type inElem = getElementTypeOrSelf(op->getOperand(0).getType());
+    if (inElem.isF16() || inElem.isF32()) {
+      return true;
+    }
+  }
+
   return isa<triton::ascend::IndexPutOp, triton::ascend::GatherOutToUbOp,
              triton::ascend::ScatterUbToOutOp, triton::ascend::IndirectLoadOp,
              triton::ascend::StrideLoadOp, triton::ascend::StrideStoreOp,
@@ -1134,6 +1289,47 @@ void TritonToLinalgPass::addDynamicLegal(
       isArithOrMathOpLegal);
 }
 
+namespace {
+
+/// Route the specific `splat(base) -> addptr(scan) -> addptr(constant) ->
+/// store` form through the existing indirect-store operation before use
+/// analysis. Lowering either addptr independently would materialize a memref
+/// while the remaining operation still expects tensor<ptr>.
+class FoldScanOffsetAddPtrChain : public OpRewritePattern<triton::AddPtrOp> {
+public:
+  using OpRewritePattern<triton::AddPtrOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::AddPtrOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op->hasOneUse() || !op.getOffset().getDefiningOp<triton::ScanOp>())
+      return failure();
+    auto nextAddPtr = dyn_cast<triton::AddPtrOp>(*op->user_begin());
+    if (!nextAddPtr ||
+        !nextAddPtr.getOffset().getDefiningOp<arith::ConstantOp>() ||
+        op.getOffset().getType() != nextAddPtr.getOffset().getType() ||
+        !nextAddPtr->hasOneUse())
+      return failure();
+    auto store = dyn_cast<triton::StoreOp>(*nextAddPtr->user_begin());
+    auto baseSplat = op.getPtr().getDefiningOp<triton::SplatOp>();
+    if (!store || !baseSplat ||
+        !isa<triton::PointerType>(baseSplat.getSrc().getType()))
+      return failure();
+
+    rewriter.setInsertionPoint(nextAddPtr);
+    Value combinedOffset = rewriter.create<arith::AddIOp>(
+        nextAddPtr.getLoc(), op.getOffset(), nextAddPtr.getOffset());
+    rewriter.create<triton::ascend::IndirectStoreOp>(
+        store.getLoc(), baseSplat.getSrc(), combinedOffset, store.getValue(),
+        store.getMask());
+    rewriter.eraseOp(store);
+    rewriter.eraseOp(nextAddPtr);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+} // namespace
+
 void TritonToLinalgPass::populateTritonToLinalgCanonicalizationPatterns(
     RewritePatternSet &patterns) {
   patterns.add<LoadStoreConverter::LoadStoreCanonicalizer<triton::LoadOp>,
@@ -1141,6 +1337,7 @@ void TritonToLinalgPass::populateTritonToLinalgCanonicalizationPatterns(
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicRMWOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicCASOp>>(
       patterns.getContext());
+  patterns.add<FoldScanOffsetAddPtrChain>(patterns.getContext());
   patterns.add<TTOpConverters::BitcastCanonicalizer>(patterns.getContext());
   patterns.add<TTOpConverters::FpToFpCanonicalizer>(patterns.getContext());
   patterns.add<LoadStoreConverter::ScalarStoreCanonicalizer>(
@@ -1305,12 +1502,12 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
 }
 
 void TritonToLinalgPass::getDependentDialects(DialectRegistry &registry) const {
-  registry
-      .insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
-              linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
-              tensor::TensorDialect, bufferization::BufferizationDialect,
-              memref::MemRefDialect, hfusion::HFusionDialect, hivm::HIVMDialect,
-              annotation::AnnotationDialect, LLVM::LLVMDialect>();
+  registry.insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
+                  linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
+                  tensor::TensorDialect, bufferization::BufferizationDialect,
+                  memref::MemRefDialect, hfusion::HFusionDialect,
+                  hivm::HIVMDialect, annotation::AnnotationDialect,
+                  LLVM::LLVMDialect, triton::ascend::TritonAscendDialect>();
 }
 
 LogicalResult
@@ -1497,27 +1694,19 @@ void TritonToLinalgPass::runOnOperation() {
     return;
   }
 
-  // Check if the kernel contains tl.dot. Without tl.dot,
-  // the kernel would be pure AIV kernel.
+  // Check if the kernel contains a cube op: tl.dot / tl.dot_scaled / al.dot
+  // decompose into a cube linalg.matmul, and conv1d/conv2d run on the cube
+  // unit. Without any of them the kernel would be tagged as a pure AIV kernel;
+  // with them it must be tagged mix mode, otherwise the cube tile-and-slice
+  // fails (cbuf overflow).
   bool existDot = false;
-  moduleOp.walk([&](triton::DotOp dotOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  moduleOp.walk([&](triton::DotScaledOp dotScaledOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  // dot decomposes into a cube linalg.matmul, so a kernel containing it is
-  // a cube (mix) kernel, not a pure-AIV one. Without this the func gets tagged
-  // mix_mode="aiv" and the cube tile-and-slice fails (cbuf overflow).
-  moduleOp.walk([&](triton::ascend::DotOp dotOp) {
-    existDot = true;
-    return WalkResult::interrupt();
-  });
-  moduleOp.walk([&](hfusion::Conv1DOp conv1dOp) {
-    existDot = true;
-    return WalkResult::interrupt();
+  moduleOp.walk([&](Operation *op) {
+    if (isa<triton::DotOp, triton::DotScaledOp, triton::ascend::DotOp,
+            hfusion::Conv1DOp, hfusion::Conv2DOp>(op)) {
+      existDot = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
   });
   existDotFlag = existDot;
 
@@ -1639,8 +1828,15 @@ void TritonToLinalgPass::runOnOperation() {
   // 4. Mark ops that must be converted explicitly (e.g. tt.scan).
   auto loopOpLegalFn = [](LoopLikeOpInterface loopOp) {
     Operation *op = loopOp.getOperation();
-    if (op->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
+    if (op->hasAttr(controlflow::kPointerDescriptorBoundaryAttr)) {
+      // CFO descriptor loops may still carry a non-descriptor make_range
+      // tensor used by a load/store mask. Route only those loops through the
+      // narrow legacy mask-carrier rewrite; descriptor and opaque slots remain
+      // on the normal pointer-free boundary path.
+      if (!getMarkedMakeRangeCarrierSlots(loopOp).empty())
+        return false;
       return hasPointerFreeControlFlowBoundary(loopOp);
+    }
     return !op->hasAttr("UnhandledLoopOp");
   };
 
@@ -1673,11 +1869,12 @@ void TritonToLinalgPass::runOnOperation() {
     // that its init is produced by reinterpret_cast does not make it BlockData.
     bool hasExpandedPointerDescriptor =
         op->hasAttr(mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
-    if (!op->hasAttr("ExtractedLoadOrStore") && !hasExpandedPointerDescriptor &&
-        needsLegacyBlockDataLoopRewrite(loopOp))
+    auto markedRangeSlots = getMarkedMakeRangeCarrierSlots(loopOp);
+    if (!op->hasAttr("ExtractedLoadOrStore") &&
+        (needsLegacyBlockDataLoopRewrite(loopOp) || !markedRangeSlots.empty()))
       op->setAttr("UnhandledLoopOp", UnitAttr::get(op->getContext()));
 
-    if (hasExpandedPointerDescriptor)
+    if (hasExpandedPointerDescriptor && markedRangeSlots.empty())
       return;
 
     for (auto res : loopOp->getResults()) {
@@ -1717,6 +1914,11 @@ void TritonToLinalgPass::runOnOperation() {
   moduleOp.walk([](Operation *op) {
     op->removeAttr(TTOpConverters::kScalarPointerCarrierBoundaryAttr);
   });
+
+  // Conversion can expose a make_range carrier whose loop result is already
+  // dead. Remove only the proven dead range/update chain before generic
+  // canonicalization; live tensor carriers and scalar address state remain.
+  eraseDeadRangeCarriers(moduleOp);
 
   // 7.1 Workaround: fold duplicated one-hot reconstruction emitted after
   // ArgMax lowering. The issue is not in triton::ReduceOp semantics themselves;

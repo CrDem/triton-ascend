@@ -61,6 +61,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#include "DynamicCVPipeline/Common/FallbackHelper.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -497,8 +498,15 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     llvm::errs() << "Add-dynamic-cv-pipeline is only supported on 91095 now.\n";
     return;
   }
+  if (this->demoteF32Reduction) {
+    moduleOp->setAttr("triton_ascend.demote_f32_reduction", builder.getUnitAttr());
+  }
 
   ModuleOp moduleBackup(moduleOp->clone());
+  CVPipeline::FallbackHelper fallback(moduleOp);
+  PassManager pm(&getContext(), moduleOp.getOperationName());
+
+  LLVM_DEBUG(moduleOp->dump());
 
   // The unroll factor is a pass option rather than a module attribute, so it
   // cannot be stamped on the module the way the other parameters are: the
@@ -944,30 +952,45 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     }
   }
 
-  PassManager pm(&getContext(), moduleOp.getOperationName());
   buildPipeline(pm, finalUnroll);
 
   if (failed(runPipeline(pm, moduleOp)) ||
       CVPipeline::hasFallbackAttr(moduleOp)) {
     auto errCodeAttr =
         moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
+    int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
+                              : CVPipeline::ERRCODE_FAILED;
+    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     if (!errCodeAttr) {
       moduleOp->emitWarning() << "[" << DEBUG_TYPE << "] "
                               << "Unexpected pass failure (no fallback attr "
                                  "set); fallback to compilation without "
                                  "dynamic CV pipeline.";
     } else {
-      moduleOp->emitWarning() << "[" << DEBUG_TYPE << "] "
-                              << "Pass failed, "
-                              << "fallback to compilation without "
-                                 "dynamic CV pipeline.";
+      if (errCode == CVPipeline::ERRCODE_IGNORED) {
+        // pipeline correctly decided this kernel is not a fit
+        // (no matmul, already scope-optimized, unsupported pattern) --
+        // just print a message, no IR.
+        mlir::emitWarning(moduleOp->getLoc())
+            << "[" << DEBUG_TYPE << "] "
+            << "Kernel not applicable for dynamic CV pipeline "
+               "(no matmul / already scope-optimized / unsupported "
+               "pattern); falling back to standard compilation.";
+      } else {
+        // a sub-pass genuinely failed (UB overflow, flag-budget
+        // exhaustion, unsupported while-condition, i1 cross-block dep, ...) --
+        // print a warning message and print module IR.
+        moduleOp->emitWarning()
+            << "[" << DEBUG_TYPE << "] " << "Pass failed (errcode=" << errCode
+            << "); "
+               "falling back to compilation without "
+               "dynamic CV pipeline.";
+      }
     }
 
-    int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
-                              : CVPipeline::ERRCODE_FAILED;
-    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
     restoreModuleFromBackup(moduleOp, moduleBackup);
     moduleBackup->destroy();
+    fallback.restore();
     moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,
                       builder.getI32IntegerAttr(errCode));
     return;

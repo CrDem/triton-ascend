@@ -31,6 +31,7 @@
 
 #include "DynamicCVPipeline/Common/Utils.h"
 #include <iostream>
+#include <cstdlib>
 
 using namespace mlir;
 using namespace triton;
@@ -65,6 +66,9 @@ void PatternMatchRewritePass::runOnOperation() {
   RewritePatternSet patterns(ctx);
   patterns.add<SplitMatmulPattern>(ctx, needSplitAll);
   patterns.add<FoldExpandExtCollapse>(ctx);
+  bool enableDemote = moduleOp->hasAttr("triton_ascend.demote_f32_reduction") ||
+                      std::getenv("TRITON_ASCEND_DEMOTE_F16_REDUCE") != nullptr;
+  patterns.add<DemoteExtReduceTruncPattern>(ctx, enableDemote);
 
   // the way we handle matmul dependencies across for blocks
   // requres the patternmatching to go top-down

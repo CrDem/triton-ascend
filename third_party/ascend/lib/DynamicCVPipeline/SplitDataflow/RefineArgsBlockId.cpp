@@ -260,6 +260,11 @@ static void processOneLoop(Operation *loopOp,
     }
     std::cout << "[VDV DEBUG] arg " << i << " 2" << std::endl;
 
+    if (llvm::isa<scf::IfOp>(yieldDefOp)) {
+      LOG_DEBUG("Yield operand is a if result, skip. Operand: " << yieldOperand
+                                                                << "\n");
+      continue;
+    }
     LOG_DEBUG("yieldDefOp: " << *yieldDefOp << "\n"
                              << "idx: " << i << "\n");
 

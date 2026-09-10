@@ -56,6 +56,7 @@ void PreCheckAvailablePass::runOnOperation() {
   LDBG("Before PreCheck:\n" << module);
   pm.addPass(createPreCheckBlacklistPass());
   pm.addPass(createPreCheckMatmulPass());
+  pm.addPass(createPreCheckDisablePreloadPass());
 
   if (failed(runPipeline(pm, module))) {
     std::cout << "[DEBUG VDV] PreCheckAvailablePass failed" << std::endl;
@@ -76,6 +77,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createPreCheckAvailablePass() {
 void registerPreCheckAvailablePasses() {
   registerPass(createPreCheckBlacklistPass);
   registerPass(createPreCheckMatmulPass);
+  registerPass(createPreCheckDisablePreloadPass);
   registerPass(createPreCheckAvailablePass);
 }
 

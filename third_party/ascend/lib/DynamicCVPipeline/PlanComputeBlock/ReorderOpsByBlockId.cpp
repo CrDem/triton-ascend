@@ -46,6 +46,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -1280,6 +1281,41 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
 
   applyReorder(block, reorderedRes.value());
 
+  // Verify the sync fence invariant: every op that preceded (followed) a
+  // gpu.barrier / hivm.sync_block_all in the original source order must still
+  // precede (follow) it.
+  LLVM_DEBUG({
+    DenseMap<Operation *, unsigned> sourceIdx;
+    for (unsigned i = 0; i < allOps.size(); ++i) {
+      sourceIdx[allOps[i]] = i;
+    }
+    for (Operation &op : block) {
+      if (!CVPipeline::isSyncOp(&op)) {
+        continue;
+      }
+      bool seenBarrier = false;
+      unsigned barrierIdx = sourceIdx[&op];
+      for (Operation &it : block) {
+        if (&it == &op) {
+          seenBarrier = true;
+          continue;
+        }
+        if (!sourceIdx.contains(&it)) {
+          continue;
+        }
+        unsigned idx = sourceIdx.at(&it);
+        if (seenBarrier && idx < barrierIdx) {
+          LOG_DEBUG("Barrier fence violated: op after barrier in source moved "
+                    << "before it: " << it << "\n");
+        }
+        if (!seenBarrier && idx > barrierIdx) {
+          LOG_DEBUG("Barrier fence violated: op before barrier in source moved "
+                    << "after it: " << it << "\n");
+        }
+      }
+    }
+  });
+
   return llvm::success();
 }
 
@@ -1292,6 +1328,18 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
 
   if (CVPipeline::hasFallbackAttr(moduleOp)) {
     return;
+  }
+
+  // MergeComputeBlockPass sets kMergeComputeBlockApplied to record whether it
+  // actually merged blocks. Skip reorder only when it ran but merged nothing;
+  // consume the marker either way so it does not leak into the output IR.
+  if (auto applied = moduleOp->getAttrOfType<BoolAttr>(
+          CVPipeline::kMergeComputeBlockApplied)) {
+    moduleOp->removeAttr(CVPipeline::kMergeComputeBlockApplied);
+    if (!applied.getValue()) {
+      LOG_DEBUG("Skip reorder: MergeComputeBlock ran but merged nothing");
+      return;
+    }
   }
 
   LOG_DEBUG("Input mlir:\n" << moduleOp << "\n");

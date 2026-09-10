@@ -21,6 +21,7 @@
  */
 
 #include "ascend/include/TritonToLinalg/BlockPtrAnalysis.h"
+#include "ascend/include/TritonControlFlowOpt/ControlFlowRewrite.h"
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "ascend/include/Utils/DebugUtils.h"
 #include "ascend/include/Utils/Utils.h"
@@ -54,6 +55,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <cassert>
+#include <limits>
 #include <set>
 
 #define DEBUG_TYPE "triton-block-ptr-analysis"
@@ -470,9 +472,9 @@ BlockDataParser::getScalarMemRef(Value ptr, Value memref, const Location &loc,
   if (ptr.getDefiningOp<triton::IntToPtrOp>()) {
     if (!isa<BaseMemRefType>(memref.getType()))
       return failure();
-    if (auto memrefType = dyn_cast<MemRefType>(memref.getType());
-        memrefType && memrefType.getRank() == 1)
-      return memref;
+    // IntToPtrConverter's rank-1 carrier is still a dynamic base memref, not
+    // the canonical scalar view consumed by indirect loads.  Normalize every
+    // int_to_ptr carrier to the one-element identity view below.
     BlockData data;
     data.setSource(memref);
     data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
@@ -2502,6 +2504,26 @@ bool isLoopCarriedValueUsedWithCondition(
   return isUsedWithCondition(loopOp->getResult(index), condition);
 }
 
+// The legacy BlockData route only needs address uses reached from inside the
+// loop. Reuse the established traversal for the region arguments, but do not
+// start another traversal from the loop result: a numerical carrier can feed
+// an unrelated reduction after the loop and eventually reach an address use.
+static bool isLoopCarriedAddressValueUsed(
+    LoopLikeOpInterface loopOp, unsigned index,
+    const std::function<bool(OpOperand *)> &condition) {
+  if (index >= loopOp.getRegionIterArgs().size() ||
+      index >= loopOp->getNumResults())
+    return false;
+  if (isUsedWithCondition(loopOp.getRegionIterArgs()[index], condition))
+    return true;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp.getOperation())) {
+    if (index < whileOp.getAfterArguments().size() &&
+        isUsedWithCondition(whileOp.getAfterArguments()[index], condition))
+      return true;
+  }
+  return false;
+}
+
 bool needsLegacyBlockDataLoopRewrite(LoopLikeOpInterface loopOp) {
   auto hasPointerValue = [&](auto values) {
     return llvm::any_of(values, [&](Value value) {
@@ -2560,7 +2582,7 @@ bool needsLegacyBlockDataLoopRewrite(LoopLikeOpInterface loopOp) {
     auto integerType = dyn_cast<IntegerType>(tensorType.getElementType());
     if (!integerType || integerType.getWidth() == 1)
       continue;
-    if (isLoopCarriedValueUsedWithCondition(loopOp, index, [](OpOperand *use) {
+    if (isLoopCarriedAddressValueUsed(loopOp, index, [](OpOperand *use) {
           Operation *user = use->getOwner();
           return isa<triton::AddPtrOp>(user) ||
                  (isa<triton::LoadOp>(user) && use->getOperandNumber() == 1) ||
@@ -2569,6 +2591,56 @@ bool needsLegacyBlockDataLoopRewrite(LoopLikeOpInterface loopOp) {
       return true;
   }
   return false;
+}
+
+static bool isMakeRangeCarrier(Value value) {
+  Operation *producer = value.getDefiningOp();
+  if (!producer)
+    return false;
+  if (isa<triton::MakeRangeOp>(producer))
+    return true;
+  if (auto cast = dyn_cast<tensor::CastOp>(producer))
+    return isMakeRangeCarrier(cast.getSource());
+  return false;
+}
+
+SmallVector<unsigned>
+getMarkedMakeRangeCarrierSlots(LoopLikeOpInterface loopOp) {
+  SmallVector<unsigned> slots;
+  if (!loopOp || !loopOp->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
+    return slots;
+
+  auto marker = dyn_cast<DenseI32ArrayAttr>(
+      loopOp->getAttr(controlflow::kPointerDescriptorBoundaryAttr));
+  if (!marker)
+    return slots;
+
+  llvm::SmallDenseSet<unsigned> descriptorSlots;
+  for (int32_t slot : marker.asArrayRef()) {
+    if (slot >= 0)
+      descriptorSlots.insert(static_cast<unsigned>(slot));
+  }
+
+  auto isMaskOrAddressUse = [](OpOperand *use) {
+    Operation *user = use->getOwner();
+    return isa<triton::AddPtrOp>(user) ||
+           (isa<triton::LoadOp>(user) && use->getOperandNumber() == 1) ||
+           (isa<triton::StoreOp>(user) && use->getOperandNumber() == 2);
+  };
+
+  for (auto [slot, init] : llvm::enumerate(loopOp.getInits())) {
+    if (descriptorSlots.contains(slot) || !isMakeRangeCarrier(init))
+      continue;
+    auto tensorType = dyn_cast<RankedTensorType>(init.getType());
+    if (!tensorType || !tensorType.hasStaticShape())
+      continue;
+    auto elementType = dyn_cast<IntegerType>(tensorType.getElementType());
+    if (!elementType || elementType.getWidth() == 1)
+      continue;
+    if (isLoopCarriedValueUsedWithCondition(loopOp, slot, isMaskOrAddressUse))
+      slots.push_back(slot);
+  }
+  return slots;
 }
 
 // This function is util function for rewriteLoopOp that create value from data.
@@ -2637,7 +2709,8 @@ Value createFromData(RankedTensorType resType, const BlockData &data,
 LogicalResult
 BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
                                ConversionPatternRewriter &rewriter,
-                               llvm::SmallDenseMap<Value, BlockData> &known) {
+                               llvm::SmallDenseMap<Value, BlockData> &known,
+                               ArrayRef<unsigned> onlyIndexTensorSlots) {
   SmallVector<Value> newInitArgs;
   SmallVector<int64_t> iterArgIdxMap;
   SmallVector<bool> maskIterArgs;
@@ -2691,6 +2764,10 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
                  (isa<triton::LoadOp>(user) && use->getOperandNumber() == 1) ||
                  (isa<triton::StoreOp>(user) && use->getOperandNumber() == 2);
         });
+
+    if (!onlyIndexTensorSlots.empty() &&
+        !llvm::is_contained(onlyIndexTensorSlots, static_cast<unsigned>(i)))
+      indexTensor = false;
 
     // Handle memref::ReinterpretCastOp and tensor<Integer> specially
     if (!reintCastOp && !indexTensor)
@@ -2952,6 +3029,7 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
     }
   }
   SmallVector<Value> newResults;
+  SmallVector<int64_t> markerSlotMap;
   if (auto forOp = dyn_cast<scf::ForOp>(op.getOperation())) {
     SmallVector<bool> usedForRegionArgs;
     for (auto newInitArg : newInitArgs) {
@@ -2991,6 +3069,7 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
         newResults.push_back(newRes);
       }
     }
+    markerSlotMap = iterArgIdxMap;
   } else if (auto whileOp = dyn_cast<scf::WhileOp>(op.getOperation())) {
     SmallVector<Type> resultTypes;
     SmallVector<bool> usedForBeforeRegionArgs;
@@ -3078,6 +3157,7 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
     if (failed(rewriteTerminator(conditionOp, rewriter, blockArgIdxSetForAfter,
                                  iterArgIdxMapForAfter, known)))
       return failure();
+    markerSlotMap = iterArgIdxMapForAfter;
   }
 
   if (!newOp || newResults.size() != op->getNumResults())
@@ -3086,6 +3166,31 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
 
   // Copy all attributes from op to newOp
   newOp->setAttrs(op->getAttrs());
+  if (!onlyIndexTensorSlots.empty()) {
+    if (Attribute marker =
+            op->getAttr(controlflow::kPointerDescriptorBoundaryAttr)) {
+      auto descriptorSlots = dyn_cast<DenseI32ArrayAttr>(marker);
+      if (!descriptorSlots) {
+        rewriter.eraseOp(newOp.getOperation());
+        return op->emitError("invalid pointer descriptor boundary marker");
+      }
+
+      SmallVector<int32_t> remappedSlots;
+      remappedSlots.reserve(descriptorSlots.size());
+      for (int32_t slot : descriptorSlots.asArrayRef()) {
+        if (slot < 0 || static_cast<size_t>(slot) >= markerSlotMap.size() ||
+            markerSlotMap[slot] < 0 ||
+            markerSlotMap[slot] > std::numeric_limits<int32_t>::max()) {
+          rewriter.eraseOp(newOp.getOperation());
+          return op->emitError(
+              "pointer descriptor slot cannot be remapped after range rewrite");
+        }
+        remappedSlots.push_back(static_cast<int32_t>(markerSlotMap[slot]));
+      }
+      newOp->setAttr(controlflow::kPointerDescriptorBoundaryAttr,
+                     DenseI32ArrayAttr::get(op->getContext(), remappedSlots));
+    }
+  }
   rewriter.replaceOp(op, newResults);
 
   // Update the loop body. Manually invoke the rewrite logic on addptr and yield

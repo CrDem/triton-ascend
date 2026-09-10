@@ -2,6 +2,7 @@
 #include <optional>
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
@@ -12,6 +13,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -131,6 +133,16 @@ bool isVectorOnlyOp(Operation *op) {
       .Default([](auto) { return false; });
 }
 
+bool isSyncOp(Operation *op) {
+  return isa<gpu::BarrierOp, hivm::SyncBlockOp, hivm::SyncBlockWaitOp,
+             hivm::SyncBlockSetOp>(op);
+}
+
+bool isExternalSyncOp(Operation *op) {
+  return isSyncOp(op) &&
+         op->getAttrOfType<IntegerAttr>(CVPipeline::kExternalSync);
+}
+
 bool isScfOp(Operation *op) {
   return llvm::isa<scf::SCFDialect>(op->getDialect());
 }
@@ -208,7 +220,9 @@ CoreType getCoreTypeOfSimpleOpOrCf(Operation *op) {
   auto funcOp = op->getParentOfType<func::FuncOp>();
   if (funcOp) {
     constexpr llvm::StringLiteral regionalDisabledOps[]{
-        "pcb10_tc01_kernel", "_jagged_flash_attention_bwd_basic_kernel"};
+        "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64", "backward_dkdv",
+        "chunk_ttt_linear_fwd_kernel_h", "chunk_ttt_linear_bwd_kernel_h"};
     if (llvm::is_contained(regionalDisabledOps, funcOp.getSymName())) {
       return CoreType::UNDETERMINED;
     }
@@ -490,6 +504,27 @@ std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
   if (inElemType.isInteger(32) && outElemType.isInteger(8))
     return hivm::FixpipePreQuantMode::S322I8;
   return std::nullopt;
+}
+CoreType getValueCoreType(Value value) {
+  auto result = llvm::dyn_cast_if_present<OpResult>(value);
+  if (!result) {
+    return UNDETERMINED;
+  }
+  Operation *defOp = result.getOwner();
+  if (defOp->getNumResults() == 1) {
+    return getOpCoreType(defOp);
+  }
+  auto attr = defOp->getAttrOfType<StringAttr>(kCoreType);
+  if (!attr) {
+    return UNDETERMINED;
+  }
+  llvm::SmallVector<llvm::StringRef> coreTypeStrs;
+  attr.getValue().split(coreTypeStrs, ", ");
+  auto resultIdx = result.getResultNumber();
+  if (coreTypeStrs.size() <= resultIdx) {
+    return UNDETERMINED;
+  }
+  return fromStrCoreType(coreTypeStrs[resultIdx]);
 }
 
 } // namespace CVPipeline
