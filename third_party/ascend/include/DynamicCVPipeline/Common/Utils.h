@@ -95,6 +95,11 @@ inline constexpr llvm::StringLiteral kIterExtension =
 /// variant search before each attempt. Absent means the ordinary block-level
 /// path, which is what an ordinary compilation takes.
 inline constexpr llvm::StringLiteral kReorderSeed = "ssbuffer.reorder_seed";
+/// Which ready block the reordering picks, "lifo" or "fifo", set on the module
+/// by the variant search before each attempt. Absent means the environment
+/// decides, which is what an ordinary compilation takes. Needed as an attribute
+/// rather than only as a variable because one search process tries both.
+inline constexpr llvm::StringLiteral kReorderPolicy = "ssbuffer.reorder_policy";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kIterCounter = "ssbuffer.iterCounter";
 inline constexpr llvm::StringLiteral kForMayNotExec =

@@ -290,10 +290,23 @@ llvm::StringRef describeReadyPolicy(ReadyPolicy policy) {
   return policy == ReadyPolicy::Fifo ? "fifo" : "lifo";
 }
 
-/// Read once. A non-default choice announces itself unconditionally: a run
-/// that silently ignored the variable would be indistinguishable from one that
-/// honoured it, and the two are supposed to produce different IR.
+/// Set for the duration of one pass run when the module names a policy, which
+/// is how the variant search tries both within one process. Empty means the
+/// environment decides.
+///
+/// A file-local override rather than a parameter because the three places that
+/// need the policy are deep inside the ordering helpers and none of them holds
+/// the module; threading it through would touch far more than it explains.
+std::optional<ReadyPolicy> readyPolicyOverride;
+
+/// Read once from the environment, unless the module overrode it. A non-default
+/// choice announces itself unconditionally: a run that silently ignored the
+/// variable would be indistinguishable from one that honoured it, and the two
+/// are supposed to produce different IR.
 ReadyPolicy getReadyPolicy() {
+  if (readyPolicyOverride) {
+    return *readyPolicyOverride;
+  }
   static const ReadyPolicy policy = [] {
     const char *env = std::getenv(kReorderPolicyEnvVar.data());
     if (!env) {
@@ -1283,6 +1296,21 @@ void ReorderOpsByBlockIdPass::runOnOperation() {
 
   LOG_DEBUG("Input mlir:\n" << moduleOp << "\n");
   llvm::dbgs().flush();
+
+  // The module's choice wins over the environment for this run only, so a
+  // search that tries both policies in one process is not fighting a variable
+  // read once per process. Reset every time, or one attempt's choice would
+  // leak into the next.
+  readyPolicyOverride = std::nullopt;
+  if (auto attr =
+          moduleOp->getAttrOfType<StringAttr>(CVPipeline::kReorderPolicy)) {
+    const std::string value = attr.getValue().lower();
+    if (value == "fifo") {
+      readyPolicyOverride = ReadyPolicy::Fifo;
+    } else if (value == "lifo") {
+      readyPolicyOverride = ReadyPolicy::Lifo;
+    }
+  }
 
   auto &aa = getAnalysis<AliasAnalysis>();
   auto memGraph = MemoryDependenceGraph(moduleOp, aa);

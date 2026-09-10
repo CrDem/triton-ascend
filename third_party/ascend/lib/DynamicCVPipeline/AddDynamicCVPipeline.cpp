@@ -39,6 +39,7 @@
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/EstimateCVPipelineCost.h"
+#include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
@@ -202,6 +203,10 @@ std::optional<int64_t> getUBSlackBytes() {
 
 /// How many orderings to try. One or fewer means the ordinary single
 /// compilation, which is what every build that does not ask for a search gets.
+///
+/// This counts *orderings*, not attempts. When the parameter space is swept as
+/// well, every ordering is tried once per point of it, so the number of
+/// compilations is this times the size of that space.
 int getVariantCount() {
   const char *env = std::getenv(kVariantCountEnvVar);
   if (!env) {
@@ -214,6 +219,151 @@ int getVariantCount() {
     return 1;
   }
   return value;
+}
+
+constexpr const char *kSearchModeEnvVar = "TRITON_ASCEND_CV_SEARCH_MODE";
+
+/// Which axes of the search space one run covers.
+///
+/// There are two, and they are independent. One is the *ordering* of operations
+/// within a region, selected by a seed. The other is the handful of *pipeline
+/// parameters* that until now were set by hand between runs: the main loop's
+/// unroll factor, the two buffer-slot counts, and which of the ready compute
+/// blocks the reordering emits first. Measured on flash attention, the second
+/// axis is the one that pays -- buffer counts alone moved the kernel by 12.7%,
+/// where the best ordering found was worth 18% on top of a fixed set of them.
+///
+/// Kept as four modes rather than two flags because the useful combinations are
+/// few and naming them is clearer than explaining which flag suppresses which.
+enum class SearchMode : int {
+  /// No search: compile once, as the caller asked. What every build gets.
+  Off = 0,
+  /// Sweep the parameter space at one fixed ordering -- seed 0, or whichever
+  /// seed the caller named. Answers "which parameters suit this kernel".
+  ConfigOnly = 1,
+  /// Sweep orderings with the parameters left exactly as the caller set them.
+  SeedOnly = 2,
+  /// Both: every ordering against every point of the parameter space.
+  Full = 3,
+};
+
+llvm::StringRef describeSearchMode(SearchMode mode) {
+  switch (mode) {
+  case SearchMode::Off:
+    return "off";
+  case SearchMode::ConfigOnly:
+    return "parameters only";
+  case SearchMode::SeedOnly:
+    return "orderings only";
+  case SearchMode::Full:
+    return "orderings x parameters";
+  }
+  return "?";
+}
+
+SearchMode getSearchMode() {
+  if (const char *env = std::getenv(kSearchModeEnvVar)) {
+    int value = 0;
+    if (!llvm::StringRef(env).getAsInteger(10, value) && value >= 0 &&
+        value <= 3) {
+      return static_cast<SearchMode>(value);
+    }
+    llvm::errs() << "[" << DEBUG_TYPE << "] " << kSearchModeEnvVar << "='"
+                 << env << "' is not a mode between 0 and 3; ignored\n";
+  }
+  // Asking for a number of orderings without naming a mode asks for the whole
+  // space. It used to mean orderings alone, and that is the weaker half: a
+  // sweep that holds the parameters fixed can only find the best ordering for
+  // whatever they happened to be.
+  if (std::getenv(kVariantCountEnvVar)) {
+    return SearchMode::Full;
+  }
+  return SearchMode::Off;
+}
+
+/// One point of the parameter space, alongside the ordering seed.
+///
+/// A field left at its "unset" value means "leave whatever the caller set
+/// alone", which is what the single point used by the ordering-only sweep does
+/// -- it keeps that mode compiling exactly what it compiled before.
+struct VariantConfig {
+  int unroll = 0;  // main loop unroll factor; 0 keeps the pass option
+  int intra = 0;   // intra-core buffer slots;  0 keeps the module attribute
+  int inter = 0;   // inter-core buffer slots;  0 keeps the module attribute
+  int fifo = -1;   // 1 fifo, 0 lifo;          -1 keeps the environment
+};
+
+/// Every combination worth trying, or the single "as given" point.
+///
+/// The ranges are the ones that were being swept by hand and are bounded by the
+/// toolchain rather than by taste: the inter-core count is a flag rather than a
+/// number above two, and the intra-core count stops paying past three.
+llvm::SmallVector<VariantConfig> buildConfigSpace(SearchMode mode) {
+  llvm::SmallVector<VariantConfig> configs;
+  if (mode == SearchMode::Off || mode == SearchMode::SeedOnly) {
+    configs.push_back(VariantConfig{});
+    return configs;
+  }
+  for (int unroll : {1, 2}) {
+    for (int intra : {1, 2, 3}) {
+      for (int inter : {1, 2}) {
+        for (int fifo : {0, 1}) {
+          configs.push_back(VariantConfig{unroll, intra, inter, fifo});
+        }
+      }
+    }
+  }
+  return configs;
+}
+
+std::string describeConfig(const VariantConfig &config) {
+  if (config.unroll == 0 && config.intra == 0 && config.inter == 0 &&
+      config.fifo < 0) {
+    return "as given";
+  }
+  std::string text = "u" + std::to_string(config.unroll) + "/intra" +
+                     std::to_string(config.intra) + "/inter" +
+                     std::to_string(config.inter);
+  if (config.fifo >= 0) {
+    text += config.fifo ? "/fifo" : "/lifo";
+  }
+  return text;
+}
+
+/// Stamp a configuration onto the module, for the passes that read it there.
+///
+/// Called after the module has been restored from the backup, which puts the
+/// caller's own attributes back, so each attempt starts from the same place and
+/// only the fields this point names are overridden.
+void applyVariantConfig(ModuleOp moduleOp, const VariantConfig &config,
+                        OpBuilder &builder) {
+  if (config.intra > 0 || config.inter > 0) {
+    BufferCountManager counts(moduleOp);
+    if (config.intra > 0) {
+      counts.setBufferCount(BufferCountManager::DepType::IntraCore,
+                            config.intra);
+    }
+    if (config.inter > 0) {
+      counts.setBufferCount(BufferCountManager::DepType::InterCore,
+                            config.inter);
+    }
+  }
+  if (config.fifo >= 0) {
+    moduleOp->setAttr(CVPipeline::kReorderPolicy,
+                      builder.getStringAttr(config.fifo ? "fifo" : "lifo"));
+  }
+}
+
+/// The ordering the caller named by hand, if any. Used as the fixed ordering
+/// the parameter-only sweep runs against.
+int64_t getRequestedSeed() {
+  if (const char *env = std::getenv("TRITON_ASCEND_REORDER_SEED")) {
+    int64_t value = 0;
+    if (!llvm::StringRef(env).getAsInteger(10, value) && value >= 0) {
+      return value;
+    }
+  }
+  return 0;
 }
 
 /// Directory to keep one log per attempted variant in, or empty for none.
@@ -350,14 +500,17 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
   ModuleOp moduleBackup(moduleOp->clone());
 
-  auto buildPipeline = [&](PassManager &pm) {
+  // The unroll factor is a pass option rather than a module attribute, so it
+  // cannot be stamped on the module the way the other parameters are: the
+  // pipeline itself has to be rebuilt around it.
+  auto buildPipeline = [&](PassManager &pm, int unrollFactor) {
     // Unroll the main loop once the compute blocks are planned but before the
     // dataflow is split, so that the inter core transfers, their sync flags and
     // the multi buffers below are planned for each unrolled copy separately.
     // The pass is a no-op unless a factor > 1 was requested.
-    if (this->mainLoopUnrollFactor > 1) {
+    if (unrollFactor > 1) {
       MainLoopUnrollOptions unrollOptions;
-      unrollOptions.unrollFactor = this->mainLoopUnrollFactor;
+      unrollOptions.unrollFactor = unrollFactor;
       pm.addPass(createMainLoopUnrollPass(unrollOptions));
       pm.addPass(createCanonicalizerPass());
     }
@@ -376,13 +529,26 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     pm.addPass(createRemoveSsbufAttrPass());
   };
 
-  // Try several orderings and keep the cheapest, when asked to. The winning
-  // seed is compiled once more at the end with the estimate allowed to speak,
-  // so the module that survives and the report that describes it are the same
+  // Try several candidates and keep the cheapest, when asked to. The winner is
+  // compiled once more at the end with the estimate allowed to speak, so the
+  // module that survives and the report that describes it are the same
   // compilation rather than two that happen to agree.
-  const int variantCount = getVariantCount();
-  if (variantCount > 1) {
+  const SearchMode searchMode = getSearchMode();
+  const llvm::SmallVector<VariantConfig> configSpace =
+      buildConfigSpace(searchMode);
+  // The parameter-only sweep holds the ordering still; the others walk it.
+  const bool sweepsOrderings = searchMode == SearchMode::SeedOnly ||
+                               searchMode == SearchMode::Full;
+  const int seedCount = sweepsOrderings ? getVariantCount() : 1;
+  const int64_t fixedSeed = getRequestedSeed();
+  // What the winner is compiled with at the end, and what an unsearched build
+  // uses unchanged.
+  int finalUnroll = this->mainLoopUnrollFactor;
+
+  if (searchMode != SearchMode::Off &&
+      (seedCount > 1 || configSpace.size() > 1)) {
     int64_t bestSeed = -1;
+    size_t bestConfig = 0;
     int64_t bestCost = 0;
     // The bound the total did not come from, for the winner. Used only to
     // separate candidates whose totals tie.
@@ -416,32 +582,54 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // which no pass here can foresee -- leaves the next choices on record
     // instead of sending the search back to the start.
     // Ordered by the first two, so the trailing fields are carried along rather
-    // than compared: seed is unique and stages is a diagnostic.
-    SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> ranked;
+    // than compared: the seed and configuration name the candidate and stages
+    // is a diagnostic.
+    SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t, size_t, int64_t>>
+        ranked;
     const std::optional<int64_t> ubSlack = getUBSlackBytes();
     const std::optional<int64_t> stageSlack = getStageSlack();
-    // Set by seed 0, the untouched pipeline, which the loop below reaches
-    // first. Everything after it is judged against these.
-    std::optional<int64_t> baselineUBPeak;
-    std::optional<int64_t> baselineDepth;
-    // Derived from the baseline when TRITON_ASCEND_CV_UB_SLACK_BYTES says
-    // nothing: the room to spend is what the baseline leaves unused.
-    int64_t ubAllowance = 0;
-    llvm::errs() << "[" << DEBUG_TYPE << "] variant search: trying "
-                 << variantCount << " operation orderings\n";
 
-    // Where each attempt's output goes. Named once here rather than per seed so
-    // the advice below is printed once too.
+    // One reference per point of the parameter space, not one per search.
+    //
+    // The guards below ask whether a candidate spends more than the untouched
+    // pipeline does, and that question only means something at equal
+    // parameters: raising the intra-core buffer count legitimately holds more
+    // Unified Buffer live, and a single global reference would reject exactly
+    // the configurations that were measured to be fastest. So each point is
+    // judged against itself at the first ordering tried.
+    struct ConfigBaseline {
+      bool established = false;
+      int64_t ubPeak = 0;
+      int64_t depth = 0;
+      int64_t allowance = 0;
+    };
+    SmallVector<ConfigBaseline> baselines(configSpace.size());
+
+    const int64_t plannedAttempts =
+        static_cast<int64_t>(seedCount) * static_cast<int64_t>(
+            configSpace.size());
+    llvm::errs() << "[" << DEBUG_TYPE << "] variant search ("
+                 << describeSearchMode(searchMode) << "): " << seedCount
+                 << " ordering(s) x " << configSpace.size()
+                 << " parameter set(s) = " << plannedAttempts
+                 << " compilation(s)\n";
+    if (searchMode == SearchMode::ConfigOnly) {
+      llvm::errs() << "[" << DEBUG_TYPE << "]   ordering held at seed "
+                   << fixedSeed << "\n";
+    }
+
+    // Where each attempt's output goes. Named once here rather than per attempt
+    // so the advice below is printed once too.
     const std::string logDir = getVariantLogDir();
     if (logDir.empty()) {
       llvm::errs() << "[" << DEBUG_TYPE << "]   attempt output is discarded;"
                       " set " << kVariantLogDirEnvVar << " to keep one log per"
-                      " seed, which is also what names the culprit if an"
+                      " attempt, which is also what names the culprit if an"
                       " attempt dies without returning\n";
     } else {
       llvm::errs() << "[" << DEBUG_TYPE << "]   attempt output goes to "
-                   << logDir << "/seed_<n>.log; the last file written is the"
-                      " seed being tried\n";
+                   << logDir << "/seed_<n>_cfg<k>.log; the last file written is"
+                      " the attempt being tried\n";
     }
 
     // Why the rejected candidates were rejected, counted by error code. A
@@ -458,184 +646,212 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       failures.push_back({code, 1});
     };
 
-    for (int64_t seed = 0; seed < variantCount; ++seed) {
-      bool accepted = false;
-      int64_t cost = 0;
-      int64_t second = 0;
-      int64_t ubBytes = 0;
-      int64_t ubCapacity = 0;
-      int64_t depth = 0;
-      // Reported, not guarded: the estimate already charges the fill and drain
-      // these stages cost, so a deep candidate pays in its own score. Carried
-      // here because when a candidate is expensive this is usually the reason,
-      // and the summary is the only place showing several candidates at once.
-      int64_t stages = 0;
-      int errCode = 0;
+    // Ordering outermost, parameters innermost: every point of the parameter
+    // space is tried against one ordering before the next ordering is reached,
+    // so a run cut short still has a complete picture of the axis that pays.
+    for (int64_t seedIdx = 0; seedIdx < seedCount; ++seedIdx) {
+      const int64_t seed =
+          searchMode == SearchMode::ConfigOnly ? fixedSeed : seedIdx;
+      for (size_t cfgIdx = 0; cfgIdx < configSpace.size(); ++cfgIdx) {
+        const VariantConfig &config = configSpace[cfgIdx];
+        bool accepted = false;
+        int64_t cost = 0;
+        int64_t second = 0;
+        int64_t ubBytes = 0;
+        int64_t ubCapacity = 0;
+        int64_t depth = 0;
+        // Reported, not guarded: the estimate already charges the fill and
+        // drain these stages cost, so a deep candidate pays in its own score.
+        // Carried here because when a candidate is expensive this is usually
+        // why, and the summary is the only place showing several at once.
+        int64_t stages = 0;
+        int errCode = 0;
 
-      {
-        // Nothing the trial prints is worth reading while it succeeds: it
-        // describes IR that is about to be discarded. The estimate is asked to
-        // stay quiet, and the rest of the pipeline is redirected at the
-        // descriptor -- to a per-seed file when one was asked for, so that the
-        // output of an attempt that never returns is still on disk afterwards.
-        std::string logPath;
-        if (!logDir.empty()) {
-          llvm::SmallString<128> path(logDir);
-          llvm::sys::path::append(path,
-                                  "seed_" + std::to_string(seed) + ".log");
-          // assign from the raw characters: SmallString::str() has returned
-          // different types across LLVM versions.
-          logPath.assign(path.begin(), path.end());
+        {
+          // Nothing the trial prints is worth reading while it succeeds: it
+          // describes IR that is about to be discarded. The estimate is asked
+          // to stay quiet, and the rest of the pipeline is redirected at the
+          // descriptor -- to a per-attempt file when one was asked for, so that
+          // the output of an attempt that never returns is still on disk
+          // afterwards.
+          std::string logPath;
+          if (!logDir.empty()) {
+            llvm::SmallString<128> path(logDir);
+            llvm::sys::path::append(path, "seed_" + std::to_string(seed) +
+                                              "_cfg" + std::to_string(cfgIdx) +
+                                              ".log");
+            // assign from the raw characters: SmallString::str() has returned
+            // different types across LLVM versions.
+            logPath.assign(path.begin(), path.end());
+          }
+          OutputSilencer hush(logPath);
+
+          // Every attempt starts from the untouched input: the pipeline
+          // rewrites the module in place, so a candidate must not be built on
+          // the previous one's output. That also restores the caller's own
+          // buffer counts, which is what makes the overrides below additive
+          // rather than cumulative.
+          ModuleOp attempt(moduleBackup->clone());
+          restoreModuleFromBackup(moduleOp, attempt);
+          attempt->destroy();
+
+          moduleOp->setAttr(CVPipeline::kReorderSeed,
+                            builder.getI64IntegerAttr(seed));
+          moduleOp->setAttr(mlir::triton::kCVPipelineCostQuiet,
+                            builder.getUnitAttr());
+          applyVariantConfig(moduleOp, config, builder);
+
+          PassManager trial(&getContext(), moduleOp.getOperationName());
+          buildPipeline(trial, config.unroll > 0 ? config.unroll
+                                                 : this->mainLoopUnrollFactor);
+          const bool ran = !failed(runPipeline(trial, moduleOp)) &&
+                           !CVPipeline::hasFallbackAttr(moduleOp);
+          auto costAttr = moduleOp->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineEstimatedCycles);
+          if (ran && costAttr) {
+            accepted = true;
+            cost = costAttr.getInt();
+            auto resourceAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                mlir::triton::kCVPipelineCostResource);
+            auto recurrenceAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                mlir::triton::kCVPipelineCostRecurrence);
+            // Falling back to the total itself makes every tie compare equal,
+            // which is exactly the behaviour before the second bound existed.
+            second = resourceAttr && recurrenceAttr
+                         ? std::min(resourceAttr.getInt(),
+                                    recurrenceAttr.getInt())
+                         : cost;
+            if (auto ubAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                    mlir::triton::kCVPipelineCostUBPeak)) {
+              ubBytes = ubAttr.getInt();
+            }
+            if (auto stageAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                    mlir::triton::kCVPipelineCostPipelineStages)) {
+              stages = stageAttr.getInt();
+            }
+            // -3: it compiled and scored, but holds more Unified Buffer live
+            // than the baseline plus what the caller allowed. A rejection
+            // rather than ranked, so the summary shows how much of the search
+            // this threw away -- and if that is most of it, the answer for this
+            // kernel is that the partition axis has no room, which is worth
+            // seeing rather than inferring from a winner that will not build.
+            if (auto capAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                    mlir::triton::kCVPipelineCostUBCapacity)) {
+              ubCapacity = capAttr.getInt();
+            }
+            if (auto depthAttr = moduleOp->getAttrOfType<IntegerAttr>(
+                    mlir::triton::kCVPipelineCostPipelineDepth)) {
+              depth = depthAttr.getInt();
+            }
+            // -3: it holds more Unified Buffer live than this parameter set's
+            // own baseline plus the room that baseline left unused. Both
+            // guards below run against a baseline rather than an absolute, so
+            // nothing here is fitted to a kernel; a baseline itself always
+            // passes, having set the reference, so the worst a wrong estimate
+            // can do is return it.
+            const ConfigBaseline &base = baselines[cfgIdx];
+            if (base.established && ubBytes > base.ubPeak + base.allowance) {
+              accepted = false;
+              errCode = -3;
+            }
+            // -4: the software pipeline needs a larger buffer factor than this
+            // configuration's baseline, which the binary compiler refuses as a
+            // prologue that reads a buffer before its first write.
+            if (accepted && base.established &&
+                depth > base.depth + stageSlack.value_or(0)) {
+              accepted = false;
+              errCode = -4;
+            }
+          } else if (!ran) {
+            auto codeAttr =
+                moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
+            // -1: the pipeline declined without saying why.
+            errCode = codeAttr ? static_cast<int>(codeAttr.getInt()) : -1;
+          } else {
+            // -2: it compiled, but produced no estimate to rank it by.
+            errCode = -2;
+          }
         }
-        OutputSilencer hush(logPath);
 
-        // Every attempt starts from the untouched input: the pipeline rewrites
-        // the module in place, so a candidate must not be built on the
-        // previous one's output.
-        ModuleOp attempt(moduleBackup->clone());
-        restoreModuleFromBackup(moduleOp, attempt);
-        attempt->destroy();
-
-        moduleOp->setAttr(CVPipeline::kReorderSeed,
-                          builder.getI64IntegerAttr(seed));
-        moduleOp->setAttr(mlir::triton::kCVPipelineCostQuiet,
-                          builder.getUnitAttr());
-
-        PassManager trial(&getContext(), moduleOp.getOperationName());
-        buildPipeline(trial);
-        const bool ran = !failed(runPipeline(trial, moduleOp)) &&
-                         !CVPipeline::hasFallbackAttr(moduleOp);
-        auto costAttr = moduleOp->getAttrOfType<IntegerAttr>(
-            mlir::triton::kCVPipelineEstimatedCycles);
-        if (ran && costAttr) {
-          accepted = true;
-          cost = costAttr.getInt();
-          auto resourceAttr = moduleOp->getAttrOfType<IntegerAttr>(
-              mlir::triton::kCVPipelineCostResource);
-          auto recurrenceAttr = moduleOp->getAttrOfType<IntegerAttr>(
-              mlir::triton::kCVPipelineCostRecurrence);
-          // Falling back to the total itself makes every tie compare equal,
-          // which is exactly the behaviour before the second bound existed.
-          second = resourceAttr && recurrenceAttr
-                       ? std::min(resourceAttr.getInt(), recurrenceAttr.getInt())
-                       : cost;
-          if (auto ubAttr = moduleOp->getAttrOfType<IntegerAttr>(
-                  mlir::triton::kCVPipelineCostUBPeak)) {
-            ubBytes = ubAttr.getInt();
-          }
-          if (auto stageAttr = moduleOp->getAttrOfType<IntegerAttr>(
-                  mlir::triton::kCVPipelineCostPipelineStages)) {
-            stages = stageAttr.getInt();
-          }
-          // -3: it compiled and scored, but holds more Unified Buffer live than
-          // the baseline plus what the caller allowed. Counted as a rejection
-          // rather than ranked, so the summary shows how much of the search
-          // this threw away -- and if that is most of it, the answer for this
-          // kernel is that the partition axis has no room, which is worth
-          // seeing rather than inferring from a winner that will not build.
-          if (auto capAttr = moduleOp->getAttrOfType<IntegerAttr>(
-                  mlir::triton::kCVPipelineCostUBCapacity)) {
-            ubCapacity = capAttr.getInt();
-          }
-          if (auto depthAttr = moduleOp->getAttrOfType<IntegerAttr>(
-                  mlir::triton::kCVPipelineCostPipelineDepth)) {
-            depth = depthAttr.getInt();
-          }
-          // -3: it holds more Unified Buffer live than the baseline plus the
-          // room the baseline left unused. Both guards below run against the
-          // baseline rather than against an absolute, so nothing here is fitted
-          // to a kernel; the baseline itself always passes, having set the
-          // reference, so the worst a wrong estimate can do is return it.
-          if (baselineUBPeak && ubBytes > *baselineUBPeak + ubAllowance) {
-            accepted = false;
-            errCode = -3;
-          }
-          // -4: the software pipeline was cut into more stages than the
-          // baseline's, which the binary compiler refuses as a prologue that
-          // reads a buffer before its first write.
-          if (accepted && baselineDepth &&
-              depth > *baselineDepth + stageSlack.value_or(0)) {
-            accepted = false;
-            errCode = -4;
-          }
-        } else if (!ran) {
-          auto codeAttr =
-              moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
-          // -1: the pipeline declined without saying why.
-          errCode = codeAttr ? static_cast<int>(codeAttr.getInt()) : -1;
-        } else {
-          // -2: it compiled, but produced no estimate to rank it by.
-          errCode = -2;
+        if (!accepted) {
+          countFailure(errCode);
+          continue;
         }
-      }
 
-      if (!accepted) {
-        countFailure(errCode);
-        continue;
-      }
-
-      ++usable;
-      if (seed == 0) {
-        baselineUBPeak = ubBytes;
-        baselineDepth = depth;
-        // What the baseline leaves unused, unless the caller named a figure.
-        // A baseline that already fills the buffer yields zero and admits only
-        // candidates that hold no more than it does -- the right answer, and
-        // the one flash attention gives at 128x128.
-        ubAllowance = ubSlack ? *ubSlack
-                              : std::max<int64_t>(0, ubCapacity - ubBytes);
-        llvm::errs() << "[" << DEBUG_TYPE << "]   baseline: " << ubBytes
-                     << " bytes of unified buffer live against a capacity of "
-                     << ubCapacity << ", buffer factor " << depth << ", "
-                     << stages << " pipeline stage(s)"
-                     << "; candidates may spend " << ubAllowance
-                     << " more byte(s) and " << stageSlack.value_or(0)
-                     << " more buffer factor(s). Stage count is not guarded:"
-                     << " the fill and drain it costs are charged in the"
-                     << " estimate, so a deeper candidate has to earn it\n";
-      }
-      distinctCosts.insert({cost, second});
-      ranked.push_back({cost, second, ubBytes, seed, stages});
-      if (worstCost < cost) {
-        worstCost = cost;
-      }
-      // Order by the total, and by the other bound only when the totals cannot
-      // be told apart. The two bounds are not interchangeable -- the total is
-      // still what the model claims the kernel costs -- so this never lets a
-      // candidate with a worse total win.
-      bool improves = bestSeed < 0;
-      bool byTieBreak = false;
-      if (!improves) {
-        if (totalsAreTied(cost, bestCost)) {
-          ++tiedCandidates;
-          improves = second < bestSecond;
-          byTieBreak = improves;
-        } else {
-          improves = cost < bestCost;
+        ++usable;
+        ConfigBaseline &base = baselines[cfgIdx];
+        if (!base.established) {
+          base.established = true;
+          base.ubPeak = ubBytes;
+          base.depth = depth;
+          // What this configuration's baseline leaves unused, unless the caller
+          // named a figure. A baseline that already fills the buffer yields
+          // zero and admits only candidates that hold no more than it does --
+          // right answer, and the one flash attention gives at 128x128.
+          base.allowance = ubSlack ? *ubSlack
+                                   : std::max<int64_t>(0, ubCapacity - ubBytes);
+          // Only the first parameter set gets a line of its own; printing this
+          // for all twenty-four would bury the improvements the search reports.
+          if (cfgIdx == 0) {
+            llvm::errs() << "[" << DEBUG_TYPE << "]   baseline ("
+                         << describeConfig(config) << "): " << ubBytes
+                         << " bytes of unified buffer live, capacity "
+                         << ubCapacity << ", buffer factor " << depth << ", "
+                         << stages << " pipeline stage(s)"
+                         << "; candidates may spend " << base.allowance
+                         << " more byte(s) and " << stageSlack.value_or(0)
+                         << " more buffer factor(s). Every parameter set is"
+                            " judged against itself, so raising a buffer count"
+                            " is not held against the candidate asking for it."
+                            " Stage count is not guarded: the fill and drain it"
+                            " costs are charged in the estimate\n";
+          }
         }
-      }
-      if (improves) {
-        bestSeed = seed;
-        bestCost = cost;
-        bestSecond = second;
-        if (byTieBreak) {
-          ++tieBreaks;
+        distinctCosts.insert({cost, second});
+        ranked.push_back({cost, second, ubBytes, seed, cfgIdx, stages});
+        if (worstCost < cost) {
+          worstCost = cost;
         }
-        llvm::errs() << "[" << DEBUG_TYPE << "]   seed " << seed << ": " << cost
-                     << " cycles";
-        if (byTieBreak) {
-          llvm::errs() << " (tied on the total; won on the other bound at "
-                       << second << ")";
+        // Order by the total, and by the other bound only when the totals
+        // cannot be told apart. The bounds are not interchangeable -- the
+        // total is still what the model claims the kernel costs -- so this
+        // never lets a candidate with a worse total win.
+        bool improves = bestSeed < 0;
+        bool byTieBreak = false;
+        if (!improves) {
+          if (totalsAreTied(cost, bestCost)) {
+            ++tiedCandidates;
+            improves = second < bestSecond;
+            byTieBreak = improves;
+          } else {
+            improves = cost < bestCost;
+          }
         }
-        llvm::errs() << " (best so far)\n";
+        if (improves) {
+          bestSeed = seed;
+          bestConfig = cfgIdx;
+          bestCost = cost;
+          bestSecond = second;
+          if (byTieBreak) {
+            ++tieBreaks;
+          }
+          llvm::errs() << "[" << DEBUG_TYPE << "]   seed " << seed << " ["
+                       << describeConfig(config) << "]: " << cost << " cycles";
+          if (byTieBreak) {
+            llvm::errs() << " (tied on the total; won on the other bound at "
+                         << second << ")";
+          }
+          llvm::errs() << " (best so far)\n";
+        }
       }
     }
 
     llvm::errs() << "[" << DEBUG_TYPE << "] variant search: " << usable << " of "
-                 << variantCount << " ordering(s) compiled";
+                 << plannedAttempts << " compilation(s) usable";
     if (bestSeed >= 0) {
-      llvm::errs() << ", keeping seed " << bestSeed << " at " << bestCost
-                   << " cycles\n";
+      llvm::errs() << ", keeping seed " << bestSeed << " ["
+                   << describeConfig(configSpace[bestConfig]) << "] at "
+                   << bestCost << " cycles\n";
       llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctCosts.size()
                    << " distinct estimate(s), worst " << worstCost
                    << " cycles; seed 0 is the untouched pipeline\n";
@@ -670,14 +886,15 @@ void AddDynamicCVPipelinePass::runOnOperation() {
             std::get<1>(ranked[i]) == std::get<1>(ranked[i - 1])) {
           continue;
         }
-        llvm::errs() << " " << std::get<3>(ranked[i]) << "("
-                     << std::get<0>(ranked[i]) << "/" << std::get<1>(ranked[i])
-                     << "/" << std::get<2>(ranked[i]) << "B/"
-                     << std::get<4>(ranked[i]) << "st)";
+        llvm::errs() << " " << std::get<3>(ranked[i]) << "["
+                     << describeConfig(configSpace[std::get<4>(ranked[i])])
+                     << "](" << std::get<0>(ranked[i]) << "/"
+                     << std::get<1>(ranked[i]) << "/" << std::get<2>(ranked[i])
+                     << "B/" << std::get<5>(ranked[i]) << "st)";
         ++shown;
       }
-      llvm::errs() << "  [seed(total/second bound/unified buffer/pipeline"
-                      " stages)]\n";
+      llvm::errs() << "  [seed[parameters](total/second bound/unified buffer/"
+                      "pipeline stages)]\n";
     } else {
       llvm::errs() << ", none usable; compiling without a variant\n";
     }
@@ -689,16 +906,13 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       } else if (entry.first == -2) {
         llvm::errs() << "no estimate produced\n";
       } else if (entry.first == -3) {
-        llvm::errs() << "more than the baseline's "
-                     << baselineUBPeak.value_or(0) << " bytes of unified"
-                        " buffer plus its "
-                     << ubAllowance << "-byte allowance\n";
+        llvm::errs() << "more unified buffer than the baseline of their own"
+                        " parameter set, plus the allowance derived from it\n";
       } else if (entry.first == -4) {
         llvm::errs() << "a larger software-pipeline buffer factor than the"
-                        " baseline's "
-                     << baselineDepth.value_or(0)
-                     << ", which the binary compiler refuses as a prologue that"
-                        " reads a buffer before its first write\n";
+                        " baseline of their own parameter set, which the binary"
+                        " compiler refuses as a prologue that reads a buffer"
+                        " before its first write\n";
       } else {
         llvm::errs() << "error code " << entry.first << "\n";
       }
@@ -719,11 +933,19 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     if (bestSeed >= 0) {
       moduleOp->setAttr(CVPipeline::kReorderSeed,
                         builder.getI64IntegerAttr(bestSeed));
+      // The winning parameters have to be re-applied too: the restore above put
+      // the caller's own back, and the ordering alone does not reproduce the
+      // candidate that won.
+      const VariantConfig &winner = configSpace[bestConfig];
+      applyVariantConfig(moduleOp, winner, builder);
+      if (winner.unroll > 0) {
+        finalUnroll = winner.unroll;
+      }
     }
   }
 
   PassManager pm(&getContext(), moduleOp.getOperationName());
-  buildPipeline(pm);
+  buildPipeline(pm, finalUnroll);
 
   if (failed(runPipeline(pm, moduleOp)) ||
       CVPipeline::hasFallbackAttr(moduleOp)) {
