@@ -51,6 +51,14 @@ public:
                                       PatternRewriter &rewriter) const override;
 };
 
+struct DemoteExtReduceTruncPattern : public OpRewritePattern<arith::TruncFOp> {
+  DemoteExtReduceTruncPattern(MLIRContext *ctx, bool enabled);
+  LogicalResult matchAndRewrite(arith::TruncFOp truncOp,
+                                PatternRewriter &rewriter) const override;
+private:
+  bool enabled;
+};
+
 class PatternMatchRewritePass
     : public PassWrapper<PatternMatchRewritePass, OperationPass<ModuleOp>> {
 public:

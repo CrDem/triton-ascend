@@ -576,7 +576,10 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # unroll is the one carrying the cube <-> vector communication,
             # which only the pipeline itself can point at.
             main_loop_unroll_factor = metadata.get("main_loop_unroll_factor") or 1
-            ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95, main_loop_unroll_factor)
+            demote_f32_reduction = metadata.get("demote_f32_reduction") or False
+            ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95,
+                                                           main_loop_unroll_factor,
+                                                           demote_f32_reduction)
 
         if _enable_msdebug():
             ascend.passes.ttir.add_normalize_debug_line_locations(pm)
@@ -1430,6 +1433,7 @@ class NPUOptions:
     # communication), applied inside the dynamic CV pipeline. Only takes effect
     # with enable_dynamic_cv_pipeline; 1 (default) leaves the loop untouched.
     main_loop_unroll_factor: int = 1
+    demote_f32_reduction: bool = False
     enable_cube_block_merge: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = None
     buf_slot_num_of_veccore: int = None

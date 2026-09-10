@@ -21,6 +21,61 @@ from triton.backends.ascend.compiler import (
 
 
 @triton.jit
+def _vdv_atn_fwd_inner_fp16(acc, l_i, m_i, q, #
+                    K_block_ptr, V_block_ptr, ATTEN_MASK, #
+                    stride_am, start_m, qk_scale: tl.constexpr,  #
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):
+    lo, hi = 0, N_CTX
+    # 0, 256, step 128
+    # 0, 8192, step 128
+    q_type : tl.constexpr = q.type
+    K_block_ptr = tl.advance(K_block_ptr, (lo, 0))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in tl.range(lo, hi, BLOCK_N):#, loop_unroll_factor=2):
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)      
+        trans_k = tl.trans(k)
+        qk = tl.dot(q, trans_k)
+        K_block_ptr = tl.advance(K_block_ptr, (BLOCK_N, 0))
+        # ------------------------------
+
+        qk = qk.cast(q_type)
+        qk = qk * qk_scale
+        tl.static_assert(qk.type.element_ty == q_type.element_ty)
+        qk = tl.max(qk, 1, propagate_nan=True)
+        qk = qk.cast(q_type)
+        tl.static_assert(qk.type.element_ty == q_type.element_ty)
+        m_ij = tl.maximum(m_i, qk, propagate_nan=tl.PropagateNan.ALL)
+        qk = qk - m_ij[:, None]
+        tl.static_assert(qk.type.element_ty == q_type.element_ty)
+        
+        ###p = tl.exp(qk.cast(q_type))
+        p = tl.math.exp(qk)
+        ####p = p.cast(q_type)
+        #orig_shape = p.shape
+        ###p_cast = p.view([BLOCK_M * BLOCK_N]).cast(q.type) ###.to(q.type)
+        ###p_cast = p_cast.view(p.shape)
+        #p_cast = p.cast(q_type)
+        ###
+        v = tl.load(V_block_ptr)
+        #pv = tl.dot(p_cast, v)
+        pv = tl.dot(p, v)
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp(m_i - m_ij)
+        m_i = m_ij 
+
+        # -- update output accumulator --
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None] + pv
+    return acc, l_i, m_i
+
+@triton.jit
 def _vdv_atn_fwd_inner_opt(acc, l_i, m_i, q, #
                     K_block_ptr, V_block_ptr, ATTEN_MASK, #
                     stride_am, start_m, qk_scale: tl.constexpr,  #
@@ -151,6 +206,7 @@ def _vdv_atn_fwd(Q, K, V, ATTEN_MASK, M, Out, sm_scale: tl.constexpr,  #
 
         # load q: it will stay in SRAM throughout
         q = tl.load(Q_block_ptr)
+        ###m_i = m_i.cast(q.type)
         acc, l_i, m_i = _vdv_atn_fwd_inner_opt(acc, l_i, m_i, q, K_block_ptr, V_block_ptr, ATTEN_MASK, #
                                         stride_am, task_m_idx, sm_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
@@ -213,7 +269,7 @@ def main():
     H=8
     N_CTX=8192
     HEAD_DIM=128
-    sm_scale=0.5
+    sm_scale: torch.float16 = 0.5
     AICORE_NUM=28
     BM=128
     BN=128
@@ -295,7 +351,14 @@ def main():
     target = GPUTarget(backend="npu", arch="Ascend950PR_958b", warp_size=32)
 
     backend = AscendBackend(target)
-    options = backend.parse_options({"debug": True, "compile_on_910_95":True, "enable_dynamic_cv_pipeline": True})  # NPUOptions с дефолтами
+    options = backend.parse_options({"debug": True,
+                                     "compile_on_910_95":True,
+                                     "enable_dynamic_cv_pipeline": True,
+                                     "main_loop_unroll_factor": 1,
+                                     #"demote_f32_reduction": True,
+                                     #"buf_slot_num_of_veccore": 3,
+                                     #"buf_slot_num_of_crosscore": 2,
+                                     })  # NPUOptions с дефолтами
     for key, value in vars(options).items():
         print(f"{key}: {value}")
 

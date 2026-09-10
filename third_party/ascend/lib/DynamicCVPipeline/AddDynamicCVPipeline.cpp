@@ -305,11 +305,15 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     llvm::errs() << "Add-dynamic-cv-pipeline is only supported on 91095 now.\n";
     return;
   }
+  if (this->demoteF32Reduction) {
+    moduleOp->setAttr("triton_ascend.demote_f32_reduction", builder.getUnitAttr());
+  }
 
   ModuleOp moduleBackup(moduleOp->clone());
   CVPipeline::FallbackHelper fallback(moduleOp);
   PassManager pm(&getContext(), moduleOp.getOperationName());
 
+  moduleOp->dump();
   auto buildPipeline = [&](PassManager &pm) {
     // Unroll the main loop once the compute blocks are planned but before the
     // dataflow is split, so that the inter core transfers, their sync flags and
