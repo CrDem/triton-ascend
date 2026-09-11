@@ -209,6 +209,22 @@ static bool shouldEraseOpForCube(
     return true;
   }
 
+  // Rule 1b: the same operations, one level down. AddMultiBufferOuterScope
+  // runs before this pass and, whenever inter-core buffering is on, wraps
+  // every synchronisation op in an scf.if choosing the flag that belongs to
+  // this iteration's buffer half. Rule 1 tests the operation's own type, so
+  // after that wrapping it stops matching and a cloned handshake survives
+  // cube cleanup. It survives in a different pipeline stage than the original,
+  // and since the stages count iterations independently, one flag pair then
+  // gets driven from two unrelated parities: the consumer's wait is released
+  // by the wrong producer, or never.
+  //
+  // Only scf.ifs that yield nothing qualify. The wrapper built around a
+  // transfer op yields its result and is data, not a handshake.
+  if (op->getNumResults() == 0 && isIfOpWithOnlySyncOps(op)) {
+    return true;
+  }
+
   auto opBlockId = getLoopDirectChildBlockId(op);
 
   // Rule 2: if op has results, check via SSA whether any result is used by a
@@ -283,6 +299,24 @@ static LogicalResult validateClonedSyncOpsErased(Block *bodyBlock) {
     if (isa<SyncBlockWaitOp>(&op) || isa<SyncBlockSetOp>(&op) ||
         isa<hivm::FixpipeOp>(&op)) {
       LDBG("[ERROR]: Cloned sync/fixpipe op should have been erased: "
+           << op.getName());
+      return failure();
+    }
+    // Look inside as well. Cloning copies whole regions but marks only the
+    // operation it was handed, so a synchronisation op that
+    // AddMultiBufferOuterScope had already wrapped in an scf.if carries no
+    // kClone of its own and passes the type check above unseen -- which is
+    // exactly the case this check exists to catch. Rule 1b in the cleanup
+    // erases those, so reaching here means one got past it; failing sends the
+    // kernel to the fallback instead of emitting a duplicated handshake.
+    WalkResult nested = op.walk([](Operation *inner) {
+      return isa<SyncBlockWaitOp>(inner) || isa<SyncBlockSetOp>(inner)
+                 ? WalkResult::interrupt()
+                 : WalkResult::advance();
+    });
+    if (nested.wasInterrupted()) {
+      LDBG("[ERROR]: Cloned op still holds a sync op that should have been "
+           "erased: "
            << op.getName());
       return failure();
     }
