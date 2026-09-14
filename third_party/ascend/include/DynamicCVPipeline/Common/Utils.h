@@ -125,6 +125,8 @@ inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
 static constexpr const int ERRCODE_FAILED = 1;
 static constexpr const int ERRCODE_IGNORED = 2;
+static constexpr const int ERRCODE_TUPLE_PRELOAD_FAILED = 3;
+static constexpr const int ERRCODE_DISABLE_VF_SUBSTITUTION = 4;
 constexpr int64_t CACHE_TABLE_BUFFER_SIZE = 4096;
 constexpr int64_t BYTE_SIZE = 8;
 static constexpr int crossCoreProducerId = 1;
@@ -166,6 +168,8 @@ bool isOnlyDirectlyUse(Operation *preOp, Operation *nextOp,
                        const CVPipeline::MemoryDependenceGraph &memGraph);
 bool isSyncOp(Operation *op);
 bool isExternalSyncOp(Operation *op);
+
+void setSubBlockId(Operation *op, int subBlockId);
 
 // Wrapper around a "main loop" — either scf.for or scf.while carrying the
 // ssbuffer.main_loop attribute. Lets downstream code treat both uniformly.
