@@ -1,10 +1,6 @@
 """
-Fused Attention - Single Loop Implementation
-============================================
-
-This is a Triton implementation of the Flash Attention v2 algorithm from Tri Dao
-(https://tridao.me/publications/flash2/flash2.pdf) adapted for Ascend NPU with a 
-single flattened execution loop.
+Fused Attention - Pipeline-Safe Single Loop Implementation
+==========================================================
 """
 
 import math
@@ -56,114 +52,126 @@ def _vdv_atn_fwd(
     STEPS_PER_BLOCK: tl.constexpr = N_CTX // BLOCK_N
     TOTAL_STEPS: tl.constexpr = NUM_BLOCKS_PER_CORE * STEPS_PER_BLOCK
 
-    # Running tile registers maintained across the flattened loop
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     q = tl.zeros([BLOCK_M, HEAD_DIM], dtype=Q.dtype.element_ty)
 
-    offs_n_init = tl.arange(0, BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_m_base = tl.arange(0, BLOCK_M)
 
-    # Single flattened loop over blocks and sequence tiles
+    # Branchless, uniform pipeline single loop
     for step_idx in tl.range(0, TOTAL_STEPS):
         outer_iter = step_idx // STEPS_PER_BLOCK
         inner_step = step_idx % STEPS_PER_BLOCK
         block_idx = start_block + outer_iter * step
 
-        if block_idx < end_block:
-            task_hz_idx = block_idx // NUM_BLOCKS_M
-            task_m_idx = block_idx % NUM_BLOCKS_M
-            off_z = task_hz_idx // H
-            off_h = task_hz_idx % H
-            kv_h = off_h * num_kv_heads // H
+        # Guard out-of-range blocks cleanly without breaking pipeline invariants
+        valid_block = block_idx < end_block
+        safe_block_idx = tl.where(valid_block, block_idx, 0)
 
-            q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-            k_offset = off_z.to(tl.int64) * stride_kz + kv_h.to(tl.int64) * stride_kh
-            v_offset = off_z.to(tl.int64) * stride_vz + kv_h.to(tl.int64) * stride_vh
+        task_hz_idx = safe_block_idx // NUM_BLOCKS_M
+        task_m_idx = safe_block_idx % NUM_BLOCKS_M
+        off_z = task_hz_idx // H
+        off_h = task_hz_idx % H
+        kv_h = off_h * num_kv_heads // H
 
-            # First step of a sequence block: initialize state and load Q
-            if inner_step == 0:
-                acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-                l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-                m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+        k_offset = off_z.to(tl.int64) * stride_kz + kv_h.to(tl.int64) * stride_kh
+        v_offset = off_z.to(tl.int64) * stride_vz + kv_h.to(tl.int64) * stride_vh
 
-                Q_block_ptr = tl.make_block_ptr(
-                    base=Q + q_offset,
-                    shape=(N_CTX, HEAD_DIM),
-                    strides=(stride_qm, stride_qk),
-                    offsets=(task_m_idx * BLOCK_M, 0),
-                    block_shape=(BLOCK_M, HEAD_DIM),
-                    order=(1, 0),
-                )
-                q = tl.load(Q_block_ptr)
+        start_n = inner_step * BLOCK_N
 
-            start_n = inner_step * BLOCK_N
+        # Load Q uniformly on first inner step, keep stable in registers otherwise
+        Q_block_ptr = tl.make_block_ptr(
+            base=Q + q_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_qm, stride_qk),
+            offsets=(task_m_idx * BLOCK_M, 0),
+            block_shape=(BLOCK_M, HEAD_DIM),
+            order=(1, 0),
+        )
+        q_new = tl.load(Q_block_ptr)
+        q = tl.where(inner_step == 0, q_new, q)
 
-            # Condition checks equivalent to STAGE 1 (off-band) & STAGE 2 (on-band)
-            is_offband = (STAGE & 1) != 0 and ((STAGE != 3) or (start_n < task_m_idx * BLOCK_M))
-            is_onband = (STAGE & 2) != 0 and (start_n >= task_m_idx * BLOCK_M) and (start_n < (task_m_idx + 1) * BLOCK_M)
+        # Reset states at beginning of every tile boundary
+        acc = tl.where(inner_step == 0, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32), acc)
+        l_i = tl.where(inner_step == 0, tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0, l_i)
+        m_i = tl.where(inner_step == 0, tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf"), m_i)
 
-            if is_offband or is_onband:
-                K_block_ptr = tl.make_block_ptr(
-                    base=K + k_offset,
-                    shape=(N_CTX, HEAD_DIM),
-                    strides=(stride_kn, stride_kk),
-                    offsets=(start_n, 0),
-                    block_shape=(BLOCK_N, HEAD_DIM),
-                    order=(1, 0),
-                )
-                V_block_ptr = tl.make_block_ptr(
-                    base=V + v_offset,
-                    shape=(N_CTX, HEAD_DIM),
-                    strides=(stride_vn, stride_vk),
-                    offsets=(start_n, 0),
-                    block_shape=(BLOCK_N, HEAD_DIM),
-                    order=(1, 0),
-                )
+        # Sequence loads (Always executed to maintain fixed hardware queue balance)
+        K_block_ptr = tl.make_block_ptr(
+            base=K + k_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_kn, stride_kk),
+            offsets=(start_n, 0),
+            block_shape=(BLOCK_N, HEAD_DIM),
+            order=(1, 0),
+        )
+        V_block_ptr = tl.make_block_ptr(
+            base=V + v_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_vn, stride_vk),
+            offsets=(start_n, 0),
+            block_shape=(BLOCK_N, HEAD_DIM),
+            order=(1, 0),
+        )
 
-                k = tl.load(K_block_ptr)
-                trans_k = tl.trans(k)
-                qk = tl.dot(q, trans_k)
+        k = tl.load(K_block_ptr)
+        v = tl.load(V_block_ptr)
 
-                if is_onband:
-                    if HAS_MASK:
-                        attn_mask_ptr = tl.make_block_ptr(
-                            base=ATTEN_MASK,
-                            shape=(N_CTX, N_CTX),
-                            strides=(stride_am, 1),
-                            offsets=(task_m_idx * BLOCK_M, start_n),
-                            block_shape=(BLOCK_M, BLOCK_N),
-                            order=(1, 0),
-                        )
-                        mask = tl.load(attn_mask_ptr)
-                        qk = qk * sm_scale + tl.where(mask, -1.0e4, 0)
-                    else:
-                        qk = qk * sm_scale
-                else:
-                    qk = qk * sm_scale
+        # Uniform Cube Dot
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
 
-                m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
-                qk -= m_ij[:, None]
+        # Mask evaluation
+        apply_mask = False
+        if STAGE == 3:
+            # Causal check: mask tiles above diagonal
+            row_idx = task_m_idx * BLOCK_M + offs_m_base[:, None]
+            col_idx = start_n + offs_n[None, :]
+            causal_mask = row_idx < col_idx
+            qk = tl.where(causal_mask, -1.0e4, qk)
+        elif HAS_MASK:
+            attn_mask_ptr = tl.make_block_ptr(
+                base=ATTEN_MASK,
+                shape=(N_CTX, N_CTX),
+                strides=(stride_am, 1),
+                offsets=(task_m_idx * BLOCK_M, start_n),
+                block_shape=(BLOCK_M, BLOCK_N),
+                order=(1, 0),
+            )
+            mask = tl.load(attn_mask_ptr)
+            qk = qk + tl.where(mask, -1.0e4, 0.0)
 
-                p = tl.math.exp(qk)
-                p_cast = p.to(q.type)
-                v = tl.load(V_block_ptr)
-                pv = tl.dot(p_cast, v)
+        # Softmax & update
+        m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
+        qk_diff = qk - m_ij[:, None]
+        p = tl.math.exp(qk_diff)
+        p_cast = p.to(q.type)
 
-                l_ij = tl.sum(p, 1)
-                alpha = tl.math.exp(m_i - m_ij)
-                l_i = l_i * alpha + l_ij
-                acc = acc * alpha[:, None] + pv
-                m_i = m_ij.to(m_i.type)
+        pv = tl.dot(p_cast, v)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp(m_i - m_ij)
 
-            # Last step of a sequence block: write out final results
-            if inner_step == STEPS_PER_BLOCK - 1:
-                offs_m = task_m_idx * BLOCK_M + tl.arange(0, BLOCK_M)
-                m_i += tl.math.log(l_i).to(q.type)
-                acc = acc / l_i[:, None]
+        # State updates
+        l_i_next = l_i * alpha + l_ij
+        acc_next = acc * alpha[:, None] + pv
+        m_i_next = m_ij.to(m_i.type)
+
+        # Guard against computing ghost blocks
+        acc = tl.where(valid_block, acc_next, acc)
+        l_i = tl.where(valid_block, l_i_next, l_i)
+        m_i = tl.where(valid_block, m_i_next, m_i)
+
+        # Store results at boundary of sequence block
+        if inner_step == STEPS_PER_BLOCK - 1:
+            if valid_block:
+                offs_m = task_m_idx * BLOCK_M + offs_m_base
+                m_i_final = m_i + tl.math.log(l_i).to(q.type)
+                acc_final = acc / l_i[:, None]
 
                 m_ptrs = M + task_hz_idx * N_CTX + offs_m
-                tl.store(m_ptrs, m_i)
+                tl.store(m_ptrs, m_i_final)
 
                 O_block_ptr = tl.make_block_ptr(
                     base=Out + q_offset,
@@ -173,7 +181,7 @@ def _vdv_atn_fwd(
                     block_shape=(BLOCK_M, HEAD_DIM),
                     order=(1, 0),
                 )
-                tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+                tl.store(O_block_ptr, acc_final.to(Out.type.element_ty))
 
 
 SPARSE_INDEX_CACHE = {}
@@ -197,7 +205,6 @@ class _attention(torch.autograd.Function):
             compile_opt = {
                 "debug": False,
                 "main_loop_unroll_factor": 1,
-                #"demote_f32_reduction": True,
             }
 
         num_cores = AICORE_NUM
@@ -227,9 +234,10 @@ class _attention(torch.autograd.Function):
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
 
-        has_mask = atten_mask is not None        
-        mask_ptr = atten_mask if has_mask else q 
+        has_mask = atten_mask is not None
+        mask_ptr = atten_mask if has_mask else q
         stride_am = atten_mask.stride(0) if has_mask else 0
+
         _vdv_atn_fwd[(num_cores,)](
             q, k, v, mask_ptr, M, o, sm_scale,
             sparse_start_idx,
@@ -398,9 +406,6 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype, BM, BN):
 
     if causal:
         atten_mask = torch.triu(torch.ones(N_CTX, N_CTX, device=DEVICE), diagonal=1)
-
-    if atten_mask is None:
-        atten_mask = torch.zeros((1, 1), device=DEVICE)
 
     tri_out = attention(q, k, v, atten_mask, causal, sm_scale, BM, BN)
     print("compare success!")
