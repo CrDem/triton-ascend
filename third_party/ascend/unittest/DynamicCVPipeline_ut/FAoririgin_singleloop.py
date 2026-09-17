@@ -42,6 +42,7 @@ def _vdv_atn_fwd(
     NUM_BLOCKS: tl.constexpr,
     NUM_BLOCKS_M: tl.constexpr,
     AICORE_NUM: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
@@ -125,18 +126,21 @@ def _vdv_atn_fwd(
                 qk = tl.dot(q, trans_k)
 
                 if is_onband:
-                    attn_mask_ptr = tl.make_block_ptr(
-                        base=ATTEN_MASK,
-                        shape=(N_CTX, N_CTX),
-                        strides=(stride_am, 1),
-                        offsets=(task_m_idx * BLOCK_M, start_n),
-                        block_shape=(BLOCK_M, BLOCK_N),
-                        order=(1, 0),
-                    )
-                    mask = tl.load(attn_mask_ptr)
-                    qk = qk * qk_scale + tl.where(mask, -1.0e4, 0)
+                    if HAS_MASK:
+                        attn_mask_ptr = tl.make_block_ptr(
+                            base=ATTEN_MASK,
+                            shape=(N_CTX, N_CTX),
+                            strides=(stride_am, 1),
+                            offsets=(task_m_idx * BLOCK_M, start_n),
+                            block_shape=(BLOCK_M, BLOCK_N),
+                            order=(1, 0),
+                        )
+                        mask = tl.load(attn_mask_ptr)
+                        qk = qk * sm_scale + tl.where(mask, -1.0e4, 0)
+                    else:
+                        qk = qk * sm_scale
                 else:
-                    qk = qk * qk_scale
+                    qk = qk * sm_scale
 
                 m_ij = tl.maximum(m_i, tl.max(qk, 1, propagate_nan=True), propagate_nan=tl.PropagateNan.ALL)
                 qk -= m_ij[:, None]
@@ -193,7 +197,7 @@ class _attention(torch.autograd.Function):
             compile_opt = {
                 "debug": False,
                 "main_loop_unroll_factor": 1,
-                "demote_f32_reduction": True,
+                #"demote_f32_reduction": True,
             }
 
         num_cores = AICORE_NUM
@@ -223,14 +227,17 @@ class _attention(torch.autograd.Function):
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
 
+        has_mask = atten_mask is not None        
+        mask_ptr = atten_mask if has_mask else q 
+        stride_am = atten_mask.stride(0) if has_mask else 0
         _vdv_atn_fwd[(num_cores,)](
-            q, k, v, atten_mask, M, o, sm_scale,
+            q, k, v, mask_ptr, M, o, sm_scale,
             sparse_start_idx,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
             o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            q.shape[2],
+            stride_am,
             q.shape[0], q.shape[1], k.shape[1],
             N_CTX=q.shape[2],
             HEAD_DIM=HEAD_DIM_K,
@@ -241,6 +248,7 @@ class _attention(torch.autograd.Function):
             NUM_BLOCKS=NUM_BLOCKS,
             NUM_BLOCKS_M=NUM_BLOCKS_M,
             AICORE_NUM=num_cores,
+            HAS_MASK=has_mask,
             **compile_opt,
             **extra_kern_args
         )
