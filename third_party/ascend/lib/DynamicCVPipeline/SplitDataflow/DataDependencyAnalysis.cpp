@@ -169,22 +169,31 @@ bool DataDependencyAnalysisPass::isValid1DValueForDependency(
   return false;
 }
 
-// Check if a value is only used by transpose ops whose users are all vector ops
-bool DataDependencyAnalysisPass::isAllTransposedInVector(mlir::Value value) {
+// Check if a value is only used by transpose ops whose users are all vector
+// ops. Returns whether the condition holds and, if so, the yield op that uses
+// the transposed value (nullptr if there is none).
+std::pair<bool, std::optional<mlir::Operation *>>
+DataDependencyAnalysisPass::isAllTransposedInVector(mlir::Value value) {
   if (!isa<linalg::MatmulOp>(value.getDefiningOp())) {
-    return false;
+    return {false, std::nullopt};
   }
   if (!llvm::hasSingleElement(value.getUsers())) {
-    return false;
+    return {false, std::nullopt};
   }
   auto *userOp = *value.getUsers().begin();
   if (!isa<linalg::TransposeOp>(userOp))
-    return false;
+    return {false, std::nullopt};
   for (mlir::Operation *transposeOpUser : userOp->getUsers()) {
     if (getSsbufferCoreType(transposeOpUser) != ssbufferCoreTypeVectorAttr)
-      return false;
+      return {false, std::nullopt};
   }
-  return true;
+
+  for (mlir::Operation *transposeOpUser : userOp->getUsers()) {
+    if (isa<scf::YieldOp>(transposeOpUser)) {
+      return {true, transposeOpUser};
+    }
+  }
+  return {true, std::nullopt};
 }
 
 // Helper: Check if value is a valid tensor for dependency analysis
@@ -806,7 +815,8 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
 
       // if c->v value will be transposed and then used by vector op, the value
       // can be transposed within fixpipe
-      bool isAllTranspoesd = isAllTransposedInVector(output);
+      auto [isAllTranspoesd, transposedYieldOp] =
+          isAllTransposedInVector(output);
 
       for (mlir::Operation *user : output.getUsers()) {
         int outputIndex = 0;
@@ -841,6 +851,9 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
                                 info, isAllTranspoesd)) {
               continue;
             }
+            if (transposedYieldOp.has_value()) {
+              c2vDependencies.back().consumerYieldOp = *transposedYieldOp;
+            }
           }
         }
         // If user belongs to Cube block, this C->C dependency was handled
@@ -849,6 +862,64 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
     }
   }
   LOG_DEBUG("External output analysis complete.\n");
+}
+
+// Trace an operand's defining op back to find the source matmul.
+static linalg::MatmulOp resolveSameBlockMatmulProducer(mlir::Value operand,
+                                                       int consumerBlockId) {
+  Operation *defOp = CVPipeline::getSourceThroughCIntermediateOps(operand);
+
+  auto producer = dyn_cast_if_present<linalg::MatmulOp>(defOp);
+  if (!producer) {
+    return nullptr;
+  }
+  auto producerBlockIdOpt = CVPipeline::getOpBlockId(producer);
+  if (!producerBlockIdOpt || *producerBlockIdOpt != consumerBlockId) {
+    return nullptr;
+  }
+  return producer;
+}
+
+// Analyze C->C dependencies between the matmuls inside the same computeBlock.
+void DataDependencyAnalysisPass::analyzeInternalDeps(DataDependencyInfo &info) {
+  auto &blockInfoMap = info.getBlockInfoMap();
+  auto &intraBlockDeps = info.getIntraC2CDependencies();
+
+  LOG_DEBUG("Analyzing intra-block matmul dependencies...\n");
+  for (auto &[blockId, blockInfo] : blockInfoMap) {
+    if (!blockInfo.isCube) {
+      continue;
+    }
+
+    llvm::SmallVector<linalg::MatmulOp> matmuls;
+    for (mlir::Operation *op : blockInfo.Operations) {
+      if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
+        matmuls.push_back(matmulOp);
+      }
+    }
+    if (matmuls.size() < 2) {
+      continue;
+    }
+
+    for (linalg::MatmulOp consumer : matmuls) {
+      for (OpOperand &opOperand : consumer->getOpOperands()) {
+        if (!resolveSameBlockMatmulProducer(opOperand.get(), blockId)) {
+          continue;
+        }
+        DependencyInfo depInfo;
+        depInfo.type = DependencyType::CubeToCube;
+        depInfo.value = opOperand.get();
+        depInfo.operand = &opOperand;
+        depInfo.producerBlockId = blockId;
+        depInfo.consumerBlockId = blockId;
+        depInfo.iniProducerBlockId = blockId;
+        depInfo.iniConsumerBlockId = blockId;
+        intraBlockDeps.push_back(depInfo);
+      }
+    }
+  }
+  LOG_DEBUG("Intra-block matmul dependency analysis complete. Found "
+            << intraBlockDeps.size() << " dependencies.\n");
 }
 
 void DataDependencyAnalysisPass::collectMemDepInfo(
@@ -1132,10 +1203,13 @@ void DataDependencyAnalysisPass::runOnOperation() {
 
   analyzeExternalOutputs(info);
 
-  // Step 4: Analyze memory dependencies (memdep sync)
+  // Step 4: Analyze intra-block c2c dependencies
+  analyzeInternalDeps(info);
+
+  // Step 5: Analyze memory dependencies (memdep sync)
   analyzeMemoryEffect(info);
 
-  // Step 5: Deduplicate dependencies (remove duplicates with same value,
+  // Step 6: Deduplicate dependencies (remove duplicates with same value,
   // iniConsumerBlockId, iniProducerBlockId)
   deduplicateDependencies(info.getV2CDependencies());
   deduplicateDependencies(info.getC2VDependencies());
@@ -1159,6 +1233,8 @@ void DataDependencyAnalysisPass::runOnOperation() {
                                     << "\n");
   LOG_DEBUG("  Memory dependencies: " << info.getMemoryDependencies().size()
                                       << "\n");
+  LOG_DEBUG("  Intra-block C->C dependencies: "
+            << info.getIntraC2CDependencies().size() << "\n");
 
   LOG_DEBUG("\n--- exit DataDependencyAnalysisPass --->\n");
 }

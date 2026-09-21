@@ -20,6 +20,7 @@
  * THE SOFTWARE.
  */
 
+#include "TritonToGraph/DotRowCoalescing.h"
 #include "TritonToGraph/GraphOptimizationRule.h"
 #include "TritonToGraph/LegacyMemoryAccess/RowCoalescing.h"
 #include "TritonToGraph/ProgramAxisDependenceAnalysis.h"
@@ -360,14 +361,20 @@ public:
   }
 
   LogicalResult apply(IRRewriter &rewriter) override {
+    return applyWithResult(rewriter) == RewritePlanApplyResult::Applied
+               ? success()
+               : failure();
+  }
+
+  RewritePlanApplyResult applyWithResult(IRRewriter &rewriter) override {
     (void)rewriter;
     std::optional<RowCandidate> current = analyzeRow(candidate.function);
     if (!current || !matchesCandidate(candidate, *current))
-      return failure();
+      return RewritePlanApplyResult::NotApplicable;
 
     ModuleOp module = candidate.function->getParentOfType<ModuleOp>();
     if (!module)
-      return failure();
+      return RewritePlanApplyResult::Failed;
 
     // The old Row implementation can still encounter a late unsupported
     // shape while materializing.  Run it on a detached one-function module;
@@ -377,7 +384,7 @@ public:
     sandbox.getBody()->push_back(candidate.function->clone());
     auto clonedFunction = dyn_cast<triton::FuncOp>(&sandbox.getBody()->front());
     if (!clonedFunction)
-      return failure();
+      return RewritePlanApplyResult::Failed;
 
     RowCoalescing::rewriteRowCoalesce(sandbox);
     auto factor = sandbox->getAttrOfType<IntegerAttr>(kCoalesceFactorAttr);
@@ -388,7 +395,7 @@ public:
         factor.getInt() != candidate.rowsPerProgram ||
         axis.getInt() != candidate.axis || ceilDiv.getInt() != 1 ||
         failed(mlir::verify(sandbox.getOperation())))
-      return failure();
+      return RewritePlanApplyResult::NotApplicable;
 
     // takeBody() is non-failing.  Commit the function IR first, then publish
     // the complete launcher contract as one final, non-failing step.
@@ -399,7 +406,7 @@ public:
     module->setAttr(kCoalesceAxisAttr,
                     IntegerAttr::get(i32Type, candidate.axis));
     module->setAttr(kCoalesceGridCeilDivAttr, IntegerAttr::get(i32Type, 1));
-    return success();
+    return RewritePlanApplyResult::Applied;
   }
 
 private:
@@ -408,7 +415,12 @@ private:
 };
 
 class RowCoalescingRule final : public GraphOptimizationRule {
+  bool enableLegacyPattern;
+
 public:
+  explicit RowCoalescingRule(bool enableLegacyPattern)
+      : enableLegacyPattern(enableLegacyPattern) {}
+
   GraphOptimizationRuleId getId() const override {
     return GraphOptimizationRuleId::RowCoalescing;
   }
@@ -420,6 +432,15 @@ public:
   LogicalResult findCandidates(
       GraphOptimizationContext &context,
       SmallVectorImpl<std::unique_ptr<RewritePlan>> &plans) override {
+    // The legacy pattern is enabled only for simt_only. Dot row coalescing
+    // belongs to the non-pure-SIMT path and must not override that pattern.
+    if (!enableLegacyPattern) {
+      if (auto plan = createDotRowCoalescingPlan(context.getFunction(),
+                                                 context.getEpoch()))
+        plans.push_back(std::move(plan));
+      return success();
+    }
+
     if (std::optional<RowCandidate> candidate =
             analyzeRow(context.getFunction(),
                        &context.getProgramAxisDependenceAnalysis())) {
@@ -439,6 +460,7 @@ public:
 
 } // namespace
 
-std::unique_ptr<GraphOptimizationRule> cfg::createRowCoalescingRule() {
-  return std::make_unique<RowCoalescingRule>();
+std::unique_ptr<GraphOptimizationRule>
+cfg::createRowCoalescingRule(bool enableLegacy) {
+  return std::make_unique<RowCoalescingRule>(enableLegacy);
 }

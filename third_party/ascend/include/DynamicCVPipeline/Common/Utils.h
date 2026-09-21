@@ -50,6 +50,7 @@ inline constexpr llvm::StringLiteral kAddFromMatmul =
 inline constexpr llvm::StringLiteral kMainLoop = "ssbuffer.main_loop";
 inline constexpr llvm::StringLiteral kTcoreType = "hivm.tcore_type";
 inline constexpr llvm::StringLiteral kIf = "ssbuffer.if";
+inline constexpr llvm::StringLiteral kSplittedIf = "ssbuffer.splitted_if";
 inline constexpr llvm::StringLiteral kIntraBuffer = "ssbuffer.intra_buffer";
 inline constexpr llvm::StringLiteral kIntraBufCount =
     "ssbuffer.intra_buf_count";
@@ -120,13 +121,14 @@ inline constexpr llvm::StringLiteral kFromMakeRange = "tt.from_make_range";
 inline constexpr llvm::StringLiteral kSubBlock = "ssbuffer.subBlock";
 inline constexpr llvm::StringLiteral kMergeComputeBlockApplied =
     "ssbuffer.merge_compute_block_applied";
+inline constexpr llvm::StringLiteral kMergeSmallBlockFirstRunDone =
+    "ssbuffer.merge_small_block_first_run_done";
 
 inline constexpr const char *ERRCODE_ATTR =
     "triton_ascend.dynamic_cv_pipeline.rc";
 static constexpr const int ERRCODE_FAILED = 1;
 static constexpr const int ERRCODE_IGNORED = 2;
 static constexpr const int ERRCODE_TUPLE_PRELOAD_FAILED = 3;
-static constexpr const int ERRCODE_DISABLE_VF_SUBSTITUTION = 4;
 constexpr int64_t CACHE_TABLE_BUFFER_SIZE = 4096;
 constexpr int64_t BYTE_SIZE = 8;
 static constexpr int crossCoreProducerId = 1;
@@ -149,9 +151,6 @@ inline constexpr CoreType fromStrCoreType(std::string_view s) {
 
   return CoreType::UNDETERMINED;
 }
-
-void setEnableCubeBlockMerge(bool enable);
-bool isCubeBlockMergeEnabled();
 
 void setEnableUBRefineOpt(bool enable);
 bool isUBRefineOptEnabled();
@@ -299,6 +298,10 @@ int64_t getBTSizeFromValidBroadcastOp(linalg::BroadcastOp broadcastOp);
 
 int getLoopCarriedArgIndex(Value operand, Block *block);
 
+// Returns the index of `v` in `iterArgs` when `v` is a tensor-type iter_arg,
+// or -1 otherwise.
+int getTensorIterArgIndex(Value v, ArrayRef<Value> iterArgs);
+
 // Helper: convert OpCoreType to string for IR attribute
 inline llvm::StringRef coreTypeToString(CoreType ct) {
   switch (ct) {
@@ -359,6 +362,10 @@ inline bool isTensorComputeOp(Operation *op) {
 // - arith.trunci: i32 -> i8
 std::optional<hivm::FixpipePreQuantMode>
 getFixpipePreQuantMode(Operation *truncOp);
+
+// Trace an operand's defining op back through C2C intermediate ops to find the
+// underlying producing op. Returns null when the operand has no defining op.
+Operation *getSourceThroughCIntermediateOps(Value operand);
 
 } // namespace CVPipeline
 } // namespace mlir

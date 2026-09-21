@@ -149,12 +149,11 @@ private:
                                                 mlir::Location loc);
   mlir::Operation *findMainLoopforTransfer(mlir::Operation *endOp,
                                            mlir::Operation *startOp);
-  mlir::Operation *createC2CSharedL1Buffer(mlir::OpBuilder &builder,
-                                           mlir::Location loc,
-                                           llvm::ArrayRef<int64_t> shape,
-                                           mlir::Type elemType, int prodBlockId,
-                                           mlir::Operation *prodEnd,
-                                           mlir::Operation *consStart);
+  mlir::Operation *
+  createC2CSharedL1Buffer(mlir::OpBuilder &builder, mlir::Location loc,
+                          llvm::ArrayRef<int64_t> shape, mlir::Type elemType,
+                          int prodBlockId, mlir::Operation *prodEnd,
+                          mlir::Operation *consStart, bool isIntraC2C);
   std::pair<mlir::Operation *, mlir::Operation *>
   createTransferAllocs(mlir::OpBuilder &builder, mlir::Location loc,
                        llvm::ArrayRef<int64_t> shape, mlir::Type elemType,
@@ -170,6 +169,8 @@ private:
                                            int iniProducerBlockId);
   mlir::Operation *getFixpipePointAfterProducer(Value depValue,
                                                 int iniProducerBlockId);
+  linalg::MatmulOp findYieldMatmulInSplitIf(Value splittedIfResult);
+  void AnalyzeSplittedIf(DependencyInfo &dep);
   mlir::Operation *insertVectorToCubeTransfer(
       mlir::OpBuilder &builder, mlir::Value srcValue,
       mlir::Value normalizedValue, mlir::Operation *vectorEndOp,

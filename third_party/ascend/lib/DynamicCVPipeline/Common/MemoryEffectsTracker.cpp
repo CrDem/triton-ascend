@@ -263,14 +263,17 @@ void MemoryDependenceGraph::analyzeOp(Operation *op) {
   SmallVector<Operation *> defs;
   SmallVector<Operation *> preds;
   collectPreds(effects, unknown, defs, preds);
-  LOG_DEBUG("Defs: \n");
-  for (auto def : defs) {
-    LOG_DEBUG(*def << "\n");
-  }
-  LOG_DEBUG("Preds: \n");
-  for (auto pred : preds) {
-    LOG_DEBUG(*pred << "\n");
-  }
+
+  LLVM_DEBUG({
+    LOG_DEBUG("Defs: \n");
+    for (auto def : defs) {
+      LOG_DEBUG(*def << "\n");
+    }
+    LOG_DEBUG("Preds: \n");
+    for (auto pred : preds) {
+      LOG_DEBUG(*pred << "\n");
+    }
+  });
 
   // Step 3: extract edges from defs and preds to the graph.
   recordEdges(op, defs, preds);
@@ -518,7 +521,6 @@ void MemoryDependenceGraph::applyEffects(
     if (isa<BaseMemRefType>(result.getType())) {
       if (MemSlot *s = getOrCreateSlot(result)) {
         s->dataSource = op;
-        s->lastWriter = op;
         s->pendingReads.clear();
       }
     }

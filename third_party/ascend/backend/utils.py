@@ -47,6 +47,7 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "code_motion",
     "compile_on_910_95",
     "enable_auto_blockify",
+    "enable_bishengir_simt_optimization",
     "enable_buffer_insert_optimization",
     "enable_cce_vf_auto_sync",
     "enable_cce_vf_remove_membar",
@@ -56,8 +57,10 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "enable_mask_fallback_conversion",
     "enable_nd2nz_on_vector",
     "enable_select_analysis",
+    "enable_simt_reorder_instruction",
     "enable_sync_block_lock",
     "enable_ub_refine_opt",
+    "enable_vf_fusion",
     "force_simt_only",
     "force_simt_template",
     "graph_optimize_emit_remarks",
@@ -135,8 +138,10 @@ _DEPRECATED_NPU_OPTION_DETAILS = {
     "enable_mask_fallback_conversion": "it is ignored; the backend fixes mask fallback conversion to False.",
     "enable_nd2nz_on_vector": "it is ignored; the backend fixes vector ND2NZ conversion to False.",
     "enable_select_analysis": "it is ignored; the backend fixes select analysis to True.",
+    "enable_simt_reorder_instruction": "it is ignored; instruction reordering is controlled by simt_optimization_mode.",
     "enable_sync_block_lock": "it is ignored; this option has no replacement because it had no effective consumer.",
     "enable_ub_refine_opt": "it is ignored; the backend keeps UB refine optimization disabled.",
+    "enable_vf_fusion": "it is ignored; this switch is no longer forwarded to the NPU compiler.",
     "graph_optimize_emit_remarks": "it is ignored; the backend fixes graph-optimization remarks to False.",
     "graph_optimize_max_rewrites_per_function":
     "it is ignored; the backend fixes the maximum rewrites per function to 64.",
@@ -293,8 +298,9 @@ def is_compile_on_910_95(arch: str = None) -> bool:
     return _is_compile_on_910_95
 
 
+AUTO_BLOCKIFY_ATOMIC_RULE = (re.compile(r"\btt\.atomic_(?:rmw|cas)\b"), "atomic operations")
+
 AUTO_BLOCKIFY_BLACKLIST_RULES = (
-    (re.compile(r"\btt\.atomic_(?:rmw|cas)\b"), "atomic operations"),
     (re.compile(r"\btt\.elementwise_inline_asm\b"), "inline elementwise assembly"),
     (
         re.compile(r"\btt\.load\b[^\n]*\bisVolatile\s*=\s*true\b"),
@@ -595,8 +601,11 @@ def _is_auto_map_parallel_blocks_enabled() -> bool:
     return True
 
 
-def _get_auto_blockify_blacklist_reasons(ir_text: str):
-    return [description for pattern, description in AUTO_BLOCKIFY_BLACKLIST_RULES if pattern.search(ir_text)]
+def _get_auto_blockify_blacklist_reasons(ir_text: str, *, compile_on_910_95: bool = False):
+    blacklist_rules = AUTO_BLOCKIFY_BLACKLIST_RULES
+    if not compile_on_910_95:
+        blacklist_rules = (AUTO_BLOCKIFY_ATOMIC_RULE, ) + blacklist_rules
+    return [description for pattern, description in blacklist_rules if pattern.search(ir_text)]
 
 
 def _warn_auto_blockify_disabled(kernel_name: str, blacklist_reasons) -> None:
@@ -909,11 +918,6 @@ def cann_version_compile_args():
     if is_cann_version_at_least(9, 1, 0):
         return ["-DTRITON_CANN_910"]
     return []
-
-
-def triton_enable_libdevice_simt(arch: str = None) -> bool:
-    """Return whether the environment switch selects SIMT libdevice."""
-    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and is_compile_on_910_95(arch)
 
 
 def get_cann_version_file_hash():

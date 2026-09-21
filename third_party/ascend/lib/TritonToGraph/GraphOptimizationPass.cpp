@@ -20,8 +20,6 @@
  * THE SOFTWARE.
  */
 
-#include "Rules/FoldHistogramParking.h"
-#include "Rules/NarrowUnsignedTensor.h"
 #include "TritonToGraph/GraphOptimizationContext.h"
 #include "TritonToGraph/GraphOptimizationRule.h"
 #include "TritonToGraph/Passes.h"
@@ -33,7 +31,6 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -108,26 +105,6 @@ constexpr bool requiresProgramMappingCleanup(GraphOptimizationRuleId ruleId) {
          ruleId == GraphOptimizationRuleId::PersistentTaskStripMining;
 }
 
-// Keep the pre-graph canonicalization limited to operations that its two
-// patterns can rewrite. A module-wide greedy driver also folds and erases
-// unrelated dead operations before graph analyses observe them. Some graph
-// rules intentionally use that visibility to reject incompatible IR.
-bool isNarrowUnsignedTensorCandidate(Operation *op) {
-  if (op->getNumResults() != 1 || op->getNumOperands() < 2 ||
-      !isa<arith::SelectOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
-           arith::ShRSIOp, arith::ShRUIOp, arith::CmpIOp>(op))
-    return false;
-  auto type = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
-  if (isa<arith::SelectOp>(op))
-    type = dyn_cast<RankedTensorType>(op->getResult(0).getType());
-  return type && type.getElementType().isInteger(64);
-}
-
-bool isFoldHistogramParkingCandidate(Operation *op) {
-  auto sub = dyn_cast<arith::SubIOp>(op);
-  return sub && isa_and_nonnull<HistogramOp>(sub.getLhs().getDefiningOp());
-}
-
 constexpr bool isPlanHigherPriority(unsigned lhsBenefit, unsigned lhsOrder,
                                     GraphOptimizationRuleId lhsRuleId,
                                     unsigned rhsBenefit, unsigned rhsOrder,
@@ -154,12 +131,10 @@ public:
     this->ubSafetyPercent = options.ubSafetyPercent;
     this->reservedUBBytes = options.reservedUBBytes;
     this->compileMode = options.compileMode;
-    this->compileOn91095 = options.compileOn91095;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, tensor::TensorDialect,
-                    triton::TritonDialect>();
+    registry.insert<arith::ArithDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override;
@@ -256,7 +231,6 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
   options.ubSafetyPercent = static_cast<unsigned>(cliUBSafetyPercent);
   options.reservedUBBytes = static_cast<unsigned>(cliReservedUBBytes);
   options.compileMode = this->compileMode;
-  options.compileOn91095 = this->compileOn91095;
   options.independentAxisTensorize.enabledForCompileMode =
       *compileMode != triton::ascend::CompileMode::SimtOnly;
   options.independentAxisTensorize.iatAndPtsmEnabled =
@@ -266,6 +240,8 @@ GraphOptimizePass::getStableOptions(GraphOptimizationOptions &options) {
                     GraphOptimizationRuleId::PersistentTaskStripMining);
   options.persistentTaskStripMining.enabledForCompileMode =
       *compileMode != triton::ascend::CompileMode::SimtOnly;
+  options.storeCoalescing.enabledForCompileMode =
+      *compileMode != triton::ascend::CompileMode::SimtOnly;
   return success();
 }
 
@@ -274,32 +250,6 @@ void GraphOptimizePass::runOnOperation() {
   if (failed(getStableOptions(options))) {
     signalPassFailure();
     return;
-  }
-
-  // The narrowing and parked-histogram templates are valid only for
-  // 910_95/950 lowering. Keep A3 on its established TTIR and constrain the
-  // rewrite scope so unrelated dead operations remain visible to later graph
-  // analyses.
-  if (options.compileOn91095) {
-    SmallVector<Operation *> preGraphRewriteCandidates;
-    getOperation().walk([&](Operation *op) {
-      if (isNarrowUnsignedTensorCandidate(op) ||
-          isFoldHistogramParkingCandidate(op))
-        preGraphRewriteCandidates.push_back(op);
-    });
-    if (!preGraphRewriteCandidates.empty()) {
-      RewritePatternSet patterns(&getContext());
-      patterns.add<narrow_unsigned_tensor::Narrow, FoldHistogramParking>(
-          &getContext());
-      FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-      GreedyRewriteConfig config;
-      config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-      if (failed(applyOpPatternsGreedily(preGraphRewriteCandidates,
-                                         frozenPatterns, config))) {
-        signalPassFailure();
-        return;
-      }
-    }
   }
 
   ModuleOp module = getOperation();
@@ -510,7 +460,22 @@ void GraphOptimizePass::runOnOperation() {
       continue;
 
     IRRewriter rewriter(&getContext());
-    if (failed(selectedRowPlan->apply(rewriter))) {
+    switch (selectedRowPlan->applyWithResult(rewriter)) {
+    case RewritePlanApplyResult::Applied:
+      break;
+    case RewritePlanApplyResult::NotApplicable:
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[" DEBUG_TYPE << "] declined graph optimization rule "
+                 << static_cast<unsigned>(
+                        GraphOptimizationRuleId::RowCoalescing)
+                 << " ("
+                 << getGraphOptimizationRuleName(
+                        GraphOptimizationRuleId::RowCoalescing)
+                 << ") after detached materialization\n");
+      selectedRowPlan.reset();
+      rowPlans.clear();
+      continue;
+    case RewritePlanApplyResult::Failed:
       selectedRowPlan.reset();
       rowPlans.clear();
       function.emitError() << "graph-optimize failed to apply Row rewrite";
@@ -565,8 +530,8 @@ void populateBuiltinGraphOptimizationRules(
   }
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::StoreCoalescing)) {
-    rules.push_back(
-        createStoreCoalescingRule(options.storeCoalescingUBBudgetBytes));
+    rules.push_back(createStoreCoalescingRule(
+        options.storeCoalescingUBBudgetBytes, options.storeCoalescing));
   }
   if (isRuleEnabled(options.enabledRuleMask,
                     GraphOptimizationRuleId::ResidentLoadForwarding)) {
@@ -591,10 +556,10 @@ void populateBuiltinGraphOptimizationRules(
   }
   const auto compileMode =
       triton::ascend::parseCompileMode(options.compileMode);
-  if (compileMode && *compileMode == triton::ascend::CompileMode::SimtOnly &&
-      isRuleEnabled(options.enabledRuleMask,
-                    GraphOptimizationRuleId::RowCoalescing)) {
-    rules.push_back(createRowCoalescingRule());
+  if (compileMode && isRuleEnabled(options.enabledRuleMask,
+                                   GraphOptimizationRuleId::RowCoalescing)) {
+    rules.push_back(createRowCoalescingRule(
+        *compileMode == triton::ascend::CompileMode::SimtOnly));
   }
 }
 

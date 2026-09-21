@@ -41,12 +41,7 @@ static constexpr const char *DEBUG_TYPE = "dynamic-cv-pipeline-utils";
 namespace mlir {
 namespace CVPipeline {
 
-static bool g_enableCubeBlockMerge = false;
 static bool g_enableUBRefineOpt = false;
-
-void setEnableCubeBlockMerge(bool enable) { g_enableCubeBlockMerge = enable; }
-
-bool isCubeBlockMergeEnabled() { return g_enableCubeBlockMerge; }
 
 CoreType getOpCoreType(Operation *op) {
   if (!op) {
@@ -489,6 +484,15 @@ int getLoopCarriedArgIndex(Value operand, Block *block) {
   return argIdx;
 }
 
+int getTensorIterArgIndex(Value v, ArrayRef<Value> iterArgs) {
+  for (unsigned i = 0; i < iterArgs.size(); ++i) {
+    if (v == iterArgs[i] && isa<RankedTensorType>(iterArgs[i].getType())) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
   if (!isa<arith::TruncFOp, arith::TruncIOp>(op))
     return std::nullopt;
@@ -510,6 +514,18 @@ std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
     return hivm::FixpipePreQuantMode::S322I8;
   return std::nullopt;
 }
+
+Operation *getSourceThroughCIntermediateOps(Value operand) {
+  auto isIntermediateOp = [](Operation *op) {
+    return getFixpipePreQuantMode(op).has_value();
+  };
+  Operation *defOp = operand.getDefiningOp();
+  while (defOp && isIntermediateOp(defOp)) {
+    defOp = defOp->getOperand(0).getDefiningOp();
+  }
+  return defOp;
+}
+
 CoreType getValueCoreType(Value value) {
   auto result = llvm::dyn_cast_if_present<OpResult>(value);
   if (!result) {

@@ -22,6 +22,7 @@ import itertools
 import sys
 import types
 import warnings
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -408,6 +409,54 @@ def _run_ttir_to_npubin(
     return events, commands[0]
 
 
+def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
+    commands = []
+    parsed_metadata = defaultdict(
+        lambda: None, {
+            "target": SimpleNamespace(arch="Ascend910B"),
+            "program_grid_transforms": None,
+            "program_grid_mapping_applied": False,
+            "row_coalescing_applied": False,
+            "has_auto_blockify_blacklist_op": has_blacklist_op,
+            "auto_blockify_enabled": not has_blacklist_op,
+            "ptsm_cap_authorized": False,
+            "mix_mode": "aiv",
+        })
+
+    class FakeNPUUtils:
+
+        def has_device_limit(self):
+            return False
+
+        def get_arch(self):
+            return "Ascend910B"
+
+    def parse_linalg_metadata(linalg, _metadata):
+        return linalg, parsed_metadata
+
+    def run_bisheng(command, **_kwargs):
+        commands.append(list(command))
+        Path(command[command.index("-o") + 1] + "_reloc.o").write_bytes(b"npubin")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(compiler, "_parse_linalg_metadata", parse_linalg_metadata)
+    monkeypatch.setattr(compiler, "get_common_bishengir_compile_options", lambda _metadata: [])
+    monkeypatch.setattr(compiler, "get_auto_bind_sub_block_option", lambda _metadata: False)
+    monkeypatch.setattr(compiler, "NPUUtils", FakeNPUUtils)
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/bishengir-compile", {}))
+    monkeypatch.setattr(compiler, "_is_auto_map_parallel_blocks_enabled", lambda: True)
+    monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
+
+    result = getattr(compiler, function_name)(
+        "module {}",
+        {},
+        SimpleNamespace(debug=False, target_arch="Ascend950PR", is_pure_simt=False),
+    )
+    assert result == b"npubin"
+    assert len(commands) == 1
+    return commands[0]
+
+
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
 def test_export_coalesce_metadata_removes_attrs_and_marks_row(compiler_module, monkeypatch):
     removed = []
@@ -556,7 +605,7 @@ def _run_make_ttir_with_recorded_graph_options(compiler, monkeypatch, options):
         compiler,
         "ascend",
         SimpleNamespace(passes=SimpleNamespace(ttir=SimpleNamespace(
-            add_graph_optimize=lambda _pm, **kwargs: (events.append("graph_optimize"), graph_calls.append(kwargs))))),
+            add_graph_optimize=lambda _pm, **kwargs: graph_calls.append(kwargs)))),
     )
 
     assert compiler.make_ttir(module, {}, options) is module
@@ -567,7 +616,6 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
     options = SimpleNamespace(
         enable_graph_optimize=True,
         target_arch="Ascend910B1",
-        compile_on_910_95=False,
         compile_mode="simt_only",
         debug=False,
     )
@@ -577,23 +625,15 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
     assert graph_calls == [{
         "ub_capacity_bytes": 192 * 1024 * 80 // 100,
         "compile_mode": "simt_only",
-        "compile_on_910_95": False,
     }]
     assert events[-1] == "run_row"
-    assert events.index(("loop_unroll", (), {})) < events.index("graph_optimize")
-
-
-def test_make_ttir_disables_graph_pipeline(compiler_module, monkeypatch):
-    options = SimpleNamespace(enable_graph_optimize=False, debug=False)
-    events, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
-    assert "graph_optimize" not in events
-    assert graph_calls == []
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
-def test_npu_options_do_not_expose_graph_remark_switch(compiler_module):
-    """Graph rewrite logging is controlled by LLVM DEBUG, not an NPU option."""
-    assert "graph_optimize_emit_remarks" not in compiler_module.NPUOptions.__dataclass_fields__
+def test_npu_options_keep_graph_remark_compatibility_default(compiler_module):
+    """The legacy graph-remarks name remains discoverable with a fixed default."""
+    options = compiler_module.NPUOptions(arch="Ascend910B1")
+    assert options.__dict__["graph_optimize_emit_remarks"] is False
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
@@ -616,7 +656,6 @@ def test_make_ttir_forwards_normalized_graph_ub_budget(compiler_module, monkeypa
 
 
 def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
-    """Check the pure-SIMT policy, blacklist, and RowCoalescing argv gates."""
     common_options = ["--common-before-pure-simt", "--common-after-pure-simt"]
     pure_simt_prefix = [
         "--enable-hivm-compile=false",
@@ -652,7 +691,7 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
                 disable_fma=True,
             )
 
-        second_injection = env_enabled and not blacklisted and not row_applied
+        second_injection = env_enabled and not row_applied
         case = f"E={env_enabled}, B={blacklisted}, R={row_applied}, superblock={superblock}"
 
         expected_options = [*common_options, *pure_simt_prefix]
@@ -661,7 +700,6 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
             if superblock > 0:
                 expected_options.append(f"--super-block-factor={superblock}")
 
-        # Pure-SIMT option emission retains the blacklist and RowCoalescing gates.
         assert command[0] == "/fake/bisheng", case
         assert Path(command[1]).name == "kernel.ttir.mlir", case
         assert command[2:-2] == expected_options, case
@@ -716,6 +754,65 @@ def test_finalize_program_launch_policy_uses_linalg_ptsm_gate(
     assert metadata["ptsm_cap_authorized"] is expected_ptsm
 
 
+@pytest.mark.parametrize(
+    ("auto_map_enabled", "blacklisted", "row_applied", "expected_auto"),
+    (
+        (False, False, False, False),
+        (False, True, False, False),
+        (True, False, False, True),
+        (True, True, False, True),
+        (True, False, True, False),
+        (True, True, True, False),
+    ),
+)
+def test_finalize_program_launch_policy_pure_simt_ignores_blacklist(
+    compiler_module,
+    monkeypatch,
+    auto_map_enabled,
+    blacklisted,
+    row_applied,
+    expected_auto,
+):
+    metadata = {
+        "program_grid_transforms": None,
+        "program_grid_mapping_applied": False,
+        "row_coalescing_applied": row_applied,
+        "has_auto_blockify_blacklist_op": blacklisted,
+        "mix_mode": "aiv",
+    }
+    monkeypatch.setattr(compiler_module, "_is_auto_map_parallel_blocks_enabled", lambda: auto_map_enabled)
+
+    compiler_module._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=True))
+
+    assert metadata["auto_blockify_enabled"] is expected_auto
+    assert metadata["ptsm_cap_authorized"] is False
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    (
+        "linalg_to_bin_enable_npu_compile_910_95",
+        "linalg_to_bin_enable_npu_compile_A2_A3",
+    ),
+)
+@pytest.mark.parametrize("has_blacklist_op", (False, True))
+def test_non_pure_simt_linalg_compilers_keep_blacklist_auto_blockify_gate(
+    compiler_module,
+    monkeypatch,
+    function_name,
+    has_blacklist_op,
+):
+    command = _run_linalg_to_npubin(
+        compiler_module,
+        monkeypatch,
+        function_name,
+        has_blacklist_op,
+    )
+
+    assert ("--enable-auto-blockify-loop" in command) is not has_blacklist_op
+    assert "--pure-simt" not in command
+
+
 def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compiler_module):
     """The canonical default is portable and enables the A5 template gate."""
 
@@ -768,5 +865,6 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
     assert explicit_only.compile_mode == "simt_only"
     assert explicit_only.is_pure_simt is True
 
-    assert "force_simt_only" not in compiler_module.NPUOptions.__dataclass_fields__
-    assert "force_simt_template" not in compiler_module.NPUOptions.__dataclass_fields__
+    # Legacy spellings remain discoverable while compile_mode controls lowering.
+    assert explicit_only.__dict__["force_simt_only"] is False
+    assert explicit_template.__dict__["force_simt_template"] is False

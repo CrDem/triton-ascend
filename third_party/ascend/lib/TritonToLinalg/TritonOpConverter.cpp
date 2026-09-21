@@ -61,6 +61,7 @@
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 
 namespace TTOpConverters {
 using namespace mlir;
@@ -254,15 +255,15 @@ getScalarPointerCarrierType(Type originalType,
   return memrefType;
 }
 
-static FailureOr<Type>
-getIfResultCarrierType(Type originalType, const TypeConverter &typeConverter) {
+static Type getIfResultCarrierType(Type originalType) {
   if (isa<triton::PointerType>(originalType))
     return IntegerType::get(originalType.getContext(), 64);
 
-  Type convertedType = typeConverter.convertType(originalType);
-  if (!convertedType)
-    return failure();
-  return convertedType;
+  // This converter exists only to carry scalar pointers as integer addresses.
+  // Sibling results already have valid SSA types and must stay unchanged; using
+  // the global type converter here would turn a tensor mask into a memref even
+  // though its existing users still consume the tensor value.
+  return originalType;
 }
 
 // Materialize a no-op-compatible memref cast to the common carrier. Returning
@@ -387,12 +388,7 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
   SmallVector<Type> convertedResultTypes;
   convertedResultTypes.reserve(op.getNumResults());
   for (Type resultType : op.getResultTypes()) {
-    FailureOr<Type> convertedType =
-        getIfResultCarrierType(resultType, *typeConverter);
-    if (failed(convertedType))
-      return rewriter.notifyMatchFailure(op,
-                                         "could not convert an if result type");
-    convertedResultTypes.push_back(*convertedType);
+    convertedResultTypes.push_back(getIfResultCarrierType(resultType));
   }
 
   auto newIfOp = rewriter.create<scf::IfOp>(op.getLoc(), convertedResultTypes,
@@ -1705,7 +1701,7 @@ LogicalResult
 ScanConverter::convertToTargetOp(triton::ScanOp op,
                                  typename triton::ScanOp::Adaptor adaptor,
                                  ConversionPatternRewriter &rewriter) const {
-  auto reductionOps = this->getReductionOps(op);
+  auto reductionOps = this->getRealReductionOps(op);
   if (reductionOps.empty()) {
     return rewriter.notifyMatchFailure(op,
                                        "No reduction op found in scan body");
@@ -1804,7 +1800,18 @@ ScanConverter::convertToTargetOp(triton::ScanOp op,
     auto memrefType = MemRefType::get(shape, elementType);
     Value inputMemRef =
         rewriter.create<bufferization::ToBufferOp>(loc, memrefType, scanInput);
-    Value outputMemRef = rewriter.create<memref::AllocOp>(loc, memrefType);
+
+    // Wrap scan logic in a scope with UB address space for the output buffer.
+    auto tensorResultType = RankedTensorType::get(shape, elementType);
+    auto scopeOp =
+        rewriter.create<scope::ScopeOp>(loc, TypeRange{tensorResultType});
+    scopeOp.getBodyRegion().emplaceBlock();
+    rewriter.setInsertionPointToEnd(&scopeOp.getBodyRegion().front());
+
+    auto ubMemRefType = MemRefType::get(
+        shape, elementType, nullptr,
+        rewriter.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB));
+    Value outputMemRef = rewriter.create<memref::AllocOp>(loc, ubMemRefType);
 
     auto processDimension = [&](ArrayRef<Value> baseIdxsArray) {
       auto startInd = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
@@ -1901,13 +1908,17 @@ ScanConverter::convertToTargetOp(triton::ScanOp op,
     createSimpleNestedLoops(rewriter, loc, outputMemRef, nonScanDims,
                             processDimension);
 
-    rewriter.setInsertionPointAfter(op);
-
     mlir::Type resultType = mlir::memref::getTensorTypeFromMemRefType(
         dyn_cast<mlir::MemRefType>(outputMemRef.getType()));
     Value outputTensor = rewriter.create<bufferization::ToTensorOp>(
         loc, resultType, outputMemRef, true);
-    rewriter.replaceOp(op, outputTensor);
+    rewriter.create<scope::ReturnOp>(loc, ValueRange{outputTensor});
+
+    scopeOp->setAttr(hivm::TCoreTypeAttr::name,
+                     hivm::TCoreTypeAttr::get(rewriter.getContext(),
+                                              hivm::TCoreType::VECTOR));
+
+    rewriter.replaceOp(op, scopeOp.getResult(0));
     return success();
   }
 }
@@ -3881,6 +3892,9 @@ LogicalResult IndexSelectSimdConverter::matchAndRewrite(
 
   // Get result type
   auto resultTensorType = cast<RankedTensorType>(op.getResult().getType());
+  static constexpr llvm::StringLiteral wasBoolToInt8AttrName =
+      "was_bool_to_int8";
+  bool wasBoolToInt8 = op->hasAttr(wasBoolToInt8AttrName);
 
   auto elemType = resultTensorType.getElementType();
   auto resultShape = resultTensorType.getShape();
@@ -4057,6 +4071,8 @@ LogicalResult IndexSelectSimdConverter::matchAndRewrite(
     // For index_select on the trailing axis, mark as discrete memory access
     // This degrades to scalar read/write handling to avoid alignment issues
     auto copyOp = rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    if (wasBoolToInt8)
+      copyOp->setAttr(wasBoolToInt8AttrName, rewriter.getBoolAttr(true));
     copyOp->setAttr(ConverterUtils::discreteAttrName, rewriter.getUnitAttr());
   } else {
     // For index_select on non-trailing axes, add stride alignment annotation
@@ -4069,7 +4085,9 @@ LogicalResult IndexSelectSimdConverter::matchAndRewrite(
                        rewriter.getDenseI32ArrayAttr({32}));
 
     // Copy from source to destination
-    rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    auto copyOp = rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
+    if (wasBoolToInt8)
+      copyOp->setAttr(wasBoolToInt8AttrName, rewriter.getBoolAttr(true));
   }
 
   // Restore insertion point
@@ -4078,6 +4096,8 @@ LogicalResult IndexSelectSimdConverter::matchAndRewrite(
   // Convert memref to tensor
   auto resultTensor = rewriter.create<bufferization::ToTensorOp>(
       loc, resultTensorType, outputBuffer, true, true);
+  if (wasBoolToInt8)
+    resultTensor->setAttr(wasBoolToInt8AttrName, rewriter.getBoolAttr(true));
 
   // Mark as index_select_simd
   resultTensor->setAttr("index_select_simd", rewriter.getUnitAttr());
