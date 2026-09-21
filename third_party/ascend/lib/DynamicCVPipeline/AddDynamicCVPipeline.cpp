@@ -724,8 +724,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     auto errCode = getErrorCode(moduleOp);
     if (succeeded(result) && !errCode.has_value() &&
         !CVPipeline::hasFallbackAttr(moduleOp)) {
-      checkAndDisableVfSub(moduleOp);
       moduleBackup->destroy();
+    }
     if (succeeded(result) && !errCode.has_value()) {
       if (tuplePreloadFailed) {
         CVPipeline::setFallbackAttr(moduleOp,
