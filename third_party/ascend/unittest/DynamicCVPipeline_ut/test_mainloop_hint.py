@@ -115,6 +115,18 @@ def _nested_outer_hinted(A, B, C, M, K_ITERS, BLOCK: tl.constexpr):
 
 
 @triton.jit
+def _nested_both_hinted(A, B, C, M, K_ITERS, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    for m in tl.range(0, M, main_loop=True):
+        acc = tl.zeros([BLOCK, BLOCK], dtype=tl.float32)
+        for k in tl.range(0, K_ITERS, main_loop=True):
+            a = tl.load(A + (m * BLOCK + offs[:, None]) * BLOCK + offs[None, :])
+            b = tl.load(B + (k * BLOCK + offs[:, None]) * BLOCK + offs[None, :])
+            acc += tl.dot(a, b)
+        tl.store(C + (m * BLOCK + offs[:, None]) * BLOCK + offs[None, :], acc)
+
+
+@triton.jit
 def _single_opted_out(A, B, C, M, K_ITERS, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
     acc = tl.zeros([BLOCK, BLOCK], dtype=tl.float32)
@@ -147,6 +159,22 @@ def test_main_loop_hint_moves_pipeline_outwards():
     assert min(hinted_indents) < min(plain_indents), (
         f"hint did not move the main loop outwards: {hinted_indents} vs {plain_indents}"
     )
+
+
+def test_nested_hints_keep_one_main_loop_per_nest():
+    """Two hints in one nest must not produce two main loops.
+
+    AddMultiBufferInnerScope rejects a main_loop that contains another main_loop
+    ("Nested main_loop found, this is not allowed"), and ComputeMainLoopTimes
+    needs every stage if-block to be a direct child of the main loop, so the
+    outer opt-in has to win outright.
+    """
+    marked = _run_pipeline(_make_ttir(_nested_both_hinted, _SIG, {"BLOCK": 128}),
+                           _TO_LINALG + "," + _TO_MARK_MAIN_LOOP)
+    indents = _main_loop_indents(marked)
+    assert indents, "nothing marked"
+    # One marked loop per scope clone (cube + vector), all at the outer depth.
+    assert len(set(indents)) == 1, f"more than one nesting level marked: {indents}"
 
 
 def test_main_loop_opt_out_removes_candidate():

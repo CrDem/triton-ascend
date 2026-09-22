@@ -97,8 +97,12 @@ void MarkMainLoopPass::runOnOperation() {
     kept.push_back(loopOp);
   }
 
-  // Step 3: resolve nests - an opted-in ancestor wins over inner candidates,
-  // otherwise the innermost candidate wins.
+  // Step 3: resolve nests. At most one loop of a nest may be marked: the rest
+  // of the pipeline relies on it - AddMultiBufferInnerScope rejects a main_loop
+  // that contains another main_loop, and ComputeMainLoopTimes requires every
+  // stage if-block to be a direct child of the main loop. An opted-in loop wins
+  // over everything nested inside it, including a nested opt-in; otherwise the
+  // innermost candidate wins, as before.
   auto hasKeptDescendant = [&](Operation *loopOp) {
     for (Operation *other : kept) {
       if (other != loopOp && loopOp->isProperAncestor(other))
@@ -117,12 +121,13 @@ void MarkMainLoopPass::runOnOperation() {
 
   llvm::SmallVector<Operation *> selected;
   for (Operation *loopOp : kept) {
-    bool optedIn = CVPipeline::isMainLoopOptIn(loopOp);
-    if (!optedIn && hasOptedInAncestor(loopOp)) {
+    // An opted-in ancestor always wins, so a nest never ends up with two main
+    // loops even when several of its loops carry the hint.
+    if (hasOptedInAncestor(loopOp)) {
       LOG_DEBUG("candidate dropped: enclosing loop is main_loop=True\n");
       continue;
     }
-    if (!optedIn && hasKeptDescendant(loopOp)) {
+    if (!CVPipeline::isMainLoopOptIn(loopOp) && hasKeptDescendant(loopOp)) {
       // Historical rule: keep only the innermost candidate.
       continue;
     }
