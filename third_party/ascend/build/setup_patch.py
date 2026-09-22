@@ -110,8 +110,19 @@ def _get_ascend_llvm_package_info(base_dir):
 
 
 def _apply_patch(patch_path):
+    # --ignore-whitespace: the patch and the worktree can disagree on line
+    # endings, and then every hunk of every file fails to match at once. That
+    # happens as soon as core.autocrlf / core.eol turn a checkout into CRLF
+    # while the patch stays LF (or the other way round), which is easy to walk
+    # into on Windows and on a checkout shared with WSL, and the error names
+    # every patched file:
+    #     error: patch failed: CMakeLists.txt:15
+    #     error: CMakeLists.txt: patch does not apply
+    # Matching context without the line terminators makes this step insensitive
+    # to that; nothing else about the patch is relaxed.
     try:
-        subprocess.run(["git", "apply", patch_path], check=True, stdout=subprocess.DEVNULL, cwd=str(_REPO_ROOT))
+        subprocess.run(["git", "apply", "--ignore-whitespace", patch_path], check=True,
+                       stdout=subprocess.DEVNULL, cwd=str(_REPO_ROOT))
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"patch({patch_path}) failed,cmd={e.cmd}, retcode={e.returncode}") from e
     except FileNotFoundError:
