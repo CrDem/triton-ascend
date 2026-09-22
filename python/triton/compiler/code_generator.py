@@ -1147,7 +1147,6 @@ class CodeGenerator(ast.NodeVisitor):
         flatten = False
         warp_specialize = False
         disable_licm = False
-        main_loop = None
         if IteratorClass is language.range:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
@@ -1162,7 +1161,6 @@ class CodeGenerator(ast.NodeVisitor):
             flatten = iterator.flatten
             warp_specialize = iterator.warp_specialize
             disable_licm = iterator.disable_licm
-            main_loop = getattr(iterator, "main_loop", None)
         elif IteratorClass is range:
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1225,13 +1223,6 @@ class CodeGenerator(ast.NodeVisitor):
                 for_op.set_attr("tt.flatten", self.builder.get_unit_attr())
             if warp_specialize:
                 for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
-            main_loop_hint = _unwrap_if_constexpr(main_loop)
-            if main_loop_hint is not None:
-                # Ascend: explicit choice of the loop the dynamic CV pipeline is
-                # built around; consumed by MarkMainLoopPass, see
-                # third_party/ascend/lib/DynamicCVPipeline/SplitDataflow.
-                for_op.set_attr("tt.main_loop",
-                                self.builder.get_int32_attr(1 if main_loop_hint else 0))
             if disable_licm:
                 for_op.set_attr("llvm.loop_annotation", self.builder.get_disable_loop_licm_attr())
 
