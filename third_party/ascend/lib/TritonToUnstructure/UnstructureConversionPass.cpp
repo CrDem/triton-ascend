@@ -381,6 +381,32 @@ static bool canUseIndirectFastPath(Value srcPtr, Value ptrOffset) {
   return isa<RankedTensorType>(ptrOffset.getType());
 }
 
+static bool isMaskOutTensorLanes(const std::optional<MaskState> &maskState,
+                                 ArrayRef<int64_t> tensorShape) {
+  // MaskState describes an axis-aligned active slice as [offset, offset + dim)
+  // on each tensor axis. The template indirect fast path is safe for such a
+  // mask only when every slice starts at constant zero and its constant extent
+  // covers the complete physical tensor axis. Dynamic, shifted, prefix, and
+  // other partial slices may leave physical lanes inactive and must use the
+  // scalar-loop fallback. A missing or rank-incompatible MaskState is outside
+  // this check and preserves the existing fast-path eligibility.
+  // A dynamic extent is conservatively treated as partial even if a particular
+  // runtime value happens to cover the full axis.
+  if (!maskState || maskState->getRank() != tensorShape.size())
+    return false;
+
+  for (auto [offset, dim, size] :
+       llvm::zip_equal(maskState->offsets, maskState->dims, tensorShape)) {
+    auto constantOffset = getConstantIntValue(offset);
+    auto constantDim = getConstantIntValue(dim);
+    if (!constantOffset || *constantOffset != 0 || !constantDim ||
+        *constantDim != size)
+      return true;
+  }
+
+  return false;
+}
+
 template <typename MemAccOpTy>
 LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
                                          Value srcPtr, Value ptrOffset,
@@ -892,6 +918,11 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
       triton::ascend::isSimtTemplateMode(unstructureCompileMode) &&
       ((!ptrOffsetInfo.isStructured() && sizeInByte < 64) ||
        mixCompileDiscreteMask);
+  if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp> ||
+                std::is_same_v<MemAccOpTy, triton::StoreOp>) {
+    templateIndirectFastPathEnabled &=
+        !isMaskOutTensorLanes(mstate, resultShape);
+  }
   bool rankWithinIndirectLoadStoreFastPathLimit = resultShape.size() <= 5;
   if (templateIndirectFastPathEnabled &&
       succeeded(tryRewriteIndirectFastPath(op, loc, srcPtr, ptrOffset,
