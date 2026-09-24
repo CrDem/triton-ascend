@@ -22,6 +22,7 @@ import itertools
 import sys
 import types
 import warnings
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,8 +33,8 @@ pytestmark = pytest.mark.backend("none")
 _UNSET = object()
 
 
-def _stub_graph_ub_budget_bytes_for_arch(arch):
-    """Mirror the documented architecture table for the compiler import shim.
+def _stub_ub_size_in_kbytes_for_arch(arch):
+    """Mirror the raw UB architecture table for the compiler import shim.
 
     The table itself is covered by the source-loaded backend-utils test.  This
     local shim keeps this compiler-only contract independent of the installed
@@ -42,7 +43,7 @@ def _stub_graph_ub_budget_bytes_for_arch(arch):
     if not isinstance(arch, str) or not arch:
         return 0
     if arch.startswith(("Ascend910_95", "Ascend950")):
-        return 128 * 1024
+        return 256
     if arch.startswith((
             "Ascend910A",
             "Ascend910B",
@@ -50,8 +51,12 @@ def _stub_graph_ub_budget_bytes_for_arch(arch):
             "Ascend910_93",
             "Ascend310B",
     )):
-        return 96 * 1024
+        return 192
     return 0
+
+
+def _stub_graph_ub_budget_bytes_for_arch(arch):
+    return _stub_ub_size_in_kbytes_for_arch(arch) * 1024 * 80 // 100
 
 
 class _FakeModule:
@@ -134,6 +139,7 @@ def compiler_module():
     utils_stub.downgrade_llir = lambda llir: llir
     utils_stub.get_cann_version_file_hash = lambda: ""
     utils_stub.graph_ub_budget_bytes_for_arch = _stub_graph_ub_budget_bytes_for_arch
+    utils_stub.ub_size_in_kbytes_for_arch = _stub_ub_size_in_kbytes_for_arch
 
     class UnusedNPUUtils:
         pass
@@ -204,14 +210,14 @@ def _parse_options(compiler, arch, opts=None):
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
-        ("Ascend910B1", _UNSET, 96 * 1024),
-        ("Ascend910B1", None, 96 * 1024),
-        ("Ascend910_9581", None, 128 * 1024),
-        ("Ascend950A3", None, 128 * 1024),
+        ("Ascend910B1", _UNSET, 192 * 1024 * 80 // 100),
+        ("Ascend910B1", None, 192 * 1024 * 80 // 100),
+        ("Ascend910_9581", None, 256 * 1024 * 80 // 100),
+        ("Ascend950A3", None, 256 * 1024 * 80 // 100),
         ("Ascend910B1", 0, 0),
         ("Ascend910B1", 4096, 4096),
-        ("Ascend910B1", 96 * 1024 + 1, 96 * 1024),
-        ("Ascend910_9581", 128 * 1024 + 1, 128 * 1024),
+        ("Ascend910B1", 192 * 1024 * 80 // 100 + 1, 192 * 1024 * 80 // 100),
+        ("Ascend910_9581", 256 * 1024 * 80 // 100 + 1, 256 * 1024 * 80 // 100),
         ("unknown-arch", None, 0),
     ),
 )
@@ -230,13 +236,13 @@ def test_npu_options_normalizes_graph_ub_budget(compiler_module, arch, requested
 @pytest.mark.parametrize(
     ("arch", "requested_capacity", "expected_capacity"),
     (
-        ("Ascend910B1", _UNSET, 96 * 1024),
-        ("Ascend910B1", None, 96 * 1024),
-        ("Ascend910_9581", None, 128 * 1024),
-        ("Ascend950A3", None, 128 * 1024),
+        ("Ascend910B1", _UNSET, 192 * 1024 * 80 // 100),
+        ("Ascend910B1", None, 192 * 1024 * 80 // 100),
+        ("Ascend910_9581", None, 256 * 1024 * 80 // 100),
+        ("Ascend950A3", None, 256 * 1024 * 80 // 100),
         ("Ascend910B1", 0, 0),
         ("Ascend910B1", 4096, 4096),
-        ("Ascend910B1", 96 * 1024 + 1, 96 * 1024),
+        ("Ascend910B1", 192 * 1024 * 80 // 100 + 1, 192 * 1024 * 80 // 100),
     ),
 )
 def test_parse_options_normalizes_graph_ub_budget(compiler_module, arch, requested_capacity, expected_capacity):
@@ -257,11 +263,12 @@ def test_normalized_graph_ub_budget_contributes_to_npu_hash(compiler_module):
     explicit_none = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=None)
     disabled = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=0)
     small = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=4096)
-    clamped = compiler_module.NPUOptions(arch="Ascend910B1", graph_optimize_ub_capacity_bytes=96 * 1024 + 1)
+    clamped = compiler_module.NPUOptions(arch="Ascend910B1",
+                                         graph_optimize_ub_capacity_bytes=192 * 1024 * 80 // 100 + 1)
 
-    assert auto.__dict__["graph_optimize_ub_capacity_bytes"] == 96 * 1024
-    assert explicit_none.graph_optimize_ub_capacity_bytes == 96 * 1024
-    assert clamped.graph_optimize_ub_capacity_bytes == 96 * 1024
+    assert auto.__dict__["graph_optimize_ub_capacity_bytes"] == 192 * 1024 * 80 // 100
+    assert explicit_none.graph_optimize_ub_capacity_bytes == 192 * 1024 * 80 // 100
+    assert clamped.graph_optimize_ub_capacity_bytes == 192 * 1024 * 80 // 100
     assert auto.hash() == explicit_none.hash() == clamped.hash()
     assert auto.hash() != disabled.hash()
     assert auto.hash() != small.hash()
@@ -288,23 +295,34 @@ def _make_opt(
     *,
     is_pure_simt,
     superblock_factor=0,
-    enable_bishengir_simt_optimization=0,
+    simt_optimization_mode=0,
     simt_stack_limit=None,
     shared_mem_dynamic_size=None,
-    enable_simt_reorder_instruction=False,
     disable_fma=False,
+    compile_on_910_95=False,
 ):
     return SimpleNamespace(
         is_pure_simt=is_pure_simt,
         num_warps=4,
         warp_size=32,
-        enable_bishengir_simt_optimization=enable_bishengir_simt_optimization,
+        simt_optimization_mode=simt_optimization_mode,
         simt_stack_limit=simt_stack_limit,
         shared_mem_dynamic_size=shared_mem_dynamic_size,
-        enable_simt_reorder_instruction=enable_simt_reorder_instruction,
         disable_fma=disable_fma,
         superblock_factor=superblock_factor,
+        compile_on_910_95=compile_on_910_95,
     )
+
+
+def _make_program_grid_contract(*transforms):
+    return {
+        "version": 2,
+        "extent_source": "runtime_original_grid",
+        "hidden_extent_axes": [0, 1],
+        "hidden_argument_order": ["originalGridX", "originalGridY"],
+        "hidden_argument_types": ["i32", "i32"],
+        "transforms": list(transforms),
+    }
 
 
 def _run_ttir_to_npubin(
@@ -317,11 +335,10 @@ def _run_ttir_to_npubin(
     row_coalescing_applied=False,
     superblock_factor=0,
     common_options=(),
-    enable_bishengir_simt_optimization=0,
+    simt_optimization_mode=0,
     simt_stack_limit=None,
     resolved_simt_stack_limit=1152,
     shared_mem_dynamic_size=None,
-    enable_simt_reorder_instruction=False,
     disable_fma=False,
 ):
     events = []
@@ -334,6 +351,7 @@ def _run_ttir_to_npubin(
         return {
             **metadata,
             "has_auto_blockify_blacklist_op": has_blacklist_op,
+            "mix_mode": "aiv",
             "row_coalescing_applied": row_coalescing_applied,
         }
 
@@ -380,16 +398,63 @@ def _run_ttir_to_npubin(
         _make_opt(
             is_pure_simt=is_pure_simt,
             superblock_factor=superblock_factor,
-            enable_bishengir_simt_optimization=enable_bishengir_simt_optimization,
+            simt_optimization_mode=simt_optimization_mode,
             simt_stack_limit=simt_stack_limit,
             shared_mem_dynamic_size=shared_mem_dynamic_size,
-            enable_simt_reorder_instruction=enable_simt_reorder_instruction,
             disable_fma=disable_fma,
         ),
     )
     assert result == b"npubin"
     assert len(commands) == 1
     return events, commands[0]
+
+
+def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
+    commands = []
+    parsed_metadata = defaultdict(
+        lambda: None, {
+            "target": SimpleNamespace(arch="Ascend910B"),
+            "program_grid_transforms": None,
+            "program_grid_mapping_applied": False,
+            "row_coalescing_applied": False,
+            "has_auto_blockify_blacklist_op": has_blacklist_op,
+            "auto_blockify_enabled": not has_blacklist_op,
+            "ptsm_cap_authorized": False,
+            "mix_mode": "aiv",
+        })
+
+    class FakeNPUUtils:
+
+        def has_device_limit(self):
+            return False
+
+        def get_arch(self):
+            return "Ascend910B"
+
+    def parse_linalg_metadata(linalg, _metadata):
+        return linalg, parsed_metadata
+
+    def run_bisheng(command, **_kwargs):
+        commands.append(list(command))
+        Path(command[command.index("-o") + 1] + "_reloc.o").write_bytes(b"npubin")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(compiler, "_parse_linalg_metadata", parse_linalg_metadata)
+    monkeypatch.setattr(compiler, "get_common_bishengir_compile_options", lambda _metadata: [])
+    monkeypatch.setattr(compiler, "get_auto_bind_sub_block_option", lambda _metadata: False)
+    monkeypatch.setattr(compiler, "NPUUtils", FakeNPUUtils)
+    monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/bishengir-compile", {}))
+    monkeypatch.setattr(compiler, "_is_auto_map_parallel_blocks_enabled", lambda: True)
+    monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
+
+    result = getattr(compiler, function_name)(
+        "module {}",
+        {},
+        SimpleNamespace(debug=False, target_arch="Ascend950PR", is_pure_simt=False),
+    )
+    assert result == b"npubin"
+    assert len(commands) == 1
+    return commands[0]
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
@@ -558,25 +623,26 @@ def test_make_ttir_passes_canonical_compile_mode_to_graph_optimize(compiler_modu
     events, graph_calls = _run_make_ttir_with_recorded_graph_options(compiler_module, monkeypatch, options)
 
     assert graph_calls == [{
-        "ub_capacity_bytes": 96 * 1024,
+        "ub_capacity_bytes": 192 * 1024 * 80 // 100,
         "compile_mode": "simt_only",
     }]
     assert events[-1] == "run_row"
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
-def test_npu_options_do_not_expose_graph_remark_switch(compiler_module):
-    """Graph rewrite logging is controlled by LLVM DEBUG, not an NPU option."""
-    assert "graph_optimize_emit_remarks" not in compiler_module.NPUOptions.__dataclass_fields__
+def test_npu_options_keep_graph_remark_compatibility_default(compiler_module):
+    """The legacy graph-remarks name remains discoverable with a fixed default."""
+    options = compiler_module.NPUOptions(arch="Ascend910B1")
+    assert options.__dict__["graph_optimize_emit_remarks"] is False
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
 @pytest.mark.parametrize(
     ("arch", "expected_capacity"),
     (
-        ("Ascend910B1", 96 * 1024),
-        ("Ascend910_9581", 128 * 1024),
-        ("Ascend950A3", 128 * 1024),
+        ("Ascend910B1", 192 * 1024 * 80 // 100),
+        ("Ascend910_9581", 256 * 1024 * 80 // 100),
+        ("Ascend950A3", 256 * 1024 * 80 // 100),
         ("unknown-arch", 0),
     ),
 )
@@ -590,7 +656,6 @@ def test_make_ttir_forwards_normalized_graph_ub_budget(compiler_module, monkeypa
 
 
 def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
-    """Keep the internal-policy-and-safety pure-SIMT auto-blockify argv contract."""
     common_options = ["--common-before-pure-simt", "--common-after-pure-simt"]
     pure_simt_prefix = [
         "--enable-hivm-compile=false",
@@ -598,10 +663,9 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
         "--pure-simt",
         "--num-warps=4",
         "--threads-per-warp=32",
-        "--enable-bishengir-simt-optimization=17",
+        "--simt-optimization-mode=1000017",
         "--simt-stack-limit=64",
         "--shared-mem-dynamic-size=4096",
-        "--enable-simt-reorder-instruction=true",
         "--disable-fma",
     ]
     auto_blockify_flag = "--enable-auto-blockify-loop"
@@ -621,14 +685,13 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
                 row_coalescing_applied=row_applied,
                 superblock_factor=superblock,
                 common_options=common_options,
-                enable_bishengir_simt_optimization=17,
+                simt_optimization_mode=1000017,
                 resolved_simt_stack_limit=64,
                 shared_mem_dynamic_size=4096,
-                enable_simt_reorder_instruction=True,
                 disable_fma=True,
             )
 
-        second_injection = env_enabled and not blacklisted and not row_applied
+        second_injection = env_enabled and not row_applied
         case = f"E={env_enabled}, B={blacklisted}, R={row_applied}, superblock={superblock}"
 
         expected_options = [*common_options, *pure_simt_prefix]
@@ -637,12 +700,117 @@ def test_ttir_to_npubin_auto_blockify_argv_matrix(compiler_module, monkeypatch):
             if superblock > 0:
                 expected_options.append(f"--super-block-factor={superblock}")
 
-        # The compiler and launcher now agree on the single policy/safety gate.
         assert command[0] == "/fake/bisheng", case
         assert Path(command[1]).name == "kernel.ttir.mlir", case
         assert command[2:-2] == expected_options, case
         assert command[-2] == "-o", case
         assert Path(command[-1]).name == "kernel", case
+
+
+@pytest.mark.parametrize(
+    ("auto_map_enabled", "blacklisted", "row_applied", "transforms", "expected_auto", "expected_ptsm"),
+    (
+        (False, False, False, None, False, False),
+        (True, False, False, None, True, False),
+        (True, False, True, None, True, False),
+        (True, True, False, None, False, False),
+        (True, False, False, ((0, 1, 16, False, False), ), True, False),
+        (True, False, False, ((0, 0, 64, True, True), ), False, True),
+        (True, False, False, ((0, 1, 16, False, False), (1, 0, 4, True, True)), False, True),
+    ),
+)
+def test_finalize_program_launch_policy_uses_linalg_ptsm_gate(
+    compiler_module,
+    monkeypatch,
+    auto_map_enabled,
+    blacklisted,
+    row_applied,
+    transforms,
+    expected_auto,
+    expected_ptsm,
+):
+    contract = None
+    if transforms is not None:
+        contract = _make_program_grid_contract(*(dict(
+            order=order,
+            kind="ceil_div",
+            axis=axis,
+            factor=factor,
+            persistent_coverage=persistent,
+            grid_stride_abi_verified=grid_stride,
+        ) for order, axis, factor, persistent, grid_stride in transforms))
+    metadata = {
+        "program_grid_transforms": contract,
+        "program_grid_mapping_applied": contract is not None,
+        "row_coalescing_applied": row_applied,
+        "has_auto_blockify_blacklist_op": blacklisted,
+        "mix_mode": "aiv",
+    }
+    monkeypatch.setattr(compiler_module, "_is_auto_map_parallel_blocks_enabled", lambda: auto_map_enabled)
+
+    compiler_module._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=False))
+
+    assert metadata["auto_blockify_enabled"] is expected_auto
+    assert metadata["ptsm_cap_authorized"] is expected_ptsm
+
+
+@pytest.mark.parametrize(
+    ("auto_map_enabled", "blacklisted", "row_applied", "expected_auto"),
+    (
+        (False, False, False, False),
+        (False, True, False, False),
+        (True, False, False, True),
+        (True, True, False, True),
+        (True, False, True, False),
+        (True, True, True, False),
+    ),
+)
+def test_finalize_program_launch_policy_pure_simt_ignores_blacklist(
+    compiler_module,
+    monkeypatch,
+    auto_map_enabled,
+    blacklisted,
+    row_applied,
+    expected_auto,
+):
+    metadata = {
+        "program_grid_transforms": None,
+        "program_grid_mapping_applied": False,
+        "row_coalescing_applied": row_applied,
+        "has_auto_blockify_blacklist_op": blacklisted,
+        "mix_mode": "aiv",
+    }
+    monkeypatch.setattr(compiler_module, "_is_auto_map_parallel_blocks_enabled", lambda: auto_map_enabled)
+
+    compiler_module._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=True))
+
+    assert metadata["auto_blockify_enabled"] is expected_auto
+    assert metadata["ptsm_cap_authorized"] is False
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    (
+        "linalg_to_bin_enable_npu_compile_910_95",
+        "linalg_to_bin_enable_npu_compile_A2_A3",
+    ),
+)
+@pytest.mark.parametrize("has_blacklist_op", (False, True))
+def test_non_pure_simt_linalg_compilers_keep_blacklist_auto_blockify_gate(
+    compiler_module,
+    monkeypatch,
+    function_name,
+    has_blacklist_op,
+):
+    command = _run_linalg_to_npubin(
+        compiler_module,
+        monkeypatch,
+        function_name,
+        has_blacklist_op,
+    )
+
+    assert ("--enable-auto-blockify-loop" in command) is not has_blacklist_op
+    assert "--pure-simt" not in command
 
 
 def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compiler_module):
@@ -697,5 +865,6 @@ def test_default_compile_mode_keeps_the_91095_layout_memory_gate_prepared(compil
     assert explicit_only.compile_mode == "simt_only"
     assert explicit_only.is_pure_simt is True
 
-    assert "force_simt_only" not in compiler_module.NPUOptions.__dataclass_fields__
-    assert "force_simt_template" not in compiler_module.NPUOptions.__dataclass_fields__
+    # Legacy spellings remain discoverable while compile_mode controls lowering.
+    assert explicit_only.__dict__["force_simt_only"] is False
+    assert explicit_template.__dict__["force_simt_template"] is False

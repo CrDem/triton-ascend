@@ -30,7 +30,13 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/Support/WalkResult.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
@@ -51,6 +57,7 @@
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -64,6 +71,7 @@
 #include "DynamicCVPipeline/Common/FallbackHelper.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
+static constexpr unsigned MAX_RETRY_TIMES = 2;
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
 
@@ -73,6 +81,52 @@ namespace triton {
 #include "ascend/include/DynamicCVPipeline/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
+
+static std::optional<int64_t> getErrorCode(ModuleOp moduleOp) {
+  auto errCodeAttr =
+      moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
+  return errCodeAttr ? std::optional<int64_t>(errCodeAttr.getInt())
+                     : std::nullopt;
+}
+
+// The unroll factor is a pass option rather than a module attribute, so it
+// cannot be stamped on the module the way the other parameters are: the
+// pipeline itself has to be rebuilt around it. The variant search rebuilds it
+// once per candidate, which is why this is a function and not a fixed list.
+static inline void addPasses(OpPassManager &pm, int unrollFactor) {
+  // Unroll the main loop once the compute blocks are planned but before the
+  // dataflow is split, so that the inter core transfers, their sync flags and
+  // the multi buffers below are planned for each unrolled copy separately.
+  // The pass is a no-op unless a factor > 1 was requested.
+  if (unrollFactor > 1) {
+    MainLoopUnrollOptions unrollOptions;
+    unrollOptions.unrollFactor = unrollFactor;
+    pm.addPass(createMainLoopUnrollPass(unrollOptions));
+    pm.addPass(createCanonicalizerPass());
+  }
+  pm.addPass(createPreCheckAvailablePass());
+  pm.addPass(createStandardizeOpPass());
+  pm.addPass(createPlanComputeBlockPass());
+  pm.addPass(createComputeBlockOptPass());
+  pm.addPass(createSplitDataflowPass());
+  pm.addPass(createAnalyzeDataFlowPass());
+  pm.addPass(createAllocMultiCachePass());
+  pm.addPass(createAddControlFlowConditionPass());
+  pm.addPass(createSeparateMemoryFromComputePass());
+  // Must precede createRemoveSsbufAttrPass(): the estimate is driven by the
+  // ssbuffer.* attributes that pass strips.
+  pm.addPass(createEstimateCVPipelineCostPass());
+  pm.addPass(createRemoveSsbufAttrPass());
+}
+
+// must collect all sub-passes since they now are not added to pipeline
+void AddDynamicCVPipelinePass::getDependentDialects(
+    DialectRegistry &registry) const {
+  Base::getDependentDialects(registry);
+  OpPassManager tempPM(ModuleOp::getOperationName());
+  addPasses(tempPM, 1);
+  tempPM.getDependentDialects(registry);
+}
 
 namespace {
 
@@ -504,37 +558,11 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
   ModuleOp moduleBackup(moduleOp->clone());
   CVPipeline::FallbackHelper fallback(moduleOp);
-  PassManager pm(&getContext(), moduleOp.getOperationName());
 
   LLVM_DEBUG(moduleOp->dump());
 
-  // The unroll factor is a pass option rather than a module attribute, so it
-  // cannot be stamped on the module the way the other parameters are: the
-  // pipeline itself has to be rebuilt around it.
-  auto buildPipeline = [&](PassManager &pm, int unrollFactor) {
-    // Unroll the main loop once the compute blocks are planned but before the
-    // dataflow is split, so that the inter core transfers, their sync flags and
-    // the multi buffers below are planned for each unrolled copy separately.
-    // The pass is a no-op unless a factor > 1 was requested.
-    if (unrollFactor > 1) {
-      MainLoopUnrollOptions unrollOptions;
-      unrollOptions.unrollFactor = unrollFactor;
-      pm.addPass(createMainLoopUnrollPass(unrollOptions));
-      pm.addPass(createCanonicalizerPass());
-    }
-    pm.addPass(createPreCheckAvailablePass());
-    pm.addPass(createStandardizeOpPass());
-    pm.addPass(createPlanComputeBlockPass());
-    pm.addPass(createComputeBlockOptPass());
-    pm.addPass(createSplitDataflowPass());
-    pm.addPass(createAnalyzeDataFlowPass());
-    pm.addPass(createAllocMultiCachePass());
-    pm.addPass(createAddControlFlowConditionPass());
-    pm.addPass(createSeparateMemoryFromComputePass());
-    // Must precede createRemoveSsbufAttrPass(): the estimate is driven by the
-    // ssbuffer.* attributes that pass strips.
-    pm.addPass(createEstimateCVPipelineCostPass());
-    pm.addPass(createRemoveSsbufAttrPass());
+  auto buildPipeline = [](PassManager &pm, int unrollFactor) {
+    addPasses(pm, unrollFactor);
   };
 
   // Try several candidates and keep the cheapest, when asked to. The winner is
@@ -952,52 +980,94 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     }
   }
 
-  buildPipeline(pm, finalUnroll);
+  // The winner is compiled for real here. Upstream retries this once with the
+  // buffer counts lowered when the tuple preload is what failed, so the retry
+  // wraps the final compile rather than the search: a candidate that trips the
+  // preload is simply not kept, while the module that ships still gets its
+  // second chance.
+  ScopedDiagnosticHandler handler(&getContext(), [&](Diagnostic &diag) {
+    LLVM_DEBUG({
+      // In debug mode, continue to other handlers, i.e. print to stderr
+      return llvm::failure();
+    });
 
-  if (failed(runPipeline(pm, moduleOp)) ||
-      CVPipeline::hasFallbackAttr(moduleOp)) {
-    auto errCodeAttr =
-        moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
-    int errCode = errCodeAttr ? static_cast<int>(errCodeAttr.getInt())
-                              : CVPipeline::ERRCODE_FAILED;
-    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << errCode << std::endl;
-    if (!errCodeAttr) {
+    // otherwise prohibit any other handler
+    return llvm::success();
+  });
+
+  bool tuplePreloadFailed = false;
+  for (unsigned attempt = 0; attempt < MAX_RETRY_TIMES; ++attempt) {
+    if (attempt > 0) {
+      BufferCountManager bufferCountManager(moduleOp);
+      bufferCountManager.setBufferCount(BufferCountManager::DepType::IntraCore,
+                                        2);
+      bufferCountManager.setBufferCount(BufferCountManager::DepType::InterCore,
+                                        1);
+    }
+
+    // Do not reuse pass instances or partially transformed IR on retry.
+    PassManager pm(&getContext(), moduleOp.getOperationName());
+    buildPipeline(pm, finalUnroll);
+
+    // run passes in separate pm, instead of the pipeline to suppress reproducer
+    const auto result = pm.run(moduleOp);
+    auto errCode = getErrorCode(moduleOp);
+    if (succeeded(result) && !errCode.has_value()) {
+      if (tuplePreloadFailed) {
+        CVPipeline::setFallbackAttr(moduleOp,
+                                    CVPipeline::ERRCODE_TUPLE_PRELOAD_FAILED);
+      }
+      moduleBackup->destroy();
+      LDBG("Process successfully");
+      return;
+    }
+
+    if (errCode == CVPipeline::ERRCODE_TUPLE_PRELOAD_FAILED &&
+        attempt + 1 < MAX_RETRY_TIMES) {
+      LDBG("Tuple-buffer failed; Retrying with tuple preload disabled.");
+      tuplePreloadFailed = true;
+      // The retry starts from the input, not from the half-transformed module.
+      ModuleOp fresh(moduleBackup->clone());
+      restoreModuleFromBackup(moduleOp, fresh);
+      fresh->destroy();
+      moduleOp->removeAttr(CVPipeline::ERRCODE_ATTR);
+      continue;
+    }
+
+    const int code = errCode.has_value() ? static_cast<int>(*errCode)
+                                         : CVPipeline::ERRCODE_FAILED;
+    std::cout << "[VDV DEBUG] DynamicCVPipeline failed errCode=" << code
+              << std::endl;
+    if (!errCode.has_value()) {
       moduleOp->emitWarning() << "[" << DEBUG_TYPE << "] "
                               << "Unexpected pass failure (no fallback attr "
                                  "set); fallback to compilation without "
                                  "dynamic CV pipeline.";
+    } else if (code == CVPipeline::ERRCODE_IGNORED) {
+      // pipeline correctly decided this kernel is not a fit (no matmul,
+      // already scope-optimized, unsupported pattern) -- message, no IR.
+      mlir::emitWarning(moduleOp->getLoc())
+          << "[" << DEBUG_TYPE << "] "
+          << "Kernel not applicable for dynamic CV pipeline "
+             "(no matmul / already scope-optimized / unsupported "
+             "pattern); falling back to standard compilation.";
     } else {
-      if (errCode == CVPipeline::ERRCODE_IGNORED) {
-        // pipeline correctly decided this kernel is not a fit
-        // (no matmul, already scope-optimized, unsupported pattern) --
-        // just print a message, no IR.
-        mlir::emitWarning(moduleOp->getLoc())
-            << "[" << DEBUG_TYPE << "] "
-            << "Kernel not applicable for dynamic CV pipeline "
-               "(no matmul / already scope-optimized / unsupported "
-               "pattern); falling back to standard compilation.";
-      } else {
-        // a sub-pass genuinely failed (UB overflow, flag-budget
-        // exhaustion, unsupported while-condition, i1 cross-block dep, ...) --
-        // print a warning message and print module IR.
-        moduleOp->emitWarning()
-            << "[" << DEBUG_TYPE << "] " << "Pass failed (errcode=" << errCode
-            << "); "
-               "falling back to compilation without "
-               "dynamic CV pipeline.";
-      }
+      // a sub-pass genuinely failed (UB overflow, flag-budget exhaustion,
+      // unsupported while-condition, i1 cross-block dep, ...).
+      moduleOp->emitWarning()
+          << "[" << DEBUG_TYPE << "] " << "Pass failed (errcode=" << code
+          << "); "
+             "falling back to compilation without "
+             "dynamic CV pipeline.";
     }
 
     restoreModuleFromBackup(moduleOp, moduleBackup);
     moduleBackup->destroy();
     fallback.restore();
     moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,
-                      builder.getI32IntegerAttr(errCode));
+                      builder.getI32IntegerAttr(code));
     return;
   }
-
-  moduleBackup->destroy();
-  LDBG("Process successfully");
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>

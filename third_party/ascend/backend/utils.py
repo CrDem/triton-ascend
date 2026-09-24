@@ -46,8 +46,8 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "auto_tile_and_bind_subblock",
     "code_motion",
     "compile_on_910_95",
-    "disable_size_align_for_cast",
     "enable_auto_blockify",
+    "enable_bishengir_simt_optimization",
     "enable_buffer_insert_optimization",
     "enable_cce_vf_auto_sync",
     "enable_cce_vf_remove_membar",
@@ -57,8 +57,10 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "enable_mask_fallback_conversion",
     "enable_nd2nz_on_vector",
     "enable_select_analysis",
+    "enable_simt_reorder_instruction",
     "enable_sync_block_lock",
     "enable_ub_refine_opt",
+    "enable_vf_fusion",
     "force_simt_only",
     "force_simt_template",
     "graph_optimize_emit_remarks",
@@ -76,6 +78,7 @@ _DEPRECATED_NPU_OPTIONS = frozenset({
     "ops_reorder",
     "optimize_dynamic_offset",
     "parallel_mode",
+    "simt_reorder_instruction",
     "storage_align",
     "stream",
     "use_bytecode",
@@ -110,6 +113,7 @@ _DEPRECATED_NPU_OPTION_ALIASES = {
     "intra_cache_num": "buf_slot_num_of_veccore",
     "inter_cache_num": "buf_slot_num_of_crosscore",
     "load_cache_num": "buf_slot_num_of_gm",
+    "enable_bishengir_simt_optimization": "simt_optimization_mode",
 }
 
 # Removed no-op options keep using the compatibility path above.  This table
@@ -123,7 +127,6 @@ _DEPRECATED_NPU_OPTION_DETAILS = {
     "auto_tile_and_bind_subblock":
     "it is ignored; tiling and subblock binding are derived from Linalg IR and lock semantics.",
     "code_motion": "it is ignored; the removed vendor compiler control has no replacement.",
-    "disable_size_align_for_cast": "it is ignored; the removed vendor compiler control has no replacement.",
     "enable_auto_blockify": "it is ignored; automatic block mapping and its safety blacklist are backend-managed.",
     "enable_buffer_insert_optimization":
     "it is ignored; DynamicCV keeps buffer insertion optimization enabled internally.",
@@ -135,14 +138,17 @@ _DEPRECATED_NPU_OPTION_DETAILS = {
     "enable_mask_fallback_conversion": "it is ignored; the backend fixes mask fallback conversion to False.",
     "enable_nd2nz_on_vector": "it is ignored; the backend fixes vector ND2NZ conversion to False.",
     "enable_select_analysis": "it is ignored; the backend fixes select analysis to True.",
+    "enable_simt_reorder_instruction": "it is ignored; instruction reordering is controlled by simt_optimization_mode.",
     "enable_sync_block_lock": "it is ignored; this option has no replacement because it had no effective consumer.",
     "enable_ub_refine_opt": "it is ignored; the backend keeps UB refine optimization disabled.",
+    "enable_vf_fusion": "it is ignored; this switch is no longer forwarded to the NPU compiler.",
     "graph_optimize_emit_remarks": "it is ignored; the backend fixes graph-optimization remarks to False.",
     "graph_optimize_max_rewrites_per_function":
     "it is ignored; the backend fixes the maximum rewrites per function to 64.",
-    "graph_optimize_rule_mask": "it is ignored; the backend fixes the graph-optimization rule mask to 511.",
+    "graph_optimize_rule_mask":
+    "it is ignored; the backend fixes the graph-optimization rule mask to 3071 (legacy + IAT + PTSM).",
     "graph_optimize_ub_capacity_bytes":
-    "it is ignored; the backend derives the UB budget from the target (A2: 96 KiB, A5: 128 KiB).",
+    "it is ignored; the backend derives an 80%-of-raw-UB graph budget from the target architecture.",
     "has_auto_blockify_blacklist_op": "it is ignored; the safety flag is derived by scanning TTIR.",
     "kernel_name": "it is ignored; the kernel name is derived from TTIR.",
     "llvm_version": "it is ignored; this option has no replacement because it had no effective consumer.",
@@ -150,6 +156,8 @@ _DEPRECATED_NPU_OPTION_DETAILS = {
     "ops_reorder": "it is ignored; the removed vendor compiler control has no replacement.",
     "optimize_dynamic_offset": "it is ignored; the backend fixes dynamic-offset optimization to False.",
     "parallel_mode": "it is ignored; parallel mode is derived from compile_mode and Linalg IR.",
+    "simt_reorder_instruction":
+    "it is ignored; this option has been moved into the first digit of simt_optimization_mode.",
     "storage_align": "it is ignored; the removed vendor compiler control has no replacement.",
     "stream": "it is ignored; launch streams are managed by the runtime and driver.",
     "use_bytecode": "it is ignored; the bytecode pipeline is always enabled.",
@@ -832,9 +840,9 @@ def graph_ub_budget_bytes_for_arch(arch: str) -> int:
     """Return the conservative graph-optimization UB budget in bytes.
 
     StoreCoalescing does not model all live local buffers, so its budget is
-    capped at one half of the target's raw UB capacity.
+    capped at 80 percent of the target's raw UB capacity.
     """
-    return ub_size_in_kbytes_for_arch(arch) * 1024 // 2
+    return ub_size_in_kbytes_for_arch(arch) * 1024 * 80 // 100
 
 
 def is_ffts_supported(arch: str):

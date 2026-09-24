@@ -44,18 +44,6 @@ static constexpr const char *DEBUG_TYPE = "refine-args-block-id";
 
 using namespace mlir::triton;
 
-// Erase `op` and, transitively, every upstream producer that becomes dead as a
-// result. Only operations inside `loopBlock` are touched, and nothing is erased
-// unless it is trivially dead at the moment of erasure: an operation is removed
-// only after its uses have actually been dropped, never on a prediction that
-// they are about to be.
-//
-// `bm` is taken because erasing an operation from the IR is only half of the
-// job: the block-id manager caches raw pointers to it and hands them back to
-// callers that dereference them, so an operation must be withdrawn from the
-// manager before it stops existing. Leaving it there segfaults the next
-// iter_arg -- or, since the manager is built once for the whole module, the
-// next main loop.
 static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock,
                                     CVPipeline::ComputeBlockIdManager &bm) {
   llvm::SetVector<Operation *> worklist;
@@ -73,7 +61,6 @@ static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock,
     if (!isOpTriviallyDead(cur)) {
       continue;
     }
-
     // Operands have to be collected before erase(): afterwards `cur` is gone.
     SmallVector<Operation *> producers;
     for (Value operand : cur->getOperands()) {
@@ -81,11 +68,9 @@ static void eraseOpsWithUnusedUsers(Operation *op, Block *loopBlock,
         producers.push_back(defOp);
       }
     }
-
     bm.forgetOp(cur);
     cur->erase();
-
-    // Re-examine the producers now that their uses have been dropped.
+    // Re-examine the producers now that their uses have actually been dropped.
     worklist.insert(producers.begin(), producers.end());
   }
 }

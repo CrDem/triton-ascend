@@ -193,6 +193,16 @@ def _sls_masked_stride4_gather(src, dst, N: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(dst + offsets, value, mask=mask)
 
 
+@triton.jit
+def _masked_indirect_tail_gather(src, indices, dst, limit, BLOCK: tl.constexpr):
+    for tile in range(0, tl.cdiv(limit, BLOCK)):
+        lanes = tile * BLOCK + tl.arange(0, BLOCK)
+        mask = lanes < limit
+        offsets = tl.load(indices + lanes)
+        value = tl.load(src + offsets, mask=mask, other=0.0)
+        tl.store(dst + lanes, value)
+
+
 def test_row_91095_native_metadata_launcher_and_ir(monkeypatch):
     """Row remains pure-SIMT and carries ceil-div grid metadata to launch."""
     n = 19  # H=8 leaves a tail, so ceil-div is observable at the launcher.
@@ -370,6 +380,34 @@ def test_chunk_rejects_data_reaching_pid_predicate_91095(monkeypatch):
     assert compiled.metadata.row_coalescing_applied is False
     assert all("hacc.coalesce_factor" not in ir_text for ir_text in observer.pre_export_ir)
     assert all("gridY = gridY / 16;" not in launcher for launcher in observer.launcher_sources)
+
+
+def test_masked_indirect_tail_uses_bounded_fallback_91095(monkeypatch):
+    """A dynamic tail mask keeps indirect accesses on the bounded fallback."""
+    block = 32
+    limit = 23
+    src = torch.arange(block * 2, dtype=torch.float16).npu()
+    indices = (torch.arange(block, dtype=torch.int64) * 2).npu()
+    dst = torch.full((block, ), -1, dtype=torch.float16).npu()
+
+    compiled, observer = _launch_with_observer(
+        monkeypatch,
+        _masked_indirect_tail_gather,
+        (1, ),
+        src,
+        indices,
+        dst,
+        limit,
+        BLOCK=block,
+        compile_mode="simd_simt_template",
+    )
+
+    expected = torch.zeros(block, dtype=torch.float16)
+    expected[:limit] = src.cpu()[indices.cpu()[:limit]]
+    assert torch.equal(dst.cpu(), expected)
+    _assert_real_91095_gate(compiled, pure_simt=False)
+    indirect_ir = [ir_text for ir_text in observer.pre_export_ir if "triton_indirect_load" in ir_text]
+    assert not indirect_ir, "\n\n".join(indirect_ir)
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
