@@ -626,8 +626,8 @@ def _get_buffer_count_override(kind: str):
 
     Setting a count to 1 makes that path single-buffered, which is how the
     pipeline is told not to multi-buffer it -- there is no separate on/off
-    switch. Only INTRA multi-buffers by default (2); the other two are already
-    1, so INTRA=1 is in practice "no multi-buffering at all".
+    switch. The defaults are INTRA=3, INTER=2, LOAD=1 (BufferCountManager.cpp),
+    so both INTRA and INTER have to be set to 1 to get no multi-buffering.
 
     Meant for experiments: comparing what a kernel costs with and without
     buffering, without editing the caller. An explicit intra_cache_num /
