@@ -39,9 +39,9 @@ def test_dot_scaled():
     M, K, N = shape[0], shape[1], shape[0]
     type_a, type_b = "bf16", "bf16"
     min_scale, max_scale = (0, 142) if type_a == torch.bfloat16 else (124, 131)
-    scale_x = torch.randint(min_scale - 128, max_scale - 127, (M, K // 32), dtype=torch.int8, device="npu")
+    scale_x = torch.randint(min_scale, max_scale, (M, K // 32), dtype=torch.uint8, device=device)
     min_scale, max_scale = (0, 142) if type_b == torch.bfloat16 else (124, 131)
-    scale_y = torch.randint(min_scale - 128, max_scale - 127, (N, K // 32), dtype=torch.int8, device="npu")
+    scale_y = torch.randint(min_scale, max_scale, (N, K // 32), dtype=torch.uint8, device=device)
     z = x.new_empty((M, N), dtype=x.dtype)
     pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b)
 
