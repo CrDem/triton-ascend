@@ -39,11 +39,22 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include <climits>
 
 static constexpr const char *DEBUG_TYPE = "AddMultiBufferInnerScope";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+
+// Temporary scaffolding: the bail-outs below are LLVM_DEBUG-only, which a
+// release build compiles away, so a failure reaches the caller with no clue
+// which check rejected the IR. This prints the one that did. Remove once the
+// store-block experiment is settled.
+static int bailAt(int line) {
+  llvm::errs() << "[add_multi_buffer_inner_scope] bail at line " << line
+               << '\n';
+  return -1;
+}
 
 using namespace mlir;
 using namespace hivm;
@@ -2105,16 +2116,16 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
 
   if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps, i1Found) !=
       0)
-    return -1;
+    return bailAt(__LINE__);
 
   if (blocks.empty())
-    return -1;
+    return bailAt(__LINE__);
 
   // Memref-type dep values are not supported here.
   if (hasMemrefDepValue(depValueMap)) {
     LDBG("ERROR: Memref type dependent values found in user IR, fallback");
     memrefFound = true;
-    return -1;
+    return bailAt(__LINE__);
   }
 
   // Phase 1: build initial depUserMap and clone empty+fill patterns. We use
@@ -2125,7 +2136,7 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   DenseSet<Value> phase1ClonedDepVals;
   if (cloneEmptyFillsInBlocks(mainLoop, blocks, depValueMap, initialDepUserMap,
                               globalBuilder, &phase1ClonedDepVals) != 0)
-    return -1;
+    return bailAt(__LINE__);
 
   rematerializeTensorRootedScalarDeps(mainLoop);
 
@@ -2138,17 +2149,17 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   allOps.clear();
   if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps, i1Found) !=
       0)
-    return -1;
+    return bailAt(__LINE__);
 
   // Phase 2 may surface i1 tensor deps that the clone introduced (e.g. a
   // cloned scalar chain reaching a producer-side i1 tensor). Abort here too.
   if (i1Found) {
     LDBG("i1 tensor dep found in Phase 2, falling back");
-    return -1;
+    return bailAt(__LINE__);
   }
 
   if (blocks.empty())
-    return -1;
+    return bailAt(__LINE__);
 
   // Drop memref-typed deps from Phase 2's collection
   int droppedMemrefDeps = 0;
@@ -2170,12 +2181,12 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   // Clone bufferization.alloc_tensor deps to each consumer's block.
   if (cloneAllocTensorsInBlocks(mainLoop, blocks, depValueMap, depUserMap,
                                 globalBuilder) != 0)
-    return -1;
+    return bailAt(__LINE__);
 
   // Clone memref.alloc + bufferization.to_tensor deps to each consumer's block
   if (cloneAllocToTensorsInBlocks(mainLoop, blocks, depValueMap, depUserMap,
                                   globalBuilder) != 0)
-    return -1;
+    return bailAt(__LINE__);
   auto valueList = collectBufferValues(depValueMap, phase1ClonedDepVals);
   LLVM_DEBUG(
       llvm::dbgs()
@@ -2197,7 +2208,7 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   if (processTensorDependencies(mainLoop, blocks, depValueMap, depUserMap,
                                 bufferMap, globalBuilder, groupId,
                                 phase1ClonedDepVals) != 0) {
-    return -1;
+    return bailAt(__LINE__);
   }
 
   // WhileOp only: insert the counter add-1 now that the dispatch ops that
@@ -2271,6 +2282,7 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
       MainLoop mainLoop(loopOp);
       if (findNestedMainloop(mainLoop)) {
         LDBG("Nested main_loop found, this is not allowed");
+      llvm::errs() << "[add_multi_buffer_inner_scope] nested main_loop" << '\n';
         return WalkResult::interrupt();
       }
       // i1Found / memrefFound are reset per main_loop so they only trigger
@@ -2281,15 +2293,18 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
                                     memrefFound);
       if (i1Found) {
         LDBG("i1 tensor dep found, setting fallback attribute");
+      llvm::errs() << "[add_multi_buffer_inner_scope] i1 dep" << '\n';
         CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
         return WalkResult::interrupt();
       }
       if (memrefFound) {
         LDBG("memref dep found, setting fallback attribute to IGNORED");
+      llvm::errs() << "[add_multi_buffer_inner_scope] memref dep" << '\n';
         CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
         return WalkResult::interrupt();
       }
       if (ret != 0) {
+        llvm::errs() << "[add_multi_buffer_inner_scope] addInnerMultiBuffer failed" << '\n';
         LDBG(
             "addInnerMultiBuffer failed for main_loop; signaling pass failure");
         CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);

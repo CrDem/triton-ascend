@@ -44,6 +44,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
+#include <cstdlib>
 #include <optional>
 #include <utility>
 
@@ -53,6 +54,31 @@ static constexpr const char *DEBUG_TYPE = "merge-small-block";
 
 using namespace mlir;
 using namespace triton;
+
+// Experiment knob for the "small block" threshold. A vector block with no
+// more compute ops than this is merged into a neighbour, which is how two
+// vector blocks of a main loop become one -- and a single vector block
+// leaves AddMultiBufferInnerScope nothing to buffer and CreateIfOps a single
+// stage, so the loop cannot be skewed. Set TRITON_ASCEND_CV_MIN_VF_SIZE=0 to
+// keep every block as planned. Unset keeps the shipped value, 3.
+static int getMinVfSize() {
+  static const int value = []() -> int {
+    const char *env = std::getenv("TRITON_ASCEND_CV_MIN_VF_SIZE");
+    if (!env) {
+      return 3;
+    }
+    int parsed = 0;
+    if (llvm::StringRef(env).getAsInteger(10, parsed) || parsed < 0) {
+      llvm::errs() << "[merge-small-block] TRITON_ASCEND_CV_MIN_VF_SIZE="
+                   << env << " is not a count; ignored\n";
+      return 3;
+    }
+    llvm::errs() << "[merge-small-block] MIN_VF_SIZE overridden to " << parsed
+                 << '\n';
+    return parsed;
+  }();
+  return value;
+}
 
 namespace mlir {
 namespace triton {
@@ -73,7 +99,7 @@ public:
   void runOnOperation() override;
 
 private:
-  const int MIN_VF_SIZE = 3;
+  const int MIN_VF_SIZE = getMinVfSize();
 };
 
 inline bool isTensorComputeOpLegacy(Operation *op) {

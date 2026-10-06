@@ -88,6 +88,11 @@ void ComputeBlockOptPass::runOnOperation() {
   pm.addPass(createReorderOpsByBlockIdPass());
   pm.addPass(createRelocateMemrefDeclPass());
 
+  // Last, so that nothing merges the block it just carved out. Off unless
+  // TRITON_ASCEND_CV_SPLIT_GM_STORE_BLOCK says otherwise.
+  pm.addPass(createSplitGMStoreBlockPass());
+  pm.addPass(createReorderOpsByBlockIdPass());
+
   if (failed(runPipeline(pm, module))) {
     if (!CVPipeline::hasFallbackAttr(module)) {
       std::cout << "[VDV DEBUG] ComputeBlockOpt failed" << std::endl;
@@ -114,6 +119,7 @@ void registerComputeBlockOptPasses() {
   registerPass(createMergeVectorIfBlockPass);
   registerPass(createFixpipeOptPass);
   registerPass(createUnifyStoreBlockPass);
+  registerPass(createSplitGMStoreBlockPass);
   registerPass(createExpSubfPatternPass);
   registerPass(createExpLoadPatternPass);
   registerPass(createSinkI1ProducersIntoUsersPass);

@@ -35,6 +35,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -43,6 +44,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <queue>
 #include <iostream>
@@ -654,6 +656,20 @@ void mlir::triton::UBUsageOptPass::runOnOperation() {
 
   if (CVPipeline::hasFallbackAttr(module)) {
     return;
+  }
+
+  // Experiment switch. This pass lowers UB pressure by moving ops between
+  // compute blocks, which can merge the vector blocks of a main loop into
+  // one -- and a single vector block leaves AddMultiBufferInnerScope nothing
+  // to buffer and CreateIfOps a single stage, so the loop cannot be skewed.
+  // Skipping the pass tells those two effects apart from a genuine lack of
+  // parallelism. Unset, or set to 0, keeps the pass on.
+  if (const char *env = std::getenv("TRITON_ASCEND_CV_SKIP_UB_USAGE_OPT")) {
+    if (llvm::StringRef(env) != "0") {
+      llvm::errs() << "[ub-usage-opt] skipped by "
+                      "TRITON_ASCEND_CV_SKIP_UB_USAGE_OPT\n";
+      return;
+    }
   }
 
   auto &aliasAnalysis = getAnalysis<AliasAnalysis>();
