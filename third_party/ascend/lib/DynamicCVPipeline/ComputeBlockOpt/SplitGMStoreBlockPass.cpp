@@ -205,12 +205,16 @@ void SplitGMStoreBlockPass::runOnOperation() {
     llvm::sort(ordered, [](Operation *a, Operation *b) {
       return a->isBeforeInBlock(b);
     });
-    if (failed(bm.markOpsWithNewId(ordered))) {
-      LOG_DEBUG("markOpsWithNewId failed for " << *storeOp);
-      continue;
+    // markOpsWithNewId refuses an op that already carries an id, and every op
+    // here has one, so take a fresh id and force it in. updateBlockId rewrites
+    // the attribute and moves the op between the manager's buckets; core_type
+    // is left alone, which is what we want -- the ops stay on the vector core.
+    const int newId = bm.getNextId();
+    for (Operation *op : ordered) {
+      bm.updateBlockId(op, newId);
     }
-    LOG_DEBUG("moved a store group of " << ordered.size()
-                                        << " op(s) into a new block");
+    LOG_DEBUG("moved a store group of " << ordered.size() << " op(s) into block "
+                                        << newId);
   }
 }
 
