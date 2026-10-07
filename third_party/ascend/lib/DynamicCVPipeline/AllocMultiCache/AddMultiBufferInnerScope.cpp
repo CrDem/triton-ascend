@@ -37,10 +37,12 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <climits>
+#include <cstdlib>
 
 static constexpr const char *DEBUG_TYPE = "AddMultiBufferInnerScope";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -50,6 +52,26 @@ static constexpr const char *DEBUG_TYPE = "AddMultiBufferInnerScope";
 // release build compiles away, so a failure reaches the caller with no clue
 // which check rejected the IR. This prints the one that did. Remove once the
 // store-block experiment is settled.
+// Hand the slot rotation to NPU-IR instead of expanding it here.
+//
+// The sync solver downstream only knows about slots for a buffer that
+// PlanMemory gave an address list to, and that list comes from an
+// hivm.multi_buffer mark. N separate memref.allocs are N unrelated memories
+// to it: AllocLikeInfo::checkConflict compares alloc ops and drops the
+// eventIdNum argument entirely, so accesses on different slots never
+// interfere and the colouring hands the whole rotation one event id -- which
+// serialises the pipe it was meant to overlap. Declaring the rotation keeps
+// everything else of ours (stages, credits, the store block) and lets the
+// solver allocate one id per slot, the way it does for a cube L1 buffer that
+// MarkMultiBuffer marked by itself.
+static bool declareMultiBuffer() {
+  static const bool declare = []() -> bool {
+    const char *env = std::getenv("TRITON_ASCEND_CV_DECLARE_MULTI_BUFFER");
+    return env && llvm::StringRef(env) != "0";
+  }();
+  return declare;
+}
+
 static int bailAt(int line) {
   llvm::errs() << "[add_multi_buffer_inner_scope] bail at line " << line
                << '\n';
@@ -1839,8 +1861,14 @@ static BufferMap insertBuffersBeforeLoop(const MainLoop &loop,
     Type elemType = shapedType.getElementType();
     AddressSpace addrSpace = AddressSpace::UB;
 
+    // One alloc plus a mark when the rotation is declared rather than built.
+    // insertProducerLogic / insertConsumerLogic then take their single-buffer
+    // paths, so no index chain of ours is emitted for this value.
+    const bool declareRotation = declareMultiBuffer() && bufNum > kBufferCountOne;
+    const int allocCount = declareRotation ? kBufferCountOne : bufNum;
+
     SmallVector<BufferPair> buffers;
-    for (int i = 0; i < bufNum; ++i) {
+    for (int i = 0; i < allocCount; ++i) {
       MemRefType memrefType = MemRefType::get(
           shapedType.getShape(), elemType, MemRefLayoutAttrInterface{},
           AddressSpaceAttr::get(insertedBuffers.getContext(), addrSpace));
@@ -1853,6 +1881,16 @@ static BufferMap insertBuffersBeforeLoop(const MainLoop &loop,
 
       auto casted = insertedBuffers.create<memref::MemorySpaceCastOp>(
           loop.getLoc(), genericType, allocOp.getResult());
+
+      if (declareRotation) {
+        auto markOp = insertedBuffers.create<annotation::MarkOp>(
+            loop.getLoc(), allocOp.getResult());
+        markOp->setAttr(hivm::MultiBufferAttr::name,
+                        insertedBuffers.getI32IntegerAttr(bufNum));
+        llvm::errs() << "[AddMultiBufferInnerScope] declared hivm.multi_buffer = "
+                     << bufNum << " instead of expanding the rotation";
+        llvm::errs() << '\n';
+      }
 
       buffers.push_back({casted.getResult(), casted.getResult()});
     }
