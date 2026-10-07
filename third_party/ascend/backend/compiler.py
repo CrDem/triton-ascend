@@ -832,7 +832,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 [f"--enable-mixed-cv={enable_mixed_cv}"]
 
         enable_dynamic_cv_pipeline = metadata["enable_dynamic_cv_pipeline"]
-        if enable_dynamic_cv_pipeline == True and not metadata.get("disable_vf_operand_substitution", False):
+        # VFOperandSubstitution ends with eraseHirStoreSourceMultiBufferMarks,
+        # which drops every annotation.mark whose only attribute is
+        # hivm.multi_buffer when the marked alloc feeds a hivm.hir.store. A
+        # rotation declared on the vector store buffer is exactly that shape, so
+        # it never reaches EnableMultiBuffer. Switching the pass off keeps the
+        # declaration alive; the cost is losing its VF buffer reuse.
+        skip_vf_operand_subst = (metadata.get("disable_vf_operand_substitution", False)
+                                 or os.getenv("TRITON_ASCEND_DISABLE_VF_OPERAND_SUBST", None) == "1")
+        if enable_dynamic_cv_pipeline == True and not skip_vf_operand_subst:
             _compile_option_list += [f"--enable-vf-operand-substitution=True"]
 
         enable_flatten = metadata["enable_flatten"]
@@ -882,6 +890,14 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
         _compile_option_list += ["--mlir-print-ir-after-failure"]
         _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+
+        # The npu compiler's own per-pass dump. compiler.py already stores its
+        # stdout/stderr as kernel.npuir.mlir, so this is how the result of
+        # MarkMultiBuffer / PlanMemory / GraphSyncSolver becomes readable --
+        # the bcmlir stage is only the bytecode parsed back, with no npu pass
+        # having run yet.
+        if os.getenv("TRITON_ASCEND_NPUIR_PRINT_IR", None) == "1":
+            _compile_option_list += ["--mlir-print-ir-after-all"]
 
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:

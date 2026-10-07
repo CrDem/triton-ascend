@@ -1856,6 +1856,21 @@ static BufferMap insertBuffersBeforeLoop(const MainLoop &loop,
   int bufNum = bufferCountMgr.getBufferCountByType(
       BufferCountManager::DepType::IntraCore);
 
+  // A declared rotation is expanded downstream by EnableMultiBuffer, which
+  // keys it to the loop getParentLoop() reports for the alloc -- the innermost
+  // loop the alloc itself sits in. An alloc placed ahead of the main loop sits
+  // in whatever loop encloses that one (the grid loop), so its slot would
+  // advance once per grid iteration and stay fixed across the pipelined
+  // iterations: indistinguishable from a single buffer. Declaring it at the top
+  // of the main loop body instead makes the slot advance per pipelined
+  // iteration, which is the only level at which the stages can overlap.
+  // The expanded path keeps the original placement -- it builds its own index
+  // chain from the stage counters and needs the allocs to outlive the loop.
+  const bool declareRotation = declareMultiBuffer() && bufNum > kBufferCountOne;
+  if (declareRotation) {
+    insertedBuffers.setInsertionPointToStart(loop.getBody());
+  }
+
   for (Value depVal : valueList) {
     ShapedType shapedType = cast<ShapedType>(depVal.getType());
     Type elemType = shapedType.getElementType();
@@ -1864,7 +1879,6 @@ static BufferMap insertBuffersBeforeLoop(const MainLoop &loop,
     // One alloc plus a mark when the rotation is declared rather than built.
     // insertProducerLogic / insertConsumerLogic then take their single-buffer
     // paths, so no index chain of ours is emitted for this value.
-    const bool declareRotation = declareMultiBuffer() && bufNum > kBufferCountOne;
     const int allocCount = declareRotation ? kBufferCountOne : bufNum;
 
     SmallVector<BufferPair> buffers;
@@ -1888,7 +1902,8 @@ static BufferMap insertBuffersBeforeLoop(const MainLoop &loop,
         markOp->setAttr(hivm::MultiBufferAttr::name,
                         insertedBuffers.getI32IntegerAttr(bufNum));
         llvm::errs() << "[AddMultiBufferInnerScope] declared hivm.multi_buffer = "
-                     << bufNum << " instead of expanding the rotation";
+                     << bufNum
+                     << " inside the main loop instead of expanding the rotation";
         llvm::errs() << '\n';
       }
 
