@@ -24,6 +24,7 @@
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <set>
@@ -65,6 +66,56 @@ using namespace hivm;
 
 static constexpr int kIntegerBitWidth = 32;
 static constexpr int NzDimWidth = 16;
+
+/// Where the initial buffer grant and the final drain of a transfer go.
+///
+/// By default they bracket the transfer's own loop, which makes the credit
+/// scheme self-contained per iteration of whatever encloses it: on entry every
+/// slot holds one credit, on exit every slot holds one credit again. The two
+/// states are identical -- each executed transfer is credit-neutral for its
+/// slot, so the pair drains to zero and refills to exactly what was already
+/// there -- which makes it a no-op in steady state.
+///
+/// It is not free, though. The grant is a SyncBlockSetOp fenced on the
+/// consumer's own pipe, so it cannot be issued until the consumer has finished
+/// everything the previous outer iteration left on that pipe. On a
+/// flash-attention shaped kernel that is the whole epilogue of the previous
+/// q-block, and the producer's first fixpipe of the next one waits behind it
+/// for no reason other than this bookkeeping.
+///
+/// Setting the variable moves the pair one loop outwards, so the credit is
+/// carried across outer iterations instead of being reset at every boundary.
+/// Off by default: the hoist is only sound while nothing between two outer
+/// iterations touches the transfer buffers outside the protocol, which holds
+/// for the kernels this was written for but is not something the pass checks.
+static constexpr const char *kHoistGrantsEnvVar =
+    "TRITON_ASCEND_CV_HOIST_GRANTS";
+
+static bool shouldHoistBufferGrants() {
+  static const bool hoist = [] {
+    const char *env = std::getenv(kHoistGrantsEnvVar);
+    const bool on = env && llvm::StringRef(env).trim() == "1";
+    if (on) {
+      llvm::errs() << "[" << DEBUG_TYPE << "] " << kHoistGrantsEnvVar
+                   << "=1: initial buffer grants and final drains are hoisted "
+                      "one loop outwards, so cross-core credit is carried "
+                      "across outer iterations instead of being reset\n";
+    }
+    return on;
+  }();
+  return hoist;
+}
+
+/// The innermost scf.for/scf.while strictly enclosing `op`, or nullptr.
+static Operation *getEnclosingLoop(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    if (isa<scf::ForOp, scf::WhileOp>(parent)) {
+      return parent;
+    }
+  }
+  return nullptr;
+}
 
 static uint64_t getElemBytesForAlign(Type t) {
   static constexpr uint64_t kBitsPerByte = 8;
@@ -1072,16 +1123,30 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     attachTransferTags(setOpForWrite, consumerBlockId, config.dstCoreType,
                        transferIndex);
 
-    builder.setInsertionPoint(mainLoopOp);
+    // The loop the initial grant and the final drain bracket. Normally the
+    // transfer's own loop; one level further out when the hoist is asked for
+    // and there is an outer loop to move to. Keeping the choice local means
+    // mainLoopOp still decides where the buffers are allocated and where the
+    // in-loop sync goes, so only the bookkeeping pair moves.
+    Operation *grantLoopOp = mainLoopOp;
+    if (shouldHoistBufferGrants()) {
+      if (Operation *outerLoop = getEnclosingLoop(mainLoopOp)) {
+        grantLoopOp = outerLoop;
+        LOG_DEBUG("transfer " << transferIndex
+                              << ": grant/drain hoisted outwards\n");
+      }
+    }
+
+    builder.setInsertionPoint(grantLoopOp);
     auto setOpForStart = builder.create<SyncBlockSetOp>(
         loc, config.dstCoreAttr, config.forWriteTPipe, config.forWritePipe,
         flagId);
-    builder.setInsertionPointAfter(mainLoopOp);
+    builder.setInsertionPointAfter(grantLoopOp);
     auto waitOpForEnd = builder.create<SyncBlockWaitOp>(
         loc, config.srcCoreAttr, config.forWriteTPipe, config.forWritePipe,
         flagId);
 
-    int startEndBlockId = CVPipeline::getOpBlockId(mainLoopOp).value_or(-1);
+    int startEndBlockId = CVPipeline::getOpBlockId(grantLoopOp).value_or(-1);
     attachTransferTags(setOpForStart, startEndBlockId, config.dstCoreType,
                        transferIndex);
     attachTransferTags(waitOpForEnd, startEndBlockId, config.srcCoreType,
