@@ -105,6 +105,11 @@ private:
   int intraDepsGroupId = 0;
 
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
+  // The buffer pair createTransferAllocs made for each transfer, so the
+  // grant/drain placement can check what else touches them. Keyed by the
+  // transfer index the allocs are tagged with.
+  llvm::DenseMap<int, llvm::SmallVector<mlir::Operation *, 2>>
+      transferAllocsByIndex;
   SSBufferManager ssbufferManager;
 
   mlir::LogicalResult

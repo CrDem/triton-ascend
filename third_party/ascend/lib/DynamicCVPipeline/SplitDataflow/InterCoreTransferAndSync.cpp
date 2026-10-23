@@ -106,6 +106,95 @@ static bool shouldHoistBufferGrants() {
   return hoist;
 }
 
+/// Everything that aliases one of `roots` through views, casts and to_tensor,
+/// so the region check below can compare values by identity. Layout-changing
+/// ops are deliberately not followed: an access through one of those counts
+/// as an access to the buffer, which is the conservative answer.
+static void collectBufferAliases(llvm::ArrayRef<Value> roots,
+                                 llvm::DenseSet<Value> &aliases) {
+  SmallVector<Value> worklist(roots.begin(), roots.end());
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!aliases.insert(value).second) {
+      continue;
+    }
+    for (Operation *user : value.getUsers()) {
+      if (isa<mlir::ViewLikeOpInterface, memref::MemorySpaceCastOp,
+              bufferization::ToTensorOp>(user)) {
+        for (Value result : user->getResults()) {
+          worklist.push_back(result);
+        }
+      }
+    }
+  }
+}
+
+/// Ops that name a transfer buffer without moving any of its data.
+static bool isHarmlessBufferUse(Operation *op) {
+  return isa<memref::AllocOp, memref::DeallocOp, annotation::MarkOp,
+             memref::MemorySpaceCastOp, bufferization::ToTensorOp,
+             SyncBlockSetOp, SyncBlockWaitOp>(op) ||
+         isa<mlir::ViewLikeOpInterface>(op);
+}
+
+/// Whether hoisting one transfer's grant and drain out to `outerLoop` leaves
+/// its buffers protected.
+///
+/// The hoist gives up on two stretches of the outer body: everything before
+/// the main loop and everything after it. While the pair brackets the main
+/// loop those stretches are safe by construction -- the drain is the
+/// producer's proof that the consumer finished reading, so on either side of
+/// the loop the buffer is owned by nobody. Hoisted, that proof is gone, and an
+/// access out there races the other core.
+///
+/// Checking it in this pass is sound rather than optimistic: ssbuffer makes TA
+/// pass --disable-auto-inject-block-sync=True, so the npu compiler adds no
+/// cross-core sync of its own, and set-workspace-multibuffer=0 keeps its code
+/// motion pipeline (loop-invariant code motion and subset hoisting) out of the
+/// pass list. Nothing downstream moves an access across the main loop, so what
+/// sits outside it here is what will sit there in the end.
+static bool isGrantHoistSafe(Operation *outerLoop, Operation *mainLoopOp,
+                             llvm::ArrayRef<Operation *> transferAllocs) {
+  if (transferAllocs.empty()) {
+    // No record of the buffers means nothing can be proven about them.
+    return false;
+  }
+  SmallVector<Value> roots;
+  for (Operation *allocOp : transferAllocs) {
+    if (!allocOp || allocOp->getNumResults() == 0) {
+      return false;
+    }
+    roots.push_back(allocOp->getResult(0));
+  }
+
+  llvm::DenseSet<Value> aliases;
+  collectBufferAliases(roots, aliases);
+
+  bool safe = true;
+  // Pre-order, because WalkResult::skip() only prunes a subtree on the way
+  // down: in the default post-order the main loop's body would already have
+  // been visited by the time the loop itself is seen.
+  outerLoop->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (op == mainLoopOp) {
+      // The protected stretch: skip it and everything nested in it.
+      return WalkResult::skip();
+    }
+    if (op == outerLoop || isHarmlessBufferUse(op)) {
+      return WalkResult::advance();
+    }
+    for (Value operand : op->getOperands()) {
+      if (aliases.contains(operand)) {
+        LOG_DEBUG(op->getName() << " touches a transfer buffer outside the"
+                                   " main loop\n");
+        safe = false;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  return safe;
+}
+
 /// The innermost scf.for/scf.while strictly enclosing `op`, or nullptr.
 static Operation *getEnclosingLoop(Operation *op) {
   for (Operation *parent = op->getParentOp(); parent;
@@ -683,6 +772,7 @@ InterCoreTransferAndSyncPass::createTransferAllocs(
     attachTransferTags(markConsOp, prodBlockId, consTag, transferIndex);
   }
   markAllocIndex++;
+  transferAllocsByIndex[transferIndex] = {prodAllocOp, consAllocOp};
 
   return {prodAllocOp, consAllocOp};
 }
@@ -1131,9 +1221,19 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     Operation *grantLoopOp = mainLoopOp;
     if (shouldHoistBufferGrants()) {
       if (Operation *outerLoop = getEnclosingLoop(mainLoopOp)) {
-        grantLoopOp = outerLoop;
-        LOG_DEBUG("transfer " << transferIndex
-                              << ": grant/drain hoisted outwards\n");
+        auto it = transferAllocsByIndex.find(transferIndex);
+        llvm::ArrayRef<Operation *> allocs =
+            it == transferAllocsByIndex.end()
+                ? llvm::ArrayRef<Operation *>()
+                : llvm::ArrayRef<Operation *>(it->second);
+        if (isGrantHoistSafe(outerLoop, mainLoopOp, allocs)) {
+          grantLoopOp = outerLoop;
+          LOG_DEBUG("transfer " << transferIndex
+                                << ": grant/drain hoisted outwards\n");
+        } else {
+          LOG_DEBUG("transfer " << transferIndex
+                                << ": grant/drain kept in place\n");
+        }
       }
     }
 
