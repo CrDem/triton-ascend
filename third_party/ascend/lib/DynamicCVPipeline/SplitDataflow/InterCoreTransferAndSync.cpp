@@ -357,6 +357,25 @@ bool hasStartEndSyncWhitelistKernel(ModuleOp module) {
   return isWhitelistKernel;
 }
 
+/// Kernels that keep the grant and the drain on their own main loop, whatever
+/// isGrantHoistSafe says about the individual transfers. The check is per
+/// transfer and per buffer, so it does not see that two main loops sharing one
+/// outer body end up with interleaved rather than nested brackets.
+static bool hasGrantHoistBlacklistKernel(ModuleOp module) {
+  std::vector<std::string> blacklist{
+      "flex_attention_backward_dq_kernel",
+  };
+
+  bool isBlacklistKernel = false;
+  for (auto func : module.getOps<func::FuncOp>()) {
+    if (llvm::is_contained(blacklist, func.getName().str())) {
+      isBlacklistKernel = true;
+      break;
+    }
+  }
+  return isBlacklistKernel;
+}
+
 // Block Start/End Operation Retrieval
 std::pair<mlir::Operation *, mlir::Operation *>
 InterCoreTransferAndSyncPass::getBlockStartEnd(int targetId,
@@ -1239,7 +1258,8 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     // Bracket the enclosing loop when safe, so the credit is carried across
     // its iterations instead of being reset at every boundary.
     Operation *grantLoopOp = mainLoopOp;
-    if (!hasStartEndSyncWhitelistKernel(module)) {
+    if (!hasStartEndSyncWhitelistKernel(module) &&
+        !hasGrantHoistBlacklistKernel(module)) {
       if (Operation *outerLoop = getEnclosingLoop(mainLoopOp)) {
         if (isGrantHoistSafe(outerLoop, mainLoopOp,
                              transferAllocsByIndex.lookup(transferIndex))) {
