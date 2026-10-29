@@ -101,6 +101,9 @@ public:
 private:
   mlir::ModuleOp module;
   int transferIndex = 0;
+  // Cleared when the kernel cannot afford the longer flag live ranges that
+  // bracketing the enclosing loop creates.
+  bool grantHoistAllowed = true;
   int markAllocIndex = 0;
   int intraDepsGroupId = 0;
 
