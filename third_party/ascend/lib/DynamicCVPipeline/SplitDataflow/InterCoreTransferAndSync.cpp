@@ -103,6 +103,24 @@ static bool isHarmlessBufferUse(Operation *op) {
              SyncBlockSetOp, SyncBlockWaitOp, ViewLikeOpInterface>(op);
 }
 
+/// Loops nested directly in `loopOp`: those whose innermost enclosing loop is
+/// `loopOp` itself, reached through any amount of non-loop nesting.
+static SmallVector<Operation *> getDirectlyNestedLoops(Operation *loopOp) {
+  SmallVector<Operation *> nested;
+  loopOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (op == loopOp) {
+      return WalkResult::advance();
+    }
+    if (isa<scf::ForOp, scf::WhileOp>(op)) {
+      nested.push_back(op);
+      // Anything below this loop is nested in it, not in `loopOp`.
+      return WalkResult::skip();
+    }
+    return WalkResult::advance();
+  });
+  return nested;
+}
+
 /// Whether the initial grant and the final drain of one transfer may bracket
 /// `outerLoop` instead of `mainLoopOp`.
 static bool isGrantHoistSafe(Operation *outerLoop, Operation *mainLoopOp,
@@ -110,6 +128,29 @@ static bool isGrantHoistSafe(Operation *outerLoop, Operation *mainLoopOp,
   if (transferAllocs.empty()) {
     return false;
   }
+
+  // The main loop has to run exactly once per outer iteration, or the grant
+  // stops dominating the in-loop wait and the drain stops post-dominating the
+  // in-loop set. Requiring it to be an unconditional statement of the outer
+  // body gives that without a dominance query, and also rejects a main loop
+  // sitting in a WhileOp's second region or under an scf.if.
+  Region &outerBody = outerLoop->getRegion(0);
+  if (!outerBody.hasOneBlock() ||
+      mainLoopOp->getBlock() != &outerBody.front()) {
+    LOG_DEBUG("main loop is not an unconditional outer-loop statement\n");
+    return false;
+  }
+
+  // A sibling loop would sit inside the hoisted bracket while keeping its own
+  // transfers and their own credit rotation, so the two brackets interleave
+  // around `outerLoop` instead of nesting.
+  for (Operation *nestedLoop : getDirectlyNestedLoops(outerLoop)) {
+    if (nestedLoop != mainLoopOp) {
+      LOG_DEBUG("outer loop holds a sibling loop, no grant hoist\n");
+      return false;
+    }
+  }
+
   SmallVector<Value> roots;
   for (Operation *allocOp : transferAllocs) {
     if (!allocOp || allocOp->getNumResults() == 0) {
@@ -355,25 +396,6 @@ bool hasStartEndSyncWhitelistKernel(ModuleOp module) {
     }
   }
   return isWhitelistKernel;
-}
-
-/// Kernels that keep the grant and the drain on their own main loop, whatever
-/// isGrantHoistSafe says about the individual transfers. The check is per
-/// transfer and per buffer, so it does not see that two main loops sharing one
-/// outer body end up with interleaved rather than nested brackets.
-static bool hasGrantHoistBlacklistKernel(ModuleOp module) {
-  std::vector<std::string> blacklist{
-      "flex_attention_backward_dq_kernel",
-  };
-
-  bool isBlacklistKernel = false;
-  for (auto func : module.getOps<func::FuncOp>()) {
-    if (llvm::is_contained(blacklist, func.getName().str())) {
-      isBlacklistKernel = true;
-      break;
-    }
-  }
-  return isBlacklistKernel;
 }
 
 // Block Start/End Operation Retrieval
@@ -1258,8 +1280,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
     // Bracket the enclosing loop when safe, so the credit is carried across
     // its iterations instead of being reset at every boundary.
     Operation *grantLoopOp = mainLoopOp;
-    if (!hasStartEndSyncWhitelistKernel(module) &&
-        !hasGrantHoistBlacklistKernel(module)) {
+    if (grantHoistAllowed && !hasStartEndSyncWhitelistKernel(module)) {
       if (Operation *outerLoop = getEnclosingLoop(mainLoopOp)) {
         if (isGrantHoistSafe(outerLoop, mainLoopOp,
                              transferAllocsByIndex.lookup(transferIndex))) {
@@ -2439,6 +2460,24 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     LOG_DEBUG("Error: Data dependency analysis failed.\n");
     return failure();
   }
+
+  // Bracketing the enclosing loop stretches a transfer's flag live range over
+  // that whole loop, so every hoisted flag interferes with every other one.
+  // Once a kernel needs more flags than the budget allows, that pressure is
+  // what breaks downstream rather than the placement, so leave every pair on
+  // its own main loop. Decided here, before anything is inserted, so the
+  // answer does not depend on the order the dependencies are processed. The
+  // stricter of the two budgets applies: the inter-core buffer count that
+  // picks between them is not settled yet.
+  size_t crossCoreDepCount = info.getV2CDependencies().size() +
+                             info.getC2VDependencies().size() +
+                             info.getMemoryDependencies().size();
+  grantHoistAllowed = crossCoreDepCount <=
+                      static_cast<size_t>(FlagIdManager::MULTI_MAX_FLAG_ID);
+  LOG_DEBUG("Grant hoist " << (grantHoistAllowed ? "enabled" : "disabled")
+                           << ": " << crossCoreDepCount
+                           << " cross-core dependencies, budget "
+                           << FlagIdManager::MULTI_MAX_FLAG_ID << "\n");
 
   // Analyze loop nesting before inserting inter-core transfer/sync.
   if (hasStartEndSyncWhitelistKernel(module)) {
