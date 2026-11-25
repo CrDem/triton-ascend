@@ -640,6 +640,24 @@ report that describes it are the same compilation, not two that happen to agree.
   trial drives the whole talkative pipeline; times two hundred candidates that
   is thousands of lines about IR which is being thrown away. Silencing pass by
   pass would not cover prints this pass does not own.
+* **Degeneracy is measured, not guessed.** Each trial fingerprints the IR it
+  produced — a 64-bit hash of the module body in generic form, taken before
+  the clone is released, since the IR itself cannot travel back from the
+  worker — and the report prints how many distinct IRs the ranked candidates
+  amounted to beside how many distinct estimates they scored:
+
+  ```
+  variant search: 164 of 200 ordering(s) compiled, keeping seed 7 at 288578196 cycles
+    31 distinct IR(s) scoring 12 distinct estimate(s), worst 402118400 cycles
+  ```
+
+  The module's own attributes are left out of the hash: they hold the estimate,
+  which is a function of the IR rather than part of it, and folding a score
+  into the fingerprint of the thing it scores would make the two counts agree
+  by construction. When the estimates collapse to one value the report says
+  which of the two causes it is — one IR under many seeds, so the generator
+  degenerated, or many IRs the model cannot tell apart — because those call
+  for opposite work and look identical from the scores alone.
 
 ### Baseline guards
 
@@ -1058,8 +1076,9 @@ the pipeline (§12.2).
   follow from it. But the model only distinguishes orderings through the
   recurrence bound, so on a resource-bound kernel every ordering scores
   identically — which the report makes visible by marking the winning bound and
-  by counting distinct scores. Buffer depths and block partitioning are the
-  obvious further axes and nothing generates them yet.
+  by counting distinct IRs against distinct scores (§10). Buffer depths and
+  block partitioning are the obvious further axes and nothing generates them
+  yet.
 * **`ssbuffer.inter_core_buf_downgraded` has no producer here.** The cost model
   reads it and would drop the inter-core depth to 1, which is the right answer
   when `AddMultiBufferOuterScope` ran out of flag budget and compiled

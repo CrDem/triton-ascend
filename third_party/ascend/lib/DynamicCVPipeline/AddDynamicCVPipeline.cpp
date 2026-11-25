@@ -23,6 +23,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
@@ -35,6 +36,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/WalkResult.h"
 #include "llvm/Support/Debug.h"
@@ -64,6 +66,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <string>
 #include <tuple>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -364,8 +367,44 @@ struct VariantScore {
   int64_t ubCapacity = 0;
   int64_t depth = 0;
   int64_t stages = 0;
+  /// Fingerprint of the IR this candidate produced; 0 when it produced none.
+  uint64_t irHash = 0;
   int errCode = 0;
 };
+
+/// A fingerprint of the IR a trial produced, so that two seeds landing on the
+/// same ordering can be told apart from two different orderings the estimate
+/// happens to score alike.
+///
+/// Those two are the reasons a search finds nothing, and they call for
+/// opposite work -- fix the generator, or teach the model what it is missing
+/// -- so the report has to say which one happened. Without a fingerprint it
+/// cannot: identical scores are what both look like from outside.
+///
+/// Taken over the module's body rather than the module operation, so that the
+/// attributes the estimate leaves on the module stay out of it. Those are a
+/// function of the IR, not part of it, and folding a score into the
+/// fingerprint of the thing being scored would make the two counts agree by
+/// construction.
+///
+/// Generic form, because an operation's pretty form can change without the
+/// operation changing. Debug locations are off, as they are by default: two
+/// orderings of the same operations carry the same locations in a different
+/// place, which is not a difference in the IR.
+///
+/// Compared only against other fingerprints from the same search, so 64 bits
+/// are ample and the value need not be stable across runs or builds.
+uint64_t fingerprintIR(ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  const OpPrintingFlags flags = OpPrintingFlags().printGenericOpForm();
+  for (Operation &op : module.getBody()->getOperations()) {
+    op.print(os, flags);
+    os << '\n';
+  }
+  os.flush();
+  return static_cast<uint64_t>(llvm::hash_value(llvm::StringRef(text)));
+}
 
 /// Load into the context everything a trial's PassManager would register on
 /// its own, before the search fans out into threads.
@@ -454,6 +493,10 @@ VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
               mlir::triton::kCVPipelineCostPipelineDepth)) {
         score.depth = depthAttr.getInt();
       }
+      // Taken here, on the thread that owns the clone and before the clone
+      // goes: the fingerprint has to travel back as a number, like every
+      // other field, because the IR it describes does not outlive this call.
+      score.irHash = fingerprintIR(attempt);
     }
   }
   // The clone is the trial's, and its one reference is here: dropping it
@@ -683,16 +726,27 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // the winner.
     int64_t tieBreaks = 0;
     // How many different scores the candidates got. One means every ordering
-    // that compiled looked identical to the estimate, which says where to look
-    // next: either the generator is producing one shape under many names, or
-    // the estimate cannot see what separates them. Without this the two are
-    // indistinguishable from outside.
+    // that ranked looked identical to the estimate, which says where to look
+    // next -- but not, on its own, where: either the generator is producing
+    // one ordering under many seeds, or the estimate cannot see what separates
+    // the orderings it was handed.
     //
     // Keyed on the pair, not on the total: since the second bound decides
     // ties, two candidates with the same total are no longer the same
     // candidate, and counting totals alone under-reports how much the search
     // can actually tell apart.
     llvm::DenseSet<std::pair<int64_t, int64_t>> distinctCosts;
+    // How many different IRs those scores were taken on, which is what
+    // separates the two cases above and so is the number to read first: a
+    // search over one ordering is a generator that degenerated, while a
+    // search over many orderings that all score alike is a model with nothing
+    // to say about them.
+    //
+    // Counted over the same candidates as distinctCosts, so the two numbers
+    // printed side by side are comparable: a candidate a baseline guard threw
+    // out is in neither, and the rejection lines below account for it
+    // instead.
+    llvm::DenseSet<uint64_t> distinctIRs;
     // Candidates whose total was indistinguishable from the best so far. The
     // difference between "no ties happened" and "ties happened and none of
     // them was an improvement" is not visible from the winner alone, and the
@@ -783,6 +837,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
                      << " estimate, so a deeper candidate has to earn it\n";
       }
       distinctCosts.insert({score.cost, score.second});
+      distinctIRs.insert(score.irHash);
       ranked.push_back({score.cost, score.second, score.ubBytes, seed,
                         score.stages});
       if (worstCost < score.cost) {
@@ -836,9 +891,26 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     if (bestSeed >= 0) {
       llvm::errs() << ", keeping seed " << bestSeed << " at " << bestCost
                    << " cycles\n";
-      llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctCosts.size()
+      llvm::errs() << "[" << DEBUG_TYPE << "]   " << distinctIRs.size()
+                   << " distinct IR(s) scoring " << distinctCosts.size()
                    << " distinct estimate(s), worst " << worstCost
                    << " cycles; seed 0 is the untouched pipeline\n";
+      // Only worth saying when the search had something to tell apart and did
+      // not: with one candidate there is nothing to compare, and with several
+      // scores the search did its job and the numbers already speak.
+      if (usable > 1 && distinctCosts.size() == 1) {
+        llvm::errs() << "[" << DEBUG_TYPE << "]   ";
+        if (distinctIRs.size() == 1) {
+          llvm::errs() << "every ranked ordering produced the same IR: the"
+                          " seeds are collapsing onto one ordering, so there"
+                          " was nothing here for the estimate to rank\n";
+        } else {
+          llvm::errs() << distinctIRs.size()
+                       << " orderings differ in the IR but not in the"
+                          " estimate: what separates them is something the"
+                          " model does not charge for\n";
+        }
+      }
       if (tiedCandidates > 0) {
         llvm::errs() << "[" << DEBUG_TYPE << "]   " << tiedCandidates
                      << " candidate(s) tied with the best on the total, "
