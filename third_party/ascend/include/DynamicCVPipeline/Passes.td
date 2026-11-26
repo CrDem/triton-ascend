@@ -17,7 +17,7 @@ def AddDynamicCVPipeline : Pass<"add_dynamic_cv_pipeline", "mlir::ModuleOp"> {
         "compile on 910_95">,
         Option<"quietVariantTrials", "quiet-variant-trials",
         "bool", /*default*/"true",
-        "Discard what the variant search's trials print; turn off to see why a trial failed">,
+        "Keep the variant search's trials quiet: each candidate is marked so this pipeline's passes report nothing about it, and the diagnostics they raise are dropped for the duration of the search; turn off to see why a trial failed">,
         Option<"reorderSeed", "reorder-seed",
         "int64_t", /*default*/"-1",
         "Compile this operation ordering instead of searching for one; -1 searches as usual">

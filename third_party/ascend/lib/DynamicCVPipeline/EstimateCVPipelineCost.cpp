@@ -3943,11 +3943,19 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
   };
 
   // During a variant search the estimate runs once per candidate, and the full
-  // report for a few hundred of them is unreadable. The search silences every
+  // report for a few hundred of them is unreadable. The search marks every
   // attempt and prints one line itself when a candidate improves on the best so
-  // far; the winner is then recompiled without the flag, so the report the user
-  // ends up reading describes exactly the IR that was kept.
-  if (module->hasAttr(kCVPipelineCostQuiet)) {
+  // far; the winner is then recompiled without the mark, so the report the user
+  // ends up reading describes exactly the IR that was kept. This holds whatever
+  // the environment asks for: the verbosity checks below are reached only
+  // outside a trial.
+  //
+  // Two attributes because they are set by different people. The search sets
+  // the general quiet-trial mark, which every pass in the pipeline honours;
+  // cv_pipeline_cost_quiet is documented input anyone can set by hand to keep
+  // this one report out of the way without silencing anything else.
+  if (module->hasAttr(kCVPipelineCostQuiet) ||
+      CVPipeline::isQuietTrial(module)) {
     return;
   }
 

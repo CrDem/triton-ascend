@@ -292,8 +292,10 @@ std::optional<uint64_t> getVariantSeed(ModuleOp module) {
       }
       return value;
     }
-    llvm::errs() << "[reorder-blocks] TRITON_ASCEND_REORDER_SEED='" << env
-                 << "' is not a number; ignored\n";
+    if (!CVPipeline::isQuietTrial(module)) {
+      llvm::errs() << "[reorder-blocks] TRITON_ASCEND_REORDER_SEED='" << env
+                   << "' is not a number; ignored\n";
+    }
   }
   return std::nullopt;
 }
@@ -1134,7 +1136,8 @@ size_t countDistinctBlockIds(ArrayRef<Operation *> order,
 // Stable sort ops based on their group orders
 static llvm::FailureOr<SmallVector<Operation *>> buildReorderedOps(
     const BlockOpGraph &graph, const DenseMap<Operation *, int> &opBlockId,
-    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph) {
+    ComputeBlockIdManager &bm, const MemoryDependenceGraph &memGraph,
+    bool quiet) {
   SmallVector<Operation *> reordered;
   GroupAdjacencyGraph adjacencyGraph{graph, opBlockId, bm};
 
@@ -1146,7 +1149,7 @@ static llvm::FailureOr<SmallVector<Operation *>> buildReorderedOps(
     return llvm::failure();
   }
 
-  if (getReorderVerbosity() >= 1) {
+  if (!quiet && getReorderVerbosity() >= 1) {
     reportGroupGraph(adjacencyGraph, graph, opBlockId, inDegSnapshot,
                      groupOrderResult.value());
   }
@@ -1195,6 +1198,10 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
   }
 
   auto &opBlockId = *opBlockIdOpt;
+  // The variant search walks this code once per candidate, a thousand times on
+  // a large kernel. Whatever TRITON_ASCEND_REORDER_VERBOSE asks for, a
+  // candidate being scored reports nothing.
+  const bool quiet = CVPipeline::isQuietTrial(block.getParentOp());
   LOG_DEBUG("Initial opBlockIds:\n");
   for (Operation *op : allOps) {
     LOG_DEBUG("  Op: " << *op << ", opBlockId = " << opBlockId[op] << "\n");
@@ -1228,7 +1235,7 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
     } else {
       rederiveBlockIds(order, bm, opBlockId);
       applyReorder(block, order);
-      if (getReorderVerbosity() >= 1) {
+      if (!quiet && getReorderVerbosity() >= 1) {
         llvm::errs() << "[reorder-blocks] variant seed " << *variantSeed
                      << ": " << order.size() << " op(s) reordered, " << before
                      << " block(s) became " << after << " in "
@@ -1238,7 +1245,8 @@ reorderOpsInBlock(Block &block, const MemoryDependenceGraph &memGraph,
     }
   }
 
-  const auto reorderedRes = buildReorderedOps(graph, opBlockId, bm, memGraph);
+  const auto reorderedRes =
+      buildReorderedOps(graph, opBlockId, bm, memGraph, quiet);
   if (failed(reorderedRes)) {
     return failure();
   }

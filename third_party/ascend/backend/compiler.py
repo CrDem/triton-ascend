@@ -478,8 +478,14 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
             # `ssbuffer.insertionOptimization` attribute (set here) at run time.
             # Keep the existing default-on buffer insertion behavior.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
-            # Flip to False to see why a variant trial failed: a trial that
-            # dies otherwise takes its diagnostics with it.
+            # Keeps the variant search quiet: each candidate is marked so the
+            # CV pipeline's own passes report nothing about it, and the
+            # diagnostics they raise through MLIR are dropped for the duration
+            # of the search. Nothing outside the search is touched, so the rest
+            # of this compilation -- and anything else in this process -- logs
+            # as usual. Flip to False to see why a particular trial failed; on
+            # a large kernel with a thousand candidates, expect a log in the
+            # millions of lines.
             quiet_variant_trials = True
             # A seed table, when one is configured, replaces the search for
             # the kernels it lists. Passed as a pass option rather than left to

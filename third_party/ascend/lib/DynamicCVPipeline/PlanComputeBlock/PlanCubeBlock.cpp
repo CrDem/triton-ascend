@@ -272,9 +272,17 @@ bool TopologicalPartitionPlanner::canExpandTo(Operation *op) {
 
 // Encountered error. Need to print failure reason, so no need for LLVM_DEBUG
 void TopologicalPartitionPlanner::dumpQueueAndIndegreeInfo() {
+  // A candidate the variant search is scoring says nothing: this dump runs on
+  // the failure path, and most candidates fail. Formatted into a null stream
+  // rather than skipped outright, so the ready queue is still drained exactly
+  // as it was before.
+  Operation *anchor = block ? block->getParentOp() : nullptr;
+  llvm::raw_ostream &out =
+      CVPipeline::isQuietTrial(anchor) ? llvm::nulls() : llvm::errs();
+
   // simply print a debug header in a new line
-  auto errs = []() -> llvm::raw_ostream & {
-    return llvm::errs() << "\n[" << DEBUG_TYPE << "] ";
+  auto errs = [&out]() -> llvm::raw_ostream & {
+    return out << "\n[" << DEBUG_TYPE << "] ";
   };
 
   errs() << "failed to make progress while planning cube blocks.";
@@ -282,13 +290,13 @@ void TopologicalPartitionPlanner::dumpQueueAndIndegreeInfo() {
 
   errs() << "ready queue";
   if (queue.empty()) {
-    llvm::errs() << " is empty.";
+    out << " is empty.";
   } else {
-    llvm::errs() << ":\n";
+    out << ":\n";
     while (!queue.empty()) {
       Operation *op = queue.front();
       queue.pop();
-      llvm::errs() << "  " << *op << "\n";
+      out << "  " << *op << "\n";
     }
   }
 
@@ -301,10 +309,10 @@ void TopologicalPartitionPlanner::dumpQueueAndIndegreeInfo() {
       continue;
     }
     foundRemainingCube = true;
-    llvm::errs() << "  indegree=" << p.second << " op=" << *op << "\n";
+    out << "  indegree=" << p.second << " op=" << *op << "\n";
   }
   if (!foundRemainingCube) {
-    llvm::errs() << "  <none>\n";
+    out << "  <none>\n";
   }
 }
 

@@ -62,16 +62,10 @@
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
-#include <iostream>
 #include <optional>
 #include <string>
 #include <tuple>
-#ifndef _WIN32
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 #include "DynamicCVPipeline/Common/FallbackHelper.h"
 #include "DynamicCVPipeline/Common/TcbPoolUtils.h"
 
@@ -263,68 +257,6 @@ int getVariantThreadCount() {
   return value;
 }
 
-/// Swallows everything written to stdout and stderr while it is alive.
-///
-/// A trial run drives the whole pipeline, and the pipeline is talkative: debug
-/// prints from several passes, MLIR diagnostics from the ones that decline a
-/// candidate, and the estimate's own report. Multiplied by the number of
-/// candidates that is thousands of lines describing IR that is about to be
-/// thrown away. Silencing at the file descriptor rather than by asking each
-/// pass to be quiet is the only thing that covers all of them, including
-/// prints this pass does not own.
-class OutputSilencer {
-public:
-  OutputSilencer() {
-#ifndef _WIN32
-    flushAll();
-    devNull = ::open("/dev/null", O_WRONLY);
-    if (devNull < 0) {
-      return; // cannot silence; noisy is better than broken
-    }
-    savedOut = ::dup(STDOUT_FILENO);
-    savedErr = ::dup(STDERR_FILENO);
-    ::dup2(devNull, STDOUT_FILENO);
-    ::dup2(devNull, STDERR_FILENO);
-#endif
-  }
-
-  ~OutputSilencer() {
-#ifndef _WIN32
-    flushAll();
-    if (savedOut >= 0) {
-      ::dup2(savedOut, STDOUT_FILENO);
-      ::close(savedOut);
-    }
-    if (savedErr >= 0) {
-      ::dup2(savedErr, STDERR_FILENO);
-      ::close(savedErr);
-    }
-    if (devNull >= 0) {
-      ::close(devNull);
-    }
-#endif
-  }
-
-  OutputSilencer(const OutputSilencer &) = delete;
-  OutputSilencer &operator=(const OutputSilencer &) = delete;
-
-private:
-  static void flushAll() {
-    // Buffered streams must be emptied on both sides of the swap, or their
-    // contents surface attributed to the wrong descriptor.
-    std::cout.flush();
-    std::cerr.flush();
-    llvm::outs().flush();
-    llvm::errs().flush();
-    std::fflush(stdout);
-    std::fflush(stderr);
-  }
-
-  int devNull = -1;
-  int savedOut = -1;
-  int savedErr = -1;
-};
-
 void restoreModuleFromBackup(ModuleOp moduleOp, ModuleOp moduleBackup) {
   Operation *moduleOperation = moduleOp.getOperation();
   Operation *backupOperation = moduleBackup.getOperation();
@@ -439,14 +371,20 @@ void prepareVariantSearchDialects(MLIRContext *context, bool outerMainLoop) {
 /// serial search took by hand: the total, the bound that decided ties, and
 /// the two figures the baseline guards are written against.
 VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
-                            bool outerMainLoop, int64_t seed) {
+                            bool outerMainLoop, int64_t seed, bool quiet) {
   VariantScore score;
   score.seed = seed;
 
   OpBuilder builder(context);
   ModuleOp attempt(moduleBackup->clone());
   attempt->setAttr(CVPipeline::kReorderSeed, builder.getI64IntegerAttr(seed));
-  attempt->setAttr(mlir::triton::kCVPipelineCostQuiet, builder.getUnitAttr());
+  if (quiet) {
+    // One marker for every pass in the trial, the estimate included: whatever
+    // verbosity the environment asks for, a candidate being scored says
+    // nothing. Only the clone carries it, so the compile of the winner that
+    // follows the search reports as usual.
+    attempt->setAttr(CVPipeline::kQuietTrial, builder.getUnitAttr());
+  }
 
   PassManager trial(context, attempt.getOperationName());
   addPasses(trial, outerMainLoop);
@@ -662,16 +600,28 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
     {
       // Nothing a trial prints is worth reading: it describes IR that is
-      // about to be discarded. The estimate is asked to stay quiet, and the
-      // rest of the pipeline is silenced at the descriptor, which is the only
-      // thing that covers prints this pass does not own.
+      // about to be discarded. Each clone is marked so that our passes report
+      // nothing about it; what they raise through MLIR instead -- a pass
+      // declining an ordering does it with an emitError -- arrives here.
       //
-      // quiet-variant-trials=false keeps it off: the redirection is undone
-      // only on the way out, so a trial that dies takes its diagnostics with
-      // it, and that is exactly when they are worth reading.
-      std::optional<OutputSilencer> hush;
+      // Installed before the workers start and removed after they join, so no
+      // worker ever touches the context's handler list, and scoped to the
+      // search, so the compile of the winner that follows reports normally.
+      //
+      // This used to point file descriptors 1 and 2 at /dev/null instead.
+      // That silenced the whole process rather than this pipeline, and it
+      // could not be made safe: any other save-and-restore overlapping the
+      // window -- the CANN runtime, the profiler -- leaves the descriptors on
+      // /dev/null for good, which loses the rest of the run's output and the
+      // test results with it.
+      //
+      // quiet-variant-trials=false keeps it off, which is what a trial that
+      // dies calls for: that is exactly when its diagnostics are worth
+      // reading.
+      std::optional<ScopedDiagnosticHandler> hush;
       if (this->quietVariantTrials) {
-        hush.emplace();
+        hush.emplace(&getContext(),
+                     [](Diagnostic &) { return llvm::success(); });
       }
       if (threadCount > 1) {
         // The workers are plain std::thread rather than a borrow from the
@@ -690,8 +640,10 @@ void AddDynamicCVPipelinePass::runOnOperation() {
               if (seed >= variantCount) {
                 break;
               }
-              scores[seed] = runVariantTrial(
-                  &getContext(), moduleBackup, enableOuterMainLoop, seed);
+              scores[seed] =
+                  runVariantTrial(&getContext(), moduleBackup,
+                                  enableOuterMainLoop, seed,
+                                  this->quietVariantTrials);
             }
           });
         }
@@ -700,8 +652,9 @@ void AddDynamicCVPipelinePass::runOnOperation() {
         }
       } else {
         for (int64_t seed = 0; seed < variantCount; ++seed) {
-          scores[seed] = runVariantTrial(&getContext(), moduleBackup,
-                                         enableOuterMainLoop, seed);
+          scores[seed] =
+              runVariantTrial(&getContext(), moduleBackup, enableOuterMainLoop,
+                              seed, this->quietVariantTrials);
         }
       }
     }

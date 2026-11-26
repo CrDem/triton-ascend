@@ -60,7 +60,8 @@ static constexpr llvm::StringLiteral kAttrsToRemove[]{
     kReorderSeed,       kInterCoreBufDowngraded,
     kSubBlock,          kMergeSmallBlockFirstRunDone,
     kSplittedIf,        kLoopDepthAttr,
-    kLoopRegionAttr,    kReorderSeedApplied};
+    kLoopRegionAttr,    kReorderSeedApplied,
+    kQuietTrial};
 
 void RemoveSsbufAttrPass::runOnOperation() {
   auto module = getOperation();

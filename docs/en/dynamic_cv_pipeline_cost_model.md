@@ -635,11 +635,25 @@ report that describes it are the same compilation, not two that happen to agree.
   pass cannot turn on from the inside; the triton patch therefore enables it in
   `python/src/ir.cc` exactly when `TRITON_ASCEND_CV_VARIANTS` asks for a search
   (see §12.6).
-* **Trial output is swallowed** at the file descriptor and restored on the way
-  out, unless the pass option `quiet-variant-trials=false` says otherwise. A
-  trial drives the whole talkative pipeline; times two hundred candidates that
-  is thousands of lines about IR which is being thrown away. Silencing pass by
-  pass would not cover prints this pass does not own.
+* **Trials are kept quiet**, unless the pass option `quiet-variant-trials=false`
+  says otherwise. A trial drives the whole talkative pipeline; times a thousand
+  candidates that is a log in the millions of lines about IR which is being
+  thrown away. Two mechanisms, because these passes speak in two ways. Every
+  clone carries `ssbuffer.quiet_trial`, which each print site in the pipeline
+  checks — including the estimate's own report, so a trial stays quiet however
+  high `TRITON_ASCEND_CV_COST_VERBOSE` is set. And a `ScopedDiagnosticHandler`
+  installed around the search drops what the passes raise as MLIR diagnostics,
+  which no `if` of ours can reach: a pass declining an ordering does it with an
+  `emitError`, and on a kernel whose orderings mostly cannot be topologically
+  sorted, that one site is nearly all of the volume. Both are scoped to the
+  search, so the final compile of the winner reports normally.
+
+  This replaces redirecting file descriptors 1 and 2 to `/dev/null` for the
+  duration of the search. That version silenced the whole process rather than
+  this pipeline, and it could not be made safe: any other save-and-restore in
+  the same process — the CANN runtime, the profiler — whose window overlaps
+  rather than nests leaves the descriptors on `/dev/null` for good, which loses
+  the rest of the run's output and takes the test results with it.
 * **Degeneracy is measured, not guessed.** Each trial fingerprints the IR it
   produced — a 64-bit hash of the module body in generic form, taken before
   the clone is released, since the IR itself cannot travel back from the

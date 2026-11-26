@@ -222,9 +222,11 @@ llvm::LogicalResult ComputeBlockIdManager::markAndRecord(Operation *op,
               IntegerAttr::get(IntegerType::get(ctx, kBlockIdWidth), blockId));
   auto itOld = opToBlockId.find(op);
   if (itOld != opToBlockId.end() && itOld->second != -1) {
-    llvm::errs() << "Error: Operation already has a block id. Op: " << *op
-                 << ", old block id: " << itOld->second
-                 << ", new block id: " << blockId << "\n";
+    if (!CVPipeline::isQuietTrial(op)) {
+      llvm::errs() << "Error: Operation already has a block id. Op: " << *op
+                   << ", old block id: " << itOld->second
+                   << ", new block id: " << blockId << "\n";
+    }
     return llvm::failure();
   }
 

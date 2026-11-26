@@ -105,6 +105,22 @@ inline constexpr llvm::StringLiteral kReorderSeed = "ssbuffer.reorder_seed";
 /// the other ssbuffer attributes before the module leaves this pipeline.
 inline constexpr llvm::StringLiteral kReorderSeedApplied =
     "ssbuffer.reorder_seed_applied";
+/// Marks a module the variant search is scoring rather than compiling, so that
+/// our own passes keep quiet about it.
+///
+/// The search drives the whole pipeline once per candidate, and every pass that
+/// reports anything reports it that many times: a thousand candidates on one
+/// kernel turned a single test's log into a million lines, nearly all of them
+/// one pass declining one ordering. What is worth reading is the search's own
+/// summary, not the commentary behind it -- the IR a trial describes is
+/// discarded moments later.
+///
+/// Only ever set on the throwaway clone a trial runs on, never on the module
+/// that goes on to be compiled, and stripped with the other ssbuffer
+/// attributes regardless. Read through isQuietTrial() below, which takes any
+/// operation, so a print site deep inside a helper does not have to be handed
+/// a module to find out.
+inline constexpr llvm::StringLiteral kQuietTrial = "ssbuffer.quiet_trial";
 inline constexpr llvm::StringLiteral kMayNotExec = "ssbuffer.may_not_exec";
 inline constexpr llvm::StringLiteral kMayNotExecNPU = "may_not_exec";
 inline constexpr llvm::StringLiteral kLoopCarriedL0C =
@@ -239,6 +255,25 @@ llvm::LogicalResult verifyOpBlockId(Operation *op);
 int getAvailableBlockId(ModuleOp module);
 void setFallbackAttr(ModuleOp module, int errorCode);
 bool hasFallbackAttr(ModuleOp module);
+
+/// Whether this module is a candidate being scored by the variant search.
+inline bool isQuietTrial(ModuleOp module) {
+  return module && module->hasAttr(kQuietTrial);
+}
+
+/// The same question asked from anywhere in the IR. The operation itself is
+/// checked first, so handing this the module operation works too; no other
+/// operation ever carries the attribute.
+inline bool isQuietTrial(Operation *op) {
+  if (!op) {
+    return false;
+  }
+  if (op->hasAttr(kQuietTrial)) {
+    return true;
+  }
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  return module && module->hasAttr(kQuietTrial);
+}
 
 /// The name of the kernel this module holds, or an empty string.
 ///

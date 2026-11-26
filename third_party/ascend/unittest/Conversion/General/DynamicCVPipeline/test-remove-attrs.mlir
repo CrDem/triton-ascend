@@ -13,12 +13,19 @@
 // CHECK-NOT: ssbuffer.reorder_seed
 // CHECK-NOT: ssbuffer.reorder_seed_applied
 
+// The mark that tells every pass in the pipeline to keep quiet about a module
+// the variant search is scoring. It only ever reaches a throwaway clone, so
+// stripping it is belt and braces -- which is the point: nothing downstream
+// should ever have to recognise it.
+// CHECK-NOT: ssbuffer.quiet_trial
+
 module attributes {ssbuffer.outer_main_loop,
     ssbuffer.blockDeps = [
     {producer = 1 : i32, consumer = 2 : i32, kind = "v2c"},
     {producer = 2 : i32, consumer = 3 : i32, kind = "mem"}],
     ssbuffer.reorder_seed = -1 : i64,
-    ssbuffer.reorder_seed_applied = 7 : i64} {
+    ssbuffer.reorder_seed_applied = 7 : i64,
+    ssbuffer.quiet_trial} {
   // CHECK-LABEL: func.func @remove_explicit_main_loop
   func.func @remove_explicit_main_loop(%lb: index, %ub: index, %step: index) {
     // CHECK: scf.for
