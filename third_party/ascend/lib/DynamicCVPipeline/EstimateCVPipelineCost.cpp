@@ -2717,6 +2717,15 @@ struct UBAllocation {
   int64_t alignedBytes = 0; ///< one copy, rounded up to the granule
   /// Copies the pipeline needs in flight at once; see countPipelineStages.
   int64_t copies = 1;
+  /// Stages the span covers before TRITON_ASCEND_CV_UB_MAX_COPIES is applied,
+  /// so a report can show the cap biting rather than silently flattening it.
+  int64_t stagesSpanned = 1;
+  /// The memref type as written, and the blocks the span runs between. Only
+  /// the detailed report uses these, and it uses them to be compared against
+  /// the binary compiler's own per-buffer list rather than read on its own.
+  std::string type;
+  int64_t firstBlock = -1;
+  int64_t lastBlock = -1;
   bool onCube = false;   ///< a Cube block touches it
   bool onVector = false; ///< a Vector block touches it
   /// Compute blocks that touch the buffer, in no particular order: only the
@@ -2752,6 +2761,11 @@ UBFootprint measureUBFootprint(ModuleOp module) {
     entry.bytes = *bytes;
     entry.alignedBytes = (*bytes + kUBAllocGranuleBytes - 1) /
                          kUBAllocGranuleBytes * kUBAllocGranuleBytes;
+    {
+      llvm::raw_string_ostream typeStream(entry.type);
+      typeStream << alloc.getType();
+      typeStream.flush();
+    }
 
     // Everything that can reach the buffer, following the casts and views that
     // hand it on without copying it: a block holding nothing but a
@@ -2945,7 +2959,10 @@ void computeUBPeak(UBFootprint &footprint, const CostBreakdown &breakdown,
       entry.onVector = true;
     }
 
-    entry.copies = countPipelineStages(breakdown, order, lo, hi);
+    entry.firstBlock = order[lo];
+    entry.lastBlock = order[hi];
+    entry.stagesSpanned = countPipelineStages(breakdown, order, lo, hi);
+    entry.copies = entry.stagesSpanned;
     if (copyCap > 0 && entry.copies > copyCap) {
       entry.copies = copyCap;
     }
@@ -3510,6 +3527,41 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
           " each buffer once could not tell two candidates apart. Bank padding"
           " and the temporaries later passes add are still missing, so this is"
           " a lower bound on what the binary compiler will ask for\n";
+
+    // One line per buffer, in the order the walk found them, because the
+    // multiplier is a prediction and this is how it gets checked. The binary
+    // compiler's CV-pipeline guard prints the same quantity for its own
+    // buffers under DEBUG_TYPE "guard-cv-pipeline-ub", as
+    //
+    //   [guard-cv-pipeline-ub] tcb memref<...> x3
+    //
+    // so the two lists line up buffer by buffer and a disagreement localises
+    // to one allocation. Those lines are LLVM_DEBUG, so they need a debug
+    // build of that compiler; without one this list still answers the question
+    // it is most often asked -- which buffers the peak is made of, and whether
+    // the copies or the sizes are what a candidate changed.
+    os << "[" << DEBUG_TYPE << "]     unified buffer, per allocation"
+          " (compare with \"[guard-cv-pipeline-ub] tcb <type> x<copies>\""
+          " from the binary compiler):\n";
+    for (const UBAllocation &entry : estimate.ub.perAllocation) {
+      os << "[" << DEBUG_TYPE << "]       " << entry.type << " x"
+         << entry.copies << " copies";
+      if (entry.stagesSpanned != entry.copies) {
+        os << " (capped from " << entry.stagesSpanned << ")";
+      }
+      os << ", " << entry.bytes << " -> " << entry.occupancy() << " byte(s)";
+      if (entry.onCube && entry.onVector) {
+        os << ", both cores";
+      } else if (entry.onCube) {
+        os << ", Cube";
+      } else if (entry.onVector) {
+        os << ", Vector";
+      }
+      if (entry.firstBlock >= 0) {
+        os << ", blocks " << entry.firstBlock << ".." << entry.lastBlock;
+      }
+      os << "\n";
+    }
   }
   if (scalarOpsCube + scalarOpsVector > 0) {
     const int perInstruction = config.getScalarCyclesPerInstruction();

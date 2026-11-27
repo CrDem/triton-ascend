@@ -746,6 +746,16 @@ describe this IR:
 * **Aligned.** Each copy is rounded up to a 32-byte granule, matching
   `kUBAlignSizeInBits`.
 
+`TRITON_ASCEND_CV_COST_VERBOSE=2` adds one line per buffer: its type, the
+copies charged, the bytes before and after multiplying, which core holds it and
+the blocks its span runs between. The binary compiler's guard prints the same
+multiplier for its own buffers as `[guard-cv-pipeline-ub] tcb <type> x<copies>`
+under that `DEBUG_TYPE`, so the two lists line up buffer by buffer and a
+disagreement localises to one allocation — which is how the stage prediction
+above gets checked. Those lines are `LLVM_DEBUG`, so seeing them needs a debug
+build of that compiler; without one the list still answers which buffers the
+peak is made of, and whether a candidate changed the copies or the sizes.
+
 Still missing, and both in the direction of under-counting: bank padding, which
 depends on where the planner puts each buffer relative to its peers and so
 cannot be predicted from here, and the temporaries later passes create. The
