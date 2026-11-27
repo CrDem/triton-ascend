@@ -2702,16 +2702,37 @@ FlagCensus takeFlagCensus(ModuleOp module) {
 /// *difference* between two variants of one kernel, which is why a consumer
 /// compares a candidate against the untouched pipeline rather than against a
 /// capacity.
+/// Granule a Unified Buffer allocation sits on, so a buffer occupies its size
+/// rounded up to this.
+///
+/// Mirrors kUBAlignSizeInBits in the binary compiler, which aligns every entry
+/// before it checks the capacity. Bank-aware placement can pad further, by up
+/// to a 256-byte bank, and that is deliberately not modelled: the padding
+/// depends on where the planner puts each buffer relative to its peers, which
+/// is decided long after this pass and cannot be predicted from here.
+constexpr int64_t kUBAllocGranuleBytes = 32;
+
 struct UBAllocation {
-  int64_t bytes = 0;
+  int64_t bytes = 0;        ///< static size of one copy
+  int64_t alignedBytes = 0; ///< one copy, rounded up to the granule
+  /// Copies the pipeline needs in flight at once; see countPipelineStages.
+  int64_t copies = 1;
+  bool onCube = false;   ///< a Cube block touches it
+  bool onVector = false; ///< a Vector block touches it
   /// Compute blocks that touch the buffer, in no particular order: only the
   /// first and last of them in schedule order are used.
   llvm::SmallVector<int64_t, 4> blocks;
+
+  /// What the buffer costs the device while it is live: every copy, aligned.
+  int64_t occupancy() const { return alignedBytes * copies; }
 };
 
 struct UBFootprint {
-  int64_t bytes = 0;
-  int64_t peakBytes = 0;
+  int64_t bytes = 0;     ///< every copy of every buffer, summed
+  int64_t peakBytes = 0; ///< the busier core's peak: the figure to guard on
+  int64_t peakCube = 0;
+  int64_t peakVector = 0;
+  int64_t maxCopies = 1; ///< deepest multi-buffering one buffer needed
   int64_t allocations = 0;
   llvm::SmallVector<UBAllocation, 8> perAllocation;
 };
@@ -2729,6 +2750,8 @@ UBFootprint measureUBFootprint(ModuleOp module) {
 
     UBAllocation entry;
     entry.bytes = *bytes;
+    entry.alignedBytes = (*bytes + kUBAllocGranuleBytes - 1) /
+                         kUBAllocGranuleBytes * kUBAllocGranuleBytes;
 
     // Everything that can reach the buffer, following the casts and views that
     // hand it on without copying it: a block holding nothing but a
@@ -2763,23 +2786,114 @@ UBFootprint measureUBFootprint(ModuleOp module) {
     }
 
     entry.blocks.assign(blocks.begin(), blocks.end());
-    footprint.bytes += entry.bytes;
+    // The summed total is left to computeUBPeak: how many copies of this
+    // buffer the device needs is a property of the schedule, and there is no
+    // schedule here yet.
     ++footprint.allocations;
     footprint.perAllocation.push_back(std::move(entry));
   });
   return footprint;
 }
 
-/// Most Unified Buffer live at any one point of the block schedule.
+/// Cap on the copies one buffer may be charged for, or zero for no cap.
+///
+/// The binary compiler caps the same quantity with max-pipeline-multibuffer,
+/// whose value its own driver chooses rather than the pass. There is no figure
+/// to mirror, so the default here is no cap and this exists to sweep it.
+constexpr const char *kUBMaxCopiesEnvVar = "TRITON_ASCEND_CV_UB_MAX_COPIES";
+
+int64_t getUBMaxCopies() {
+  static const int64_t cap = [] {
+    const char *raw = std::getenv(kUBMaxCopiesEnvVar);
+    if (!raw) {
+      return int64_t{0};
+    }
+    int64_t value = 0;
+    if (llvm::StringRef(raw).trim().getAsInteger(10, value) || value < 0) {
+      return int64_t{0};
+    }
+    return value;
+  }();
+  return cap;
+}
+
+/// How many pipeline stages a buffer is held across, which is how many copies
+/// of it must exist at once.
+///
+/// A value produced in stage s and read in stage s+k needs k+1 copies, so that
+/// the producer can run ahead without overwriting data the consumer has not
+/// read. The binary compiler charges exactly this -- its CV-pipeline guard
+/// multiplies each buffer by the distance between its producer's and its
+/// consumer's stage, plus one -- and it reads the stage numbers from a staging
+/// pass that runs long after this one, so they have to be predicted here.
+///
+/// The prediction uses the one structural signal this pass has. Downstream, a
+/// compute block becomes a scope, adjacent same-core scopes are merged into
+/// one, and what is left is scheduled into stages; a stage boundary therefore
+/// falls where the schedule changes core. The number of same-core runs the
+/// buffer's span covers is the number of stages it lives across. A block whose
+/// operations disagree about their core is a run of its own, which is how
+/// edgeCrossesCores reads the same situation.
+///
+/// This is the quantity the footprint used to have no equivalent of, and it is
+/// the one reordering moves most: two orderings can hold the same buffers over
+/// the same number of blocks and still need a different number of copies,
+/// because what changed is how many core alternations fall between producer
+/// and consumer. A footprint that charges each buffer once is blind to it,
+/// which is why variants used to score byte-identical and then overrun.
+int64_t countPipelineStages(const CostBreakdown &breakdown,
+                            ArrayRef<int64_t> order, size_t lo, size_t hi) {
+  int64_t runs = 0;
+  bool started = false;
+  bool lastWasCube = false;
+  for (size_t i = lo; i <= hi && i < order.size(); ++i) {
+    auto it = breakdown.blocks.find(order[i]);
+    if (it == breakdown.blocks.end()) {
+      continue;
+    }
+    const BlockStats &block = it->second;
+    if (block.mixedCore) {
+      // Touches both cores, so it neither continues the run before it nor
+      // starts one the next block could continue.
+      ++runs;
+      started = false;
+      continue;
+    }
+    if (!started || block.isCube != lastWasCube) {
+      ++runs;
+      started = true;
+      lastWasCube = block.isCube;
+    }
+  }
+  return std::max<int64_t>(runs, 1);
+}
+
+/// Most Unified Buffer live at any one point of the block schedule, per core.
 ///
 /// A buffer is taken to be live from the first block that touches it to the
 /// last, which is the same span the recurrence bound measures for a transfer,
 /// and for the same reason: nothing may reuse the storage in between. Swept
 /// with a difference array over the schedule, so the cost is linear in blocks.
-void computeUBPeak(UBFootprint &footprint, ArrayRef<int64_t> order) {
+///
+/// What is charged is every copy the pipeline needs, each rounded up to the
+/// allocation granule, and the sweep runs once per core. Both departures from
+/// the previous version follow the binary compiler: it multiplies a buffer by
+/// its stage distance, it aligns every entry, and it checks each core's
+/// function against that core's own budget once it has split them.
+void computeUBPeak(UBFootprint &footprint, const CostBreakdown &breakdown,
+                   ArrayRef<int64_t> order) {
   if (order.empty() || footprint.perAllocation.empty()) {
-    // No schedule to be live against; the sum is the only honest answer.
+    // No schedule to be live against, and none to predict stages from: one
+    // copy each, and the sum is the only honest answer.
+    for (UBAllocation &entry : footprint.perAllocation) {
+      entry.copies = 1;
+      entry.onCube = true;
+      entry.onVector = true;
+      footprint.bytes += entry.occupancy();
+    }
     footprint.peakBytes = footprint.bytes;
+    footprint.peakCube = footprint.bytes;
+    footprint.peakVector = footprint.bytes;
     return;
   }
 
@@ -2788,8 +2902,11 @@ void computeUBPeak(UBFootprint &footprint, ArrayRef<int64_t> order) {
     position[order[i]] = i;
   }
 
-  llvm::SmallVector<int64_t> delta(order.size() + 1, 0);
-  for (const UBAllocation &entry : footprint.perAllocation) {
+  const int64_t copyCap = getUBMaxCopies();
+  llvm::SmallVector<int64_t> deltaCube(order.size() + 1, 0);
+  llvm::SmallVector<int64_t> deltaVector(order.size() + 1, 0);
+
+  for (UBAllocation &entry : footprint.perAllocation) {
     size_t lo = order.size();
     size_t hi = 0;
     bool placed = false;
@@ -2801,6 +2918,18 @@ void computeUBPeak(UBFootprint &footprint, ArrayRef<int64_t> order) {
       lo = std::min(lo, it->second);
       hi = std::max(hi, it->second);
       placed = true;
+      auto stats = breakdown.blocks.find(id);
+      if (stats == breakdown.blocks.end()) {
+        continue;
+      }
+      if (stats->second.mixedCore) {
+        entry.onCube = true;
+        entry.onVector = true;
+      } else if (stats->second.isCube) {
+        entry.onCube = true;
+      } else {
+        entry.onVector = true;
+      }
     }
     if (!placed) {
       // Touched only by operations the pipeline left unassigned. Nothing says
@@ -2808,15 +2937,40 @@ void computeUBPeak(UBFootprint &footprint, ArrayRef<int64_t> order) {
       lo = 0;
       hi = order.size() - 1;
     }
-    delta[lo] += entry.bytes;
-    delta[hi + 1] -= entry.bytes;
+    if (!entry.onCube && !entry.onVector) {
+      // Either unassigned, or touched only by blocks the breakdown has no
+      // stats for. Which core holds it is then unknown, and charging it to
+      // both is the reading that cannot let an overrun through.
+      entry.onCube = true;
+      entry.onVector = true;
+    }
+
+    entry.copies = countPipelineStages(breakdown, order, lo, hi);
+    if (copyCap > 0 && entry.copies > copyCap) {
+      entry.copies = copyCap;
+    }
+    footprint.maxCopies = std::max(footprint.maxCopies, entry.copies);
+    footprint.bytes += entry.occupancy();
+
+    if (entry.onCube) {
+      deltaCube[lo] += entry.occupancy();
+      deltaCube[hi + 1] -= entry.occupancy();
+    }
+    if (entry.onVector) {
+      deltaVector[lo] += entry.occupancy();
+      deltaVector[hi + 1] -= entry.occupancy();
+    }
   }
 
-  int64_t live = 0;
+  int64_t liveCube = 0;
+  int64_t liveVector = 0;
   for (size_t i = 0; i < order.size(); ++i) {
-    live += delta[i];
-    footprint.peakBytes = std::max(footprint.peakBytes, live);
+    liveCube += deltaCube[i];
+    liveVector += deltaVector[i];
+    footprint.peakCube = std::max(footprint.peakCube, liveCube);
+    footprint.peakVector = std::max(footprint.peakVector, liveVector);
   }
+  footprint.peakBytes = std::max(footprint.peakCube, footprint.peakVector);
 }
 
 /// Whether an edge between two blocks crosses the Cube/Vector boundary, and so
@@ -2987,8 +3141,9 @@ ModuleEstimate computeModuleEstimate(const CostBreakdown &breakdown,
   estimate.flags = flags;
   estimate.ub = ub;
   estimate.order = topologicalBlockOrder(breakdown);
-  // Needs the order, so it cannot be done where the allocations were collected.
-  computeUBPeak(estimate.ub, estimate.order);
+  // Needs the order and the per-block core, so it cannot be done where the
+  // allocations were collected.
+  computeUBPeak(estimate.ub, breakdown, estimate.order);
 
   BarrierTally weightedBarriers;
   estimate.serialisedBound = scheduleBlockGraph(
@@ -3338,20 +3493,23 @@ void printEstimate(llvm::raw_ostream &os, const ModuleEstimate &estimate,
   if (estimate.ub.allocations > 0) {
     const MemorySpace *ub = config.getMemorySpace("ub");
     os << "[" << DEBUG_TYPE << "]     unified buffer: "
-       << estimate.ub.allocations << " allocation(s), " << estimate.ub.peakBytes
-       << " bytes live at the peak of the schedule, " << estimate.ub.bytes
-       << " summed";
+       << estimate.ub.allocations << " allocation(s), peak "
+       << estimate.ub.peakCube << " byte(s) on Cube and "
+       << estimate.ub.peakVector << " on Vector, " << estimate.ub.bytes
+       << " summed over every copy, deepest multi-buffering x"
+       << estimate.ub.maxCopies;
     if (ub && ub->sizeBytes > 0) {
-      os << ", against a capacity of " << ub->sizeBytes;
+      os << ", against a per-core capacity of " << ub->sizeBytes;
     }
-    os << ". The peak is the one to read: sizes are exact and live ranges come"
-          " from the block schedule, so the difference between two variants of"
-          " one kernel is the buffers a finer partition forced into existence."
-          " The absolute value is not what the binary compiler will ask for --"
-          " it multi-buffers again on top, aligns to banks, and adds"
-          " temporaries after this pass -- which is why a search compares"
-          " candidates against the untouched pipeline and not against the"
-          " capacity\n";
+    os << ". The two peaks are the figures to read, and each is checked"
+          " against the capacity on its own: the binary compiler splits the"
+          " module into one function per core and gives each its own budget."
+          " Every copy a buffer needs is charged, " << kUBAllocGranuleBytes
+       << "-byte aligned, because that is what the device allocates -- the"
+          " copies are the part reordering moves, so a footprint that counted"
+          " each buffer once could not tell two candidates apart. Bank padding"
+          " and the temporaries later passes add are still missing, so this is"
+          " a lower bound on what the binary compiler will ask for\n";
   }
   if (scalarOpsCube + scalarOpsVector > 0) {
     const int perInstruction = config.getScalarCyclesPerInstruction();
@@ -3785,6 +3943,12 @@ void estimateModuleCost(ModuleOp module, llvm::StringRef hardwareConfigPath) {
                   builder.getI64IntegerAttr(estimate.ub.bytes));
   module->setAttr(kCVPipelineCostUBPeak,
                   builder.getI64IntegerAttr(estimate.ub.peakBytes));
+  module->setAttr(kCVPipelineCostUBPeakCube,
+                  builder.getI64IntegerAttr(estimate.ub.peakCube));
+  module->setAttr(kCVPipelineCostUBPeakVector,
+                  builder.getI64IntegerAttr(estimate.ub.peakVector));
+  module->setAttr(kCVPipelineCostUBCopies,
+                  builder.getI64IntegerAttr(estimate.ub.maxCopies));
   // Deepest software-pipeline stretch, over every loop. Diagnostic: it is the
   // one number directly comparable with the bound written in the IR, but it
   // mixes the rescaling with the ramp, so the two below separate them.

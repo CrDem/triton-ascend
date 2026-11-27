@@ -296,6 +296,16 @@ struct VariantScore {
   int64_t cost = 0;
   int64_t second = 0;
   int64_t ubBytes = 0;
+  /// The peak taken for one core at a time. These are what the guard reads:
+  /// the binary compiler checks each core's function against its own Unified
+  /// Buffer budget, so a candidate that fits on average and overruns on one
+  /// core overruns.
+  int64_t ubCube = 0;
+  int64_t ubVector = 0;
+  /// Most copies of any one buffer the pipeline needs at once. Diagnostic, but
+  /// the one worth reading when two candidates differ: it is what reordering
+  /// moves, and the footprint is proportional to it.
+  int64_t ubCopies = 1;
   int64_t ubCapacity = 0;
   int64_t depth = 0;
   int64_t stages = 0;
@@ -418,6 +428,18 @@ VariantScore runVariantTrial(MLIRContext *context, ModuleOp moduleBackup,
       if (auto ubAttr = attempt->getAttrOfType<IntegerAttr>(
               mlir::triton::kCVPipelineCostUBPeak)) {
         score.ubBytes = ubAttr.getInt();
+      }
+      if (auto cubeAttr = attempt->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineCostUBPeakCube)) {
+        score.ubCube = cubeAttr.getInt();
+      }
+      if (auto vectorAttr = attempt->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineCostUBPeakVector)) {
+        score.ubVector = vectorAttr.getInt();
+      }
+      if (auto copiesAttr = attempt->getAttrOfType<IntegerAttr>(
+              mlir::triton::kCVPipelineCostUBCopies)) {
+        score.ubCopies = copiesAttr.getInt();
       }
       if (auto stageAttr = attempt->getAttrOfType<IntegerAttr>(
               mlir::triton::kCVPipelineCostPipelineStages)) {
@@ -713,23 +735,41 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     // Ordered by the first two, so the trailing fields are carried along rather
     // than compared: seed is unique and stages is a diagnostic.
     SmallVector<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>> ranked;
-    // Set by seed 0, the untouched pipeline. Everything after it is judged
-    // against these.
-    std::optional<int64_t> baselineUBPeak;
+    // Set by seed 0, the untouched pipeline. Candidates are judged against it.
     std::optional<int64_t> baselineDepth;
-    // Derived from the baseline when TRITON_ASCEND_CV_UB_SLACK_BYTES says
-    // nothing: the room to spend is what the baseline leaves unused.
-    int64_t ubAllowance = 0;
+    // What a candidate's per-core Unified Buffer peak may not exceed.
+    //
+    // The device's own capacity, while the estimate is in a range where that
+    // means something, and the baseline's own figure when it is not. Both
+    // readings are needed because the footprint is a lower bound on what the
+    // binary compiler asks for but an over-estimate of what the device holds:
+    // it widens live ranges to whole blocks, follows views, and counts buffers
+    // that later passes fold away. On a kernel where that puts the baseline
+    // above the capacity, an absolute limit would reject every candidate and
+    // say nothing; falling back to the baseline keeps the comparison.
+    //
+    // The fallback is not the guard this replaced. That one derived the room to
+    // spend from "capacity minus baseline", which is zero exactly when the
+    // baseline is over the capacity, so it reduced to byte-equality against a
+    // footprint that charged each buffer once however many copies the pipeline
+    // needed -- a test the thing reordering changes could pass unseen. The
+    // footprint now counts the copies, so comparing against the baseline
+    // measures the quantity that decides the overrun either way.
+    //
+    // TRITON_ASCEND_CV_UB_SLACK_BYTES moves whichever limit is in force.
+    int64_t ubLimit = 0;
+    bool ubOverStated = false;
     if (scores[0].accepted) {
-      baselineUBPeak = scores[0].ubBytes;
       baselineDepth = scores[0].depth;
-      // What the baseline leaves unused, unless the caller named a figure.
-      // A baseline that already fills the buffer yields zero and admits only
-      // candidates that hold no more than it does -- the right answer, and
-      // the one flash attention gives at 128x128.
-      ubAllowance = ubSlack ? *ubSlack
-                            : std::max<int64_t>(0, scores[0].ubCapacity -
-                                                          scores[0].ubBytes);
+      const int64_t baselinePeak =
+          std::max(scores[0].ubCube, scores[0].ubVector);
+      if (scores[0].ubCapacity > 0) {
+        ubLimit = scores[0].ubCapacity + ubSlack.value_or(0);
+      }
+      if (baselinePeak > ubLimit) {
+        ubLimit = baselinePeak + ubSlack.value_or(0);
+        ubOverStated = scores[0].ubCapacity > 0;
+      }
     }
 
     // Why the rejected candidates were rejected, counted by error code. A
@@ -749,17 +789,21 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     for (int64_t seed = 0; seed < variantCount; ++seed) {
       VariantScore &score = scores[seed];
 
-      // -3: it compiled and scored, but holds more Unified Buffer live than
-      // the baseline plus what the caller allowed. Counted as a rejection
-      // rather than ranked, so the summary shows how much of the search this
-      // threw away -- and if that is most of it, the answer for this kernel
-      // is that the partition axis has no room, which is worth seeing rather
-      // than inferring from a winner that will not build. Both guards below
-      // run against the baseline rather than against an absolute, so nothing
-      // here is fitted to a kernel; the baseline itself always passes, having
-      // set the reference, so the worst a wrong estimate can do is return it.
-      if (score.accepted && baselineUBPeak &&
-          score.ubBytes > *baselineUBPeak + ubAllowance) {
+      // -3: it compiled and scored, but the Unified Buffer it needs does not
+      // fit the device. Counted as a rejection rather than ranked, so the
+      // summary shows how much of the search this threw away -- and if that is
+      // most of it, the answer for this kernel is that the partition axis has
+      // no room, which is worth seeing rather than inferring from a winner
+      // that will not build.
+      //
+      // Seed 0 is exempt. It is the ordering the pipeline falls back to and it
+      // demonstrably builds, so an estimate that puts it over the capacity is
+      // wrong about the baseline rather than right about the device; throwing
+      // it out would leave the search preferring a candidate to an ordering
+      // that works. The line below says so when it happens, because then every
+      // rejection here is suspect too.
+      if (score.accepted && seed != 0 && ubLimit > 0 &&
+          std::max(score.ubCube, score.ubVector) > ubLimit) {
         score.accepted = false;
         score.errCode = -3;
       }
@@ -779,15 +823,33 @@ void AddDynamicCVPipelinePass::runOnOperation() {
 
       ++usable;
       if (seed == 0) {
-        llvm::errs() << "[" << DEBUG_TYPE << "]   baseline: " << score.ubBytes
-                     << " bytes of unified buffer live against a capacity of "
-                     << score.ubCapacity << ", buffer factor " << score.depth
-                     << ", " << score.stages << " pipeline stage(s)"
-                     << "; candidates may spend " << ubAllowance
-                     << " more byte(s) and " << stageSlack.value_or(0)
+        llvm::errs() << "[" << DEBUG_TYPE
+                     << "]   baseline: unified buffer peak " << score.ubCube
+                     << " byte(s) on Cube and " << score.ubVector
+                     << " on Vector, deepest multi-buffering x"
+                     << score.ubCopies << ", against a per-core capacity of "
+                     << score.ubCapacity << "; buffer factor " << score.depth
+                     << ", " << score.stages
+                     << " pipeline stage(s). Candidates must fit " << ubLimit
+                     << " byte(s) per core and may spend "
+                     << stageSlack.value_or(0)
                      << " more buffer factor(s). Stage count is not guarded:"
                      << " the fill and drain it costs are charged in the"
                      << " estimate, so a deeper candidate has to earn it\n";
+        if (ubOverStated) {
+          // The baseline builds on the device, so this says the estimate
+          // over-states this kernel rather than that the kernel is too big.
+          // Worth a line of its own: it means the limit above is the
+          // baseline's own footprint rather than the device's capacity, so
+          // the rejections below say "more than the untouched pipeline", not
+          // "more than the part has".
+          llvm::errs() << "[" << DEBUG_TYPE
+                       << "]   that is the baseline's own peak, not the"
+                          " capacity: the estimate puts the untouched pipeline"
+                          " over the device, so the footprint is over-stated"
+                          " for this kernel and candidates are judged against"
+                          " the baseline instead\n";
+        }
       }
       distinctCosts.insert({score.cost, score.second});
       distinctIRs.insert(score.irHash);
@@ -914,10 +976,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
       } else if (entry.first == -2) {
         llvm::errs() << "no estimate produced\n";
       } else if (entry.first == -3) {
-        llvm::errs() << "more than the baseline's "
-                     << baselineUBPeak.value_or(0) << " bytes of unified"
-                        " buffer plus its "
-                     << ubAllowance << "-byte allowance\n";
+        llvm::errs() << "a unified buffer peak above the " << ubLimit
+                     << "-byte per-core limit\n";
       } else if (entry.first == -4) {
         llvm::errs() << "a larger software-pipeline buffer factor than the"
                         " baseline's "

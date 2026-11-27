@@ -522,8 +522,10 @@ Declared in
 | `ascend.cv_pipeline_cost_roofline` | i64 | same module with unconditional Cube/Vector overlap; the gap is what barriers cost |
 | `ascend.cv_pipeline_cost_hardware` | str | profile name; estimates are only comparable within one profile |
 | `ascend.cv_pipeline_cost_ub_bytes` | i64 | Unified Buffer allocated, summed over allocations |
-| `ascend.cv_pipeline_cost_ub_peak` | i64 | the most Unified Buffer live at one point of the schedule |
-| `ascend.cv_pipeline_cost_ub_capacity` | i64 | what the profile says the part has |
+| `ascend.cv_pipeline_cost_ub_peak` | i64 | the most Unified Buffer live at one point of the schedule, on the busier core |
+| `ascend.cv_pipeline_cost_ub_peak_cube` / `..._ub_peak_vector` | i64 | the same peak per core; these are what the guard compares, and the one above is their maximum |
+| `ascend.cv_pipeline_cost_ub_copies` | i64 | most copies of any one buffer the pipeline needs at once |
+| `ascend.cv_pipeline_cost_ub_capacity` | i64 | what the profile says one core has |
 | `ascend.cv_pipeline_cost_pipeline_depth` | i64 | the buffer rescaling factor (`requiredBuffers`), **not** the stage count |
 | `ascend.cv_pipeline_cost_pipeline_stages` | i64 | predicated stages in the deepest loop's software pipeline |
 | `ascend.cv_pipeline_cost_loop_extension` | i64 | iterations the rewritten bound added past the real trip count |
@@ -676,22 +678,78 @@ report that describes it are the same compilation, not two that happen to agree.
 ### Baseline guards
 
 A winner the toolchain then refuses is worse than no winner. Two properties
-predict that refusal, and both are compared **against seed 0** rather than
-against an absolute, so nothing here is fitted to a kernel and the baseline
-always passes its own test:
+predict that refusal:
 
 | Guard | Rejects a candidate that | Slack variable |
 |---|---|---|
-| Unified Buffer | holds more UB live than the baseline plus the allowance | `TRITON_ASCEND_CV_UB_SLACK_BYTES`, default `capacity - peak(baseline)` |
+| Unified Buffer | needs more UB on either core than the limit below allows | `TRITON_ASCEND_CV_UB_SLACK_BYTES`, default 0 |
 | Pipeline depth | needs a larger `requiredBuffers` factor than the baseline | `TRITON_ASCEND_CV_STAGE_SLACK`, default 0 |
 
 The UB overrun is diagnosed by the binary compiler, in another process, after
 this compilation has finished — so an unbuildable candidate looks perfectly
 healthy here, and it is the *good* candidates that overrun, because the overlap
 they win is paid for by materialising every value that crosses a new block
-boundary. The absolute figures do not match the binary compiler's, but every
-correction it applies applies to the baseline too and cancels in a difference;
-what is left is the buffers the new cuts created, which this model does know.
+boundary.
+
+The UB limit is the **device's per-core capacity** while the estimate is in a
+range where that means something, and the **baseline's own peak** when it is
+not. Both readings are needed, because the footprint is a lower bound on what
+the binary compiler will ask for and at the same time an over-estimate of what
+the device holds: it widens live ranges to whole blocks, follows views, and
+counts buffers later passes fold away. On a kernel where that puts seed 0 above
+the capacity, an absolute limit would reject every candidate and tell you
+nothing, so the limit falls back to the baseline and the report says in a line
+of its own that it did — the rejections then mean "more than the untouched
+pipeline", not "more than the part has".
+
+That fallback is not the guard this replaced, and the difference is the whole
+point. The old version derived the room to spend as `capacity - peak(baseline)`,
+which is zero exactly when the baseline is over the capacity, so it reduced to
+byte-equality against a footprint that charged each buffer **once** however
+many copies of it the pipeline needed. Two orderings came out byte-identical
+and one of them then overran. Now that the footprint counts the copies (see
+below), comparing against the baseline measures the quantity that actually
+decides the overrun.
+
+Seed 0 itself is never rejected. It is the ordering the pipeline falls back to
+and it demonstrably builds, so an estimate that puts it over the capacity is
+wrong about the baseline rather than right about the device.
+
+The stage **count** is deliberately not guarded: it costs time rather than
+correctness, and the estimate already charges the prologue and epilogue
+directly, so a candidate that buys shorter dependency chains by adding stages
+pays for them in its own score.
+
+### What the Unified Buffer footprint counts
+
+Three things, each mirroring what the binary compiler does with the same
+buffers, because the figure has to predict that compiler's refusal rather than
+describe this IR:
+
+* **Every copy, not every buffer.** A value produced in one pipeline stage and
+  read *k* stages later needs *k+1* copies at once, so the producer can run
+  ahead without overwriting what the consumer has not read. The compiler's own
+  CV-pipeline guard multiplies each buffer by that distance plus one, taking
+  the stage numbers from a staging pass that runs long after this one. They are
+  predicted here from the one structural signal available: downstream a compute
+  block becomes a scope, adjacent same-core scopes are merged, and what is left
+  is scheduled into stages — so a stage boundary falls where the schedule
+  changes core, and the number of same-core runs a buffer's span covers is the
+  number of stages it lives across. This is the part reordering moves most, and
+  the part the old footprint could not see.
+* **Per core, not per module.** The compiler splits the module into one
+  function per core and checks each against its own Unified Buffer budget, so a
+  whole-module total compared against one budget charges the other core's
+  buffers to this core's capacity. The sweep runs once per core; a buffer both
+  cores touch is counted in both, which is the reading that cannot let an
+  overrun through.
+* **Aligned.** Each copy is rounded up to a 32-byte granule, matching
+  `kUBAlignSizeInBits`.
+
+Still missing, and both in the direction of under-counting: bank padding, which
+depends on where the planner puts each buffer relative to its peers and so
+cannot be predicted from here, and the temporaries later passes create. The
+figure is therefore a lower bound on what the binary compiler will ask for.
 
 The stage **count** is deliberately not guarded: it costs time rather than
 correctness, and the estimate already charges the prologue and epilogue
@@ -748,7 +806,8 @@ is the intended replacement.
 |---|---|
 | `TRITON_ASCEND_CV_VARIANTS` | how many operation orderings to score; 1 or unset is the ordinary single compilation |
 | `TRITON_ASCEND_CV_VARIANT_THREADS` | how many candidates to score at once; a ceiling, capped at the candidate count |
-| `TRITON_ASCEND_CV_UB_SLACK_BYTES` | extra Unified Buffer a candidate may hold over the baseline; unset derives it from what the baseline leaves unused |
+| `TRITON_ASCEND_CV_UB_SLACK_BYTES` | how far past the per-core capacity a candidate's Unified Buffer peak is still accepted; defaults to 0, i.e. the device's own limit |
+| `TRITON_ASCEND_CV_UB_MAX_COPIES` | cap on the copies one buffer is charged for, mirroring the binary compiler's `max-pipeline-multibuffer`; 0 or unset is no cap |
 | `TRITON_ASCEND_CV_STAGE_SLACK` | extra software-pipeline buffer factor a candidate may carry over the baseline; defaults to 0 |
 | `TRITON_ASCEND_REORDER_SEED` | compile one ordering by hand, for reproducing a candidate; 0 is the untouched pipeline |
 | `TRITON_ASCEND_REORDER_POLICY` | `lifo` (default) or `fifo`: which of the ready blocks `ReorderOpsByBlockId` emits first |
@@ -803,7 +862,9 @@ TRITON_ALWAYS_COMPILE=1 TRITON_ASCEND_CV_SEED_TABLE=seeds.jsonl pytest kernels/
 | `cv_variants_usable` / `cv_variants_total` | how many orderings were scored and how many could be |
 | `cv_cost` | the estimate for the ordering that was compiled |
 | `cv_cost_resource` / `cv_cost_recurrence` / `cv_second_bound` | the two bounds, and the one that decides ties |
-| `cv_ub_peak` / `cv_ub_capacity` | Unified Buffer held live, against what the part has |
+| `cv_ub_peak` / `cv_ub_capacity` | Unified Buffer needed on the busier core, against what one core has |
+| `cv_ub_peak_cube` / `cv_ub_peak_vector` | the same peak per core; the guard compares each separately |
+| `cv_ub_copies` | most copies of one buffer the pipeline needs at once |
 | `cv_pipeline_stages` / `cv_pipeline_depth` | software-pipeline stage count, and the buffer factor that predicts a refusal |
 | `cv_rc` | the pipeline's return code; `0` is success |
 | `cv_seed_requested` | the seed this compilation was told to use, or `-1` |

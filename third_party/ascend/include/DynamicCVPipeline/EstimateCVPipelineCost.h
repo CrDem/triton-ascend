@@ -109,6 +109,30 @@ inline constexpr llvm::StringLiteral kCVPipelineCostUBBytes =
 inline constexpr llvm::StringLiteral kCVPipelineCostUBPeak =
     "ascend.cv_pipeline_cost_ub_peak";
 
+/// The same peak, taken for one core only (i64).
+///
+/// These two are the figures to guard on, and the plain peak above is their
+/// maximum. The binary compiler splits the module into one function per core
+/// and checks each against its own Unified Buffer budget, so a whole-module
+/// total compared against one budget is the wrong shape: it charges the other
+/// core's buffers to this core's capacity. A buffer both cores touch is counted
+/// in both, which is the tighter reading.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBPeakCube =
+    "ascend.cv_pipeline_cost_ub_peak_cube";
+inline constexpr llvm::StringLiteral kCVPipelineCostUBPeakVector =
+    "ascend.cv_pipeline_cost_ub_peak_vector";
+
+/// The deepest multi-buffering any single UB buffer needed (i64): the most
+/// copies of one buffer that have to exist at the same time.
+///
+/// A buffer produced in one pipeline stage and read k stages later needs k+1
+/// copies, so the producer can run ahead without overwriting what the consumer
+/// has not read yet. Reordering operations moves producers and consumers
+/// between stages, which makes this the number it changes most -- and the one
+/// a footprint that charges each buffer once cannot see at all.
+inline constexpr llvm::StringLiteral kCVPipelineCostUBCopies =
+    "ascend.cv_pipeline_cost_ub_copies";
+
 /// How far software pipelining stretched the deepest loop past the iterations
 /// that actually do work (i64): the rewritten bound minus the trip count, taken
 /// over every loop and maximised.
